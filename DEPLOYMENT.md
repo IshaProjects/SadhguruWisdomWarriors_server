@@ -23,7 +23,8 @@ In the App → **Settings** → **App-Level Environment Variables** (or Componen
 |----------|----------|-------------|
 | `PORT` | No (DO sets it) | App Platform sets this; you can omit or set to match. |
 | `NODE_ENV` | Recommended | Set to `production`. |
-| `MONGODB_URI` | **Yes** | MongoDB connection string. |
+| `MONGODB_URI` | **Yes** | MongoDB connection string (can include or omit database name). |
+| `MONGODB_DB_NAME` | No | Database name. Overrides DB in URI. Use different names per environment (e.g. `yt_dashboard_prod`). |
 | `JWT_SECRET` | **Yes** | Long random string for access tokens. |
 | `JWT_REFRESH_SECRET` | **Yes** | Long random string for refresh tokens. |
 | `JWT_EXPIRE` | No | e.g. `15m`. |
@@ -33,6 +34,8 @@ In the App → **Settings** → **App-Level Environment Variables** (or Componen
 | `SYNC_CRON_SCHEDULE` | No | e.g. `0 3 * * *` (3 AM daily). |
 
 Use **Encrypted** for secrets. Copy from your local `server/.env` (never commit `.env`).
+
+**Different databases per environment:** Use a different `MONGODB_URI` and/or `MONGODB_DB_NAME` per environment (e.g. local `.env` → `yt_dashboard_dev`, production on DO → `yt_dashboard_prod`) so dev and prod data stay separate.
 
 ## 4. Deploy
 
