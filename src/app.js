@@ -14,6 +14,7 @@ import channelRoutes from './routes/channels.js';
 import dashboardRoutes from './routes/dashboard.js';
 import syncRoutes from './routes/sync.js';
 import exportRoutes from './routes/export.js';
+import rbacRoutes from './routes/rbac.js';
 
 const app = express();
 
@@ -35,6 +36,7 @@ app.use('/api/channels', channelRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/sync', syncRoutes);
 app.use('/api/export', exportRoutes);
+app.use('/api/rbac', rbacRoutes);
 
 // Health check
 app.get('/api/health', (req, res) => {
