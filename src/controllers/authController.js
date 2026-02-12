@@ -138,11 +138,70 @@ export async function inviteUser(req, res, next) {
     });
 
     res.status(201).json({
-      id: user._id,
+      _id: user._id,
       email: user.email,
       name: user.name,
       role: user.role,
     });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function updateTeamMember(req, res, next) {
+  try {
+    const { name, email, role } = req.body;
+    const update = {};
+
+    if (name !== undefined) update.name = name;
+    if (email !== undefined) {
+      // Check if email is already taken by another user
+      const existing = await User.findOne({ email, _id: { $ne: req.params.id } });
+      if (existing) {
+        return res.status(409).json({ message: 'Email already in use by another user' });
+      }
+      update.email = email;
+    }
+    if (role !== undefined) {
+      if (!['admin', 'manager', 'viewer'].includes(role)) {
+        return res.status(400).json({ message: 'Invalid role' });
+      }
+      update.role = role;
+    }
+
+    // Prevent demoting yourself
+    if (req.params.id === req.user._id.toString() && role && role !== req.user.role) {
+      return res.status(400).json({ message: 'You cannot change your own role' });
+    }
+
+    const user = await User.findByIdAndUpdate(req.params.id, update, { new: true }).select(
+      'name email role createdAt'
+    );
+
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    res.json(user);
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function deleteTeamMember(req, res, next) {
+  try {
+    // Prevent deleting yourself
+    if (req.params.id === req.user._id.toString()) {
+      return res.status(400).json({ message: 'You cannot delete your own account' });
+    }
+
+    const user = await User.findByIdAndDelete(req.params.id);
+
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    res.json({ message: 'Team member deleted' });
   } catch (err) {
     next(err);
   }
