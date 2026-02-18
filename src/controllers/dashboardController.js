@@ -2,7 +2,20 @@ import Channel from '../models/Channel.js';
 import ChannelSnapshot from '../models/ChannelSnapshot.js';
 import Video from '../models/Video.js';
 
-function getDateRange(period) {
+/**
+ * Returns { start, end } for filtering. Uses startDate/endDate query params if both
+ * provided (ISO date strings YYYY-MM-DD), otherwise uses period (7d, 30d, 90d).
+ */
+function getDateRange(period, query = {}) {
+  if (query.startDate && query.endDate) {
+    const start = new Date(query.startDate);
+    const end = new Date(query.endDate);
+    start.setHours(0, 0, 0, 0);
+    end.setHours(23, 59, 59, 999);
+    if (start > end) return getDateRange(period, {}); // fallback if invalid
+    return { start, end };
+  }
+
   const end = new Date();
   const start = new Date();
   switch (period) {
@@ -19,13 +32,17 @@ function getDateRange(period) {
       start.setDate(start.getDate() - 30);
   }
   start.setHours(0, 0, 0, 0);
+  end.setHours(23, 59, 59, 999);
   return { start, end };
 }
 
 function buildChannelFilter(query) {
   const filter = { status: { $ne: 'archived' } };
   if (query.category) filter.category = query.category;
-  if (query.tags) filter.tags = { $in: query.tags.split(',') };
+  if (query.tags && query.tags.trim()) {
+    const tagList = query.tags.split(',').map((t) => t.trim()).filter(Boolean);
+    if (tagList.length) filter.tags = { $in: tagList };
+  }
   if (query.assignedTo) filter.assignedTo = query.assignedTo;
   if (query.status) filter.status = query.status;
   return filter;
@@ -49,14 +66,14 @@ export async function getSummary(req, res, next) {
 
     // Get period comparison data
     const { period = '30d' } = req.query;
-    const { start } = getDateRange(period);
+    const { start, end } = getDateRange(period, req.query);
 
     // Get earliest snapshots in the period for comparison
     const oldSnapshots = await ChannelSnapshot.aggregate([
       {
         $match: {
           channelId: { $in: channelIds },
-          date: { $gte: start },
+          date: { $gte: start, $lte: end },
         },
       },
       {
@@ -90,13 +107,13 @@ export async function getSummary(req, res, next) {
     // Videos published this period
     const videosThisPeriod = await Video.countDocuments({
       channelId: { $in: channelIds },
-      publishedAt: { $gte: start },
+      publishedAt: { $gte: start, $lte: end },
     });
 
     // Average engagement rate (from recent videos)
     const recentVideos = await Video.find({
       channelId: { $in: channelIds },
-      publishedAt: { $gte: start },
+      publishedAt: { $gte: start, $lte: end },
       views: { $gt: 0 },
     }).select('views likes comments');
 
@@ -129,13 +146,13 @@ export async function getGrowthData(req, res, next) {
     const channels = await Channel.find(channelFilter).select('_id');
     const channelIds = channels.map((c) => c._id);
 
-    const { start } = getDateRange(period);
+    const { start, end } = getDateRange(period, req.query);
 
     const snapshots = await ChannelSnapshot.aggregate([
       {
         $match: {
           channelId: { $in: channelIds },
-          date: { $gte: start },
+          date: { $gte: start, $lte: end },
         },
       },
       {
@@ -169,14 +186,14 @@ export async function getTopChannels(req, res, next) {
     const channels = await Channel.find(channelFilter);
     const channelIds = channels.map((c) => c._id);
 
-    const { start } = getDateRange(period);
+    const { start, end } = getDateRange(period, req.query);
 
     // Get first and latest snapshot for each channel
     const growthData = await ChannelSnapshot.aggregate([
       {
         $match: {
           channelId: { $in: channelIds },
-          date: { $gte: start },
+          date: { $gte: start, $lte: end },
         },
       },
       {
@@ -233,11 +250,11 @@ export async function getTopVideos(req, res, next) {
     const channels = await Channel.find(channelFilter).select('_id title');
     const channelIds = channels.map((c) => c._id);
 
-    const { start } = getDateRange(period);
+    const { start, end } = getDateRange(period, req.query);
 
     const videos = await Video.find({
       channelId: { $in: channelIds },
-      publishedAt: { $gte: start },
+      publishedAt: { $gte: start, $lte: end },
     })
       .sort({ views: -1 })
       .limit(parseInt(limit))
@@ -281,13 +298,13 @@ export async function getPublishingFrequency(req, res, next) {
     const channels = await Channel.find(channelFilter).select('_id');
     const channelIds = channels.map((c) => c._id);
 
-    const { start } = getDateRange(period);
+    const { start, end } = getDateRange(period, req.query);
 
     const data = await Video.aggregate([
       {
         $match: {
           channelId: { $in: channelIds },
-          publishedAt: { $gte: start },
+          publishedAt: { $gte: start, $lte: end },
         },
       },
       {

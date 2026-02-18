@@ -35,9 +35,9 @@ export async function listChannels(req, res, next) {
     if (status) filter.status = status;
     else filter.status = { $ne: 'archived' };
 
-    if (tags) {
-      const tagList = tags.split(',').map((t) => t.trim());
-      filter.tags = { $in: tagList };
+    if (tags && typeof tags === 'string' && tags.trim()) {
+      const tagList = tags.split(',').map((t) => t.trim()).filter(Boolean);
+      if (tagList.length) filter.tags = { $in: tagList };
     }
 
     if (assignedTo) filter.assignedTo = assignedTo;
