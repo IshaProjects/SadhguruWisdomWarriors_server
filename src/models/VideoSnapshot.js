@@ -22,6 +22,7 @@ const videoSnapshotSchema = new mongoose.Schema(
     views:    { type: Number, default: 0 },
     likes:    { type: Number, default: 0 },
     comments: { type: Number, default: 0 },
+    deletedAt: { type: Date, default: null, index: true },
   },
   { timestamps: true }
 );

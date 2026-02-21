@@ -16,6 +16,7 @@ const channelSnapshotSchema = new mongoose.Schema(
     subscribers: { type: Number, default: 0 },
     views: { type: Number, default: 0 },
     videoCount: { type: Number, default: 0 },
+    deletedAt: { type: Date, default: null, index: true },
   },
   { timestamps: true }
 );

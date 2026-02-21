@@ -1,35 +1,56 @@
 export function extractChannelId(input) {
   if (!input) return null;
-  const trimmed = input.trim();
+
+  // Normalise: trim whitespace, ensure a protocol so URL parsing works
+  let raw = input.trim();
+
+  // Encode unicode characters in the path (e.g. Hindi channel names)
+  // by leaving them as-is – they'll be treated as handles below
+
+  // Add protocol if missing (e.g. "www.youtube.com/..." or bare paths)
+  if (!raw.match(/^https?:\/\//i)) {
+    raw = 'https://' + raw.replace(/^\/\//, '');
+  }
+
+  // Strip tracking / share params (?si=..., ?feature=..., etc.) and fragments
+  let url;
+  try {
+    url = new URL(raw);
+  } catch {
+    // Not a valid URL – treat as raw channel ID or handle
+    if (/^UC[\w-]{22}$/.test(raw)) return raw;
+    if (raw.startsWith('@')) return { handle: raw.slice(1) };
+    return raw;
+  }
+
+  // Remove ?si= and other tracking query params entirely
+  const cleanPath = url.pathname;
 
   // Already a raw channel ID (starts with UC and is 24 chars)
-  if (/^UC[\w-]{22}$/.test(trimmed)) return trimmed;
-
-  // URL patterns
-  const patterns = [
-    /youtube\.com\/channel\/(UC[\w-]{22})/,
-    /youtube\.com\/@([\w.-]+)/,
-    /youtube\.com\/c\/([\w.-]+)/,
-    /youtube\.com\/user\/([\w.-]+)/,
-  ];
-
-  for (const pattern of patterns) {
-    const match = trimmed.match(pattern);
-    if (match) {
-      // If it's a direct channel ID URL, return it
-      if (match[1] && match[1].startsWith('UC')) return match[1];
-      // Otherwise return the handle/username for resolution via API
-      return { handle: match[1] };
-    }
+  if (/^UC[\w-]{22}$/.test(cleanPath.replace('/', ''))) {
+    return cleanPath.replace(/^\//, '');
   }
 
-  // If it looks like a handle (@something), strip the @
-  if (trimmed.startsWith('@')) {
-    return { handle: trimmed.slice(1) };
+  // /channel/UCxxxx
+  const channelMatch = cleanPath.match(/\/channel\/(UC[\w-]{22})/);
+  if (channelMatch) return channelMatch[1];
+
+  // /@handle  (most common modern format)
+  const atMatch = cleanPath.match(/\/@([\w.\u0900-\u097F\u0600-\u06FF-]+)/u);
+  if (atMatch) return { handle: atMatch[1] };
+
+  // /c/customName or /user/username  (legacy)
+  const legacyMatch = cleanPath.match(/\/(?:c|user)\/([\w.-]+)/);
+  if (legacyMatch) return { handle: legacyMatch[1] };
+
+  // Bare path like /jibonsomossarsomadhan (no @ prefix – legacy custom URLs)
+  const bareMatch = cleanPath.match(/^\/([\w.-]+)$/);
+  if (bareMatch && bareMatch[1] !== 'channel') {
+    return { handle: bareMatch[1] };
   }
 
-  // Treat as potential channel ID or custom URL
-  return trimmed;
+  // Fallback: return the whole cleaned path segment
+  return cleanPath.replace(/^\//, '') || raw;
 }
 
 export function formatNumber(num) {

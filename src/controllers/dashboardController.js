@@ -116,6 +116,7 @@ export async function getSummary(req, res, next) {
       channelId: { $in: channelIds },
       publishedAt: { $gte: start, $lte: end },
       views: { $gt: 0 },
+      deletedAt: null,
     }).select('views likes comments');
 
     let avgEngagement = 0;
@@ -256,6 +257,7 @@ export async function getTopVideos(req, res, next) {
     const videos = await Video.find({
       channelId: { $in: channelIds },
       publishedAt: { $gte: start, $lte: end },
+      deletedAt: null,
     })
       .sort({ views: -1 })
       .limit(parseInt(limit))

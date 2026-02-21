@@ -7,6 +7,7 @@ import {
   getChannel,
   updateChannel,
   deleteChannel,
+  bulkDeleteChannels,
   syncSingleChannel,
   syncAllChannels,
   getChannelVideos,
@@ -21,6 +22,7 @@ router.use(authenticate);
 router.get('/', listChannels);
 router.post('/', authorize('admin', 'manager'), addChannel);
 router.post('/bulk', authorize('admin', 'manager'), upload.single('file'), bulkImport);
+router.delete('/bulk', authorize('admin'), bulkDeleteChannels);
 router.post('/sync-all', authorize('admin', 'manager'), syncAllChannels);
 
 router.get('/:id', getChannel);

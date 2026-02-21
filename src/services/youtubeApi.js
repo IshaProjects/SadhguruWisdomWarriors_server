@@ -100,6 +100,30 @@ export async function resolveChannelByHandle(handle) {
   return null;
 }
 
+/**
+ * Fetch a channel directly by its @handle using the channels endpoint
+ * (costs only 1 quota unit vs 100 for search).
+ * Returns the full channel item or null.
+ */
+export async function fetchChannelByHandle(handle) {
+  // Try forHandle first (works for @handles on the channels endpoint)
+  const h = handle.startsWith('@') ? handle : `@${handle}`;
+  try {
+    const data = await ytFetch('channels', {
+      part: 'snippet,statistics,brandingSettings,contentDetails',
+      forHandle: h,
+    });
+    if (data.items?.length > 0) return data.items[0];
+  } catch {
+    // forHandle may not work for legacy custom URLs — fall back to search
+  }
+
+  // Fallback: search (100 quota units)
+  const channelId = await resolveChannelByHandle(handle);
+  if (!channelId) return null;
+  return fetchSingleChannel(channelId);
+}
+
 export async function fetchPlaylistItems(playlistId, maxResults = 10) {
   const data = await ytFetch('playlistItems', {
     part: 'snippet,contentDetails',

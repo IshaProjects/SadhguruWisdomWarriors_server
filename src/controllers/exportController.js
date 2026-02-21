@@ -253,6 +253,7 @@ export async function reportVideos(req, res, next) {
     const skip     = isExport ? 0 : (parseInt(page) - 1) * parseInt(limit);
     const lim      = isExport ? 0 : parseInt(limit);
 
+    videoFilter.deletedAt = null;
     const query = Video.find(videoFilter).sort(sort);
     if (!isExport) query.skip(skip).limit(lim);
 

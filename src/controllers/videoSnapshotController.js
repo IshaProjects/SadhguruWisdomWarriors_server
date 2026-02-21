@@ -22,6 +22,7 @@ export async function getVideoSnapshots(req, res, next) {
     const snapshots = await VideoSnapshot.find({
       videoId,
       date: { $gte: start, $lte: end },
+      deletedAt: null,
     })
       .sort({ date: 1 })
       .lean();
@@ -56,6 +57,7 @@ export async function getChannelVideoTrends(req, res, next) {
         $match: {
           channelId: new mongoose.Types.ObjectId(channelId),
           date: { $gte: start, $lte: end },
+          deletedAt: null,
         },
       },
       {
@@ -76,6 +78,7 @@ export async function getChannelVideoTrends(req, res, next) {
         $match: {
           channelId: new mongoose.Types.ObjectId(channelId),
           date: { $gte: start, $lte: end },
+          deletedAt: null,
         },
       },
       {
@@ -95,7 +98,7 @@ export async function getChannelVideoTrends(req, res, next) {
 
     // Populate video metadata
     const videoIds = videoTrends.map((v) => v._id);
-    const videos = await Video.find({ _id: { $in: videoIds } }).select('title thumbnailUrl youtubeVideoId publishedAt');
+    const videos = await Video.find({ _id: { $in: videoIds }, deletedAt: null }).select('title thumbnailUrl youtubeVideoId publishedAt');
     const videoMap = new Map(videos.map((v) => [v._id.toString(), v]));
 
     const enriched = videoTrends.map((v) => ({

@@ -1,9 +1,11 @@
 import Channel from '../models/Channel.js';
 import ChannelSnapshot from '../models/ChannelSnapshot.js';
 import Video from '../models/Video.js';
-import { fetchSingleChannel, resolveChannelByHandle } from '../services/youtubeApi.js';
+import Category from '../models/Category.js';
+import { fetchSingleChannel, resolveChannelByHandle, fetchChannelByHandle } from '../services/youtubeApi.js';
 import { syncChannels } from '../services/syncEngine.js';
 import { extractChannelId } from '../utils/helpers.js';
+import { softDeleteChannels } from '../utils/softDelete.js';
 import { parse } from 'csv-parse/sync';
 
 export async function listChannels(req, res, next) {
@@ -159,58 +161,100 @@ export async function bulkImport(req, res, next) {
       trim: true,
     });
 
-    const results = { added: 0, skipped: 0, errors: [] };
+    const results = { added: 0, skipped: 0, errors: [], addedChannels: [] };
+
+    // Pre-collect and upsert all categories from the CSV into the Category collection
+    const categoryNames = [
+      ...new Set(
+        records
+          .map((r) => (r.category || '').trim())
+          .filter(Boolean)
+      ),
+    ];
+    for (const name of categoryNames) {
+      await Category.updateOne({ name }, { $setOnInsert: { name } }, { upsert: true });
+    }
 
     for (const record of records) {
+      const channelInput = (record.channel_id || record.channelId || '').trim();
+      if (!channelInput) {
+        results.errors.push({ input: JSON.stringify(record), error: 'Missing channel_id column' });
+        continue;
+      }
+
       try {
-        const channelInput = record.channel_id || record.channelId;
-        if (!channelInput) {
-          results.errors.push({ input: JSON.stringify(record), error: 'No channel_id' });
-          continue;
+        const parsed = extractChannelId(channelInput);
+
+        let ytData = null;
+
+        if (typeof parsed === 'string' && /^UC[\w-]{22}$/.test(parsed)) {
+          // Direct channel ID — cheapest lookup (1 quota unit)
+          const existing = await Channel.findOne({ youtubeChannelId: parsed });
+          if (existing) {
+            results.skipped++;
+            continue;
+          }
+          ytData = await fetchSingleChannel(parsed);
+
+        } else if (typeof parsed === 'object' && parsed.handle) {
+          // @handle or legacy custom URL — use forHandle endpoint (1 unit), fall back to search
+          ytData = await fetchChannelByHandle(parsed.handle);
+          if (ytData) {
+            const existing = await Channel.findOne({ youtubeChannelId: ytData.id });
+            if (existing) {
+              results.skipped++;
+              continue;
+            }
+          }
+
+        } else {
+          // Bare string that didn't match any pattern — try as channel ID
+          const existing = await Channel.findOne({ youtubeChannelId: parsed });
+          if (existing) {
+            results.skipped++;
+            continue;
+          }
+          ytData = await fetchSingleChannel(parsed);
         }
 
-        let channelId = extractChannelId(channelInput);
-        if (channelId && typeof channelId === 'object' && channelId.handle) {
-          results.errors.push({ input: channelInput, error: 'Handle resolution skipped in bulk (use channel IDs)' });
-          continue;
-        }
-
-        const existing = await Channel.findOne({ youtubeChannelId: channelId });
-        if (existing) {
-          results.skipped++;
-          continue;
-        }
-
-        const ytData = await fetchSingleChannel(channelId);
         if (!ytData) {
-          results.errors.push({ input: channelId, error: 'Not found on YouTube' });
+          results.errors.push({ input: channelInput, error: 'Channel not found on YouTube' });
           continue;
         }
 
-        await Channel.create({
-          youtubeChannelId: channelId,
-          title: ytData.snippet.title,
-          description: ytData.snippet.description,
-          thumbnailUrl: ytData.snippet.thumbnails?.high?.url || '',
-          bannerUrl: ytData.brandingSettings?.image?.bannerExternalUrl || '',
-          customUrl: ytData.snippet.customUrl || '',
-          country: ytData.snippet.country || '',
-          publishedAt: ytData.snippet.publishedAt,
+        const category = (record.category || '').trim() || 'Uncategorized';
+        const tags     = record.tags ? record.tags.split(';').map((t) => t.trim()).filter(Boolean) : [];
+
+        const channel = await Channel.create({
+          youtubeChannelId: ytData.id,
+          title:            ytData.snippet.title,
+          description:      ytData.snippet.description || '',
+          thumbnailUrl:     ytData.snippet.thumbnails?.high?.url || '',
+          bannerUrl:        ytData.brandingSettings?.image?.bannerExternalUrl || '',
+          customUrl:        ytData.snippet.customUrl || '',
+          country:          ytData.snippet.country || '',
+          publishedAt:      ytData.snippet.publishedAt,
           uploadsPlaylistId: ytData.contentDetails?.relatedPlaylists?.uploads || '',
-          category: record.category || 'Uncategorized',
-          tags: record.tags ? record.tags.split(';').map((t) => t.trim()) : [],
-          notes: record.notes || '',
+          category,
+          tags,
+          notes:            record.notes || '',
           currentStats: {
-            subscribers: parseInt(ytData.statistics.subscriberCount) || 0,
-            views: parseInt(ytData.statistics.viewCount) || 0,
-            videoCount: parseInt(ytData.statistics.videoCount) || 0,
+            subscribers: parseInt(ytData.statistics?.subscriberCount) || 0,
+            views:       parseInt(ytData.statistics?.viewCount)       || 0,
+            videoCount:  parseInt(ytData.statistics?.videoCount)      || 0,
           },
           lastSyncedAt: new Date(),
         });
 
         results.added++;
+        results.addedChannels.push({ title: channel.title, category, url: channelInput });
+
       } catch (err) {
-        results.errors.push({ input: record.channel_id, error: err.message });
+        if (err.code === 11000) {
+          results.skipped++; // duplicate key — already exists
+        } else {
+          results.errors.push({ input: channelInput, error: err.message });
+        }
       }
     }
 
@@ -234,12 +278,13 @@ export async function getChannel(req, res, next) {
     // Get snapshots for trend data
     const snapshots = await ChannelSnapshot.find({
       channelId: channel._id,
+      deletedAt: null,
     })
       .sort({ date: -1 })
       .limit(90);
 
     // Get recent videos
-    const videos = await Video.find({ channelId: channel._id })
+    const videos = await Video.find({ channelId: channel._id, deletedAt: null })
       .sort({ publishedAt: -1 })
       .limit(20);
 
@@ -274,19 +319,40 @@ export async function updateChannel(req, res, next) {
   }
 }
 
+/**
+ * DELETE /api/channels/:id
+ * Soft-delete a single channel and cascade to all related collections.
+ */
 export async function deleteChannel(req, res, next) {
   try {
-    const channel = await Channel.findByIdAndUpdate(
-      req.params.id,
-      { status: 'archived' },
-      { new: true }
-    );
-
+    // Verify the channel exists first
+    const channel = await Channel.findById(req.params.id);
     if (!channel) {
       return res.status(404).json({ message: 'Channel not found' });
     }
 
-    res.json({ message: 'Channel archived', channel });
+    await softDeleteChannels([req.params.id]);
+
+    res.json({ message: 'Channel archived', channelId: req.params.id });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * DELETE /api/channels/bulk
+ * Soft-delete multiple channels and cascade to all related collections.
+ */
+export async function bulkDeleteChannels(req, res, next) {
+  try {
+    const { ids } = req.body;
+    if (!Array.isArray(ids) || ids.length === 0) {
+      return res.status(400).json({ message: 'ids array is required' });
+    }
+
+    const { archived } = await softDeleteChannels(ids);
+
+    res.json({ archived });
   } catch (err) {
     next(err);
   }
@@ -327,11 +393,11 @@ export async function getChannelVideos(req, res, next) {
     const skip = (parseInt(page) - 1) * parseInt(limit);
 
     const [videos, total] = await Promise.all([
-      Video.find({ channelId: req.params.id })
+      Video.find({ channelId: req.params.id, deletedAt: null })
         .sort(sort)
         .skip(skip)
         .limit(parseInt(limit)),
-      Video.countDocuments({ channelId: req.params.id }),
+      Video.countDocuments({ channelId: req.params.id, deletedAt: null }),
     ]);
 
     res.json({

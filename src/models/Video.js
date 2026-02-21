@@ -23,6 +23,7 @@ const videoSchema = new mongoose.Schema(
     comments: { type: Number, default: 0 },
     duration: { type: String, default: '' },
     lastSyncedAt: { type: Date },
+    deletedAt: { type: Date, default: null, index: true },
   },
   { timestamps: true }
 );
