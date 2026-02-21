@@ -96,11 +96,14 @@ function mapChannel(c) {
   };
 }
 
-function mapVideo(v, channelMap) {
+function mapVideo(v, channelMap, avgViews) {
   const ch = channelMap[v.channelId?.toString()] || {};
   const engagement = v.views > 0
     ? (((v.likes + v.comments) / v.views) * 100).toFixed(2)
     : '0.00';
+  const outlierScore = avgViews > 0
+    ? parseFloat((v.views / avgViews).toFixed(2))
+    : 0;
   return {
     title:            v.title,
     youtube_video_id: v.youtubeVideoId,
@@ -111,6 +114,7 @@ function mapVideo(v, channelMap) {
     likes:            v.likes    ?? 0,
     comments:         v.comments ?? 0,
     engagement_rate:  parseFloat(engagement),
+    outlier_score:    outlierScore,
     duration:         v.duration || '',
     last_synced:      v.lastSyncedAt ? v.lastSyncedAt.toISOString().slice(0, 10) : '',
   };
@@ -263,7 +267,11 @@ export async function reportVideos(req, res, next) {
     const channelMap  = {};
     channelDocs.forEach((c) => { channelMap[c._id.toString()] = c; });
 
-    const rows = videos.map((v) => mapVideo(v, channelMap));
+    const avgViews = videos.length
+      ? videos.reduce((s, v) => s + (v.views ?? 0), 0) / videos.length
+      : 0;
+
+    const rows = videos.map((v) => mapVideo(v, channelMap, avgViews));
 
     /* ── JSON preview ── */
     if (format === 'json') {
@@ -305,6 +313,7 @@ export async function reportVideos(req, res, next) {
         { header: 'Likes',            key: 'likes',            width: 12 },
         { header: 'Comments',         key: 'comments',         width: 12 },
         { header: 'Engagement Rate%', key: 'engagement_rate',  width: 18 },
+        { header: 'Outlier Score',    key: 'outlier_score',    width: 16 },
         { header: 'Duration',         key: 'duration',         width: 10 },
         { header: 'Last Synced',      key: 'last_synced',      width: 14 },
       ];
