@@ -13,13 +13,16 @@ const DEFAULT_PAGES = [
 ];
 
 const DEFAULT_ACTIONS = [
-  { key: 'channels.add',    label: 'Add Channel',        roles: { admin: true, manager: true, viewer: false } },
-  { key: 'channels.edit',   label: 'Edit Channel',       roles: { admin: true, manager: true, viewer: false } },
-  { key: 'channels.delete', label: 'Delete Channel',     roles: { admin: true, manager: false, viewer: false } },
-  { key: 'channels.sync',   label: 'Sync Channel',       roles: { admin: true, manager: true, viewer: false } },
-  { key: 'channels.export', label: 'Export Channels CSV', roles: { admin: true, manager: true, viewer: false } },
-  { key: 'channels.import', label: 'Import Channels CSV', roles: { admin: true, manager: true, viewer: false } },
-  { key: 'team.invite',     label: 'Invite Team Member', roles: { admin: true, manager: false, viewer: false } },
+  { key: 'channels.add',        label: 'Add Channel',              roles: { admin: true, manager: true,  viewer: false } },
+  { key: 'channels.edit',       label: 'Edit Channel',             roles: { admin: true, manager: true,  viewer: false } },
+  { key: 'channels.delete',     label: 'Delete Channel',           roles: { admin: true, manager: false, viewer: false } },
+  { key: 'channels.sync',       label: 'Sync Channel',             roles: { admin: true, manager: true,  viewer: false } },
+  { key: 'channels.export',     label: 'Export Channels CSV',      roles: { admin: true, manager: true,  viewer: false } },
+  { key: 'channels.import',     label: 'Import Channels CSV',      roles: { admin: true, manager: true,  viewer: false } },
+  { key: 'team.invite',         label: 'Invite Team Member',       roles: { admin: true, manager: false, viewer: false } },
+  { key: 'sync.triggerChannel', label: 'Trigger Channel Sync Now', roles: { admin: true, manager: true,  viewer: false } },
+  { key: 'sync.triggerVideo',   label: 'Trigger Video Sync Now',   roles: { admin: true, manager: true,  viewer: false } },
+  { key: 'sync.configure',      label: 'Configure Sync Schedule',  roles: { admin: true, manager: false, viewer: false } },
 ];
 
 /**

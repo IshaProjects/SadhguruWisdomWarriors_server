@@ -1,6 +1,11 @@
 import mongoose from 'mongoose';
 
 const syncLogSchema = new mongoose.Schema({
+  syncType: {
+    type: String,
+    enum: ['channel', 'video'],
+    default: 'channel',
+  },
   type: {
     type: String,
     enum: ['auto', 'manual'],

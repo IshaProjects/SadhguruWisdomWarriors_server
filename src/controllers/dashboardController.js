@@ -1,6 +1,7 @@
 import Channel from '../models/Channel.js';
 import ChannelSnapshot from '../models/ChannelSnapshot.js';
 import Video from '../models/Video.js';
+import DashboardLayout from '../models/DashboardLayout.js';
 
 /**
  * Returns { start, end } for filtering. Uses startDate/endDate query params if both
@@ -274,18 +275,122 @@ export async function getCategoryBreakdown(req, res, next) {
       {
         $group: {
           _id: '$category',
-          count: { $sum: 1 },
-          totalSubs: { $sum: '$currentStats.subscribers' },
+          count:      { $sum: 1 },
+          totalSubs:  { $sum: '$currentStats.subscribers' },
+          totalViews: { $sum: '$currentStats.views' },
         },
       },
-      { $sort: { count: -1 } },
+      { $sort: { totalViews: -1 } },
     ]);
 
     res.json(result.map((r) => ({
-      category: r._id,
-      count: r.count,
-      totalSubs: r.totalSubs,
+      category:   r._id || 'Uncategorized',
+      count:      r.count,
+      totalSubs:  r.totalSubs,
+      totalViews: r.totalViews,
     })));
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * GET /api/dashboard/channel-metrics
+ * Returns per-channel computed metrics:
+ *   - engagementEfficiency : (likes + comments) / views  (from synced videos)
+ *   - subscriberVelocity   : (currentSubs - subs7dAgo)  / subs7dAgo  (%)
+ *   - contentImpact        : lifetime views / videoCount (from channel doc)
+ *   - loyaltyIndex         : comments / views  (from synced videos)
+ * Supports same filters as the rest of the dashboard.
+ */
+export async function getChannelMetrics(req, res, next) {
+  try {
+    const channelFilter = buildChannelFilter(req.query);
+    const channels = await Channel.find(channelFilter)
+      .select('_id title thumbnailUrl currentStats category')
+      .lean();
+
+    if (channels.length === 0) return res.json([]);
+
+    const channelIds = channels.map((c) => c._id);
+
+    // --- 1. Video aggregation: engagementEfficiency + loyaltyIndex ---
+    const videoAgg = await Video.aggregate([
+      { $match: { channelId: { $in: channelIds } } },
+      {
+        $group: {
+          _id:           '$channelId',
+          totalViews:    { $sum: '$views'    },
+          totalLikes:    { $sum: '$likes'    },
+          totalComments: { $sum: '$comments' },
+        },
+      },
+    ]);
+    const videoMap = new Map(videoAgg.map((v) => [v._id.toString(), v]));
+
+    // --- 2. ChannelSnapshot: subscriber velocity (7-day lookback) ---
+    const sevenDaysAgo = new Date();
+    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+    sevenDaysAgo.setHours(0, 0, 0, 0);
+
+    // For each channel get the most recent snapshot on or before 7 days ago
+    const snapAgg = await ChannelSnapshot.aggregate([
+      {
+        $match: {
+          channelId: { $in: channelIds },
+          date: { $lte: sevenDaysAgo },
+        },
+      },
+      { $sort: { date: -1 } },
+      {
+        $group: {
+          _id:        '$channelId',
+          subscribers: { $first: '$subscribers' },
+        },
+      },
+    ]);
+    const snapMap = new Map(snapAgg.map((s) => [s._id.toString(), s.subscribers]));
+
+    // --- 3. Compose result ---
+    const result = channels.map((ch) => {
+      const vid = videoMap.get(ch._id.toString());
+      const subs7dAgo = snapMap.get(ch._id.toString()) ?? null;
+      const currentSubs = ch.currentStats?.subscribers ?? 0;
+      const currentViews = ch.currentStats?.views ?? 0;
+      const videoCount = ch.currentStats?.videoCount ?? 0;
+
+      const totalViews    = vid?.totalViews    ?? 0;
+      const totalLikes    = vid?.totalLikes    ?? 0;
+      const totalComments = vid?.totalComments ?? 0;
+
+      const engagementEfficiency =
+        totalViews > 0 ? (totalLikes + totalComments) / totalViews : null;
+
+      const subscriberVelocity =
+        subs7dAgo != null && subs7dAgo > 0
+          ? ((currentSubs - subs7dAgo) / subs7dAgo) * 100
+          : null;
+
+      const contentImpact =
+        videoCount > 0 ? currentViews / videoCount : null;
+
+      const loyaltyIndex =
+        totalViews > 0 ? totalComments / totalViews : null;
+
+      return {
+        channelId:            ch._id,
+        title:                ch.title,
+        thumbnailUrl:         ch.thumbnailUrl,
+        category:             ch.category,
+        subscribers:          currentSubs,
+        engagementEfficiency,
+        subscriberVelocity,
+        contentImpact,
+        loyaltyIndex,
+      };
+    });
+
+    res.json(result);
   } catch (err) {
     next(err);
   }
@@ -319,6 +424,32 @@ export async function getPublishingFrequency(req, res, next) {
     ]);
 
     res.json(data.map((d) => ({ date: d._id, count: d.count })));
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function getLayout(req, res, next) {
+  try {
+    const doc = await DashboardLayout.findOne();
+    res.json(doc ? { layouts: doc.layouts, updatedBy: doc.updatedBy } : { layouts: {}, updatedBy: '' });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function saveLayout(req, res, next) {
+  try {
+    const { layouts } = req.body;
+    if (!layouts || typeof layouts !== 'object') {
+      return res.status(400).json({ message: 'layouts object is required' });
+    }
+    const doc = await DashboardLayout.findOneAndUpdate(
+      {},
+      { layouts, updatedBy: req.user.username || req.user.email || 'unknown' },
+      { upsert: true, new: true }
+    );
+    res.json({ layouts: doc.layouts, updatedBy: doc.updatedBy });
   } catch (err) {
     next(err);
   }

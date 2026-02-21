@@ -15,6 +15,7 @@ import dashboardRoutes from './routes/dashboard.js';
 import syncRoutes from './routes/sync.js';
 import exportRoutes from './routes/export.js';
 import rbacRoutes from './routes/rbac.js';
+import videoSnapshotRoutes from './routes/videoSnapshots.js';
 
 const app = express();
 
@@ -37,6 +38,7 @@ app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/sync', syncRoutes);
 app.use('/api/export', exportRoutes);
 app.use('/api/rbac', rbacRoutes);
+app.use('/api/video-snapshots', videoSnapshotRoutes);
 
 // Health check
 app.get('/api/health', (req, res) => {
@@ -51,7 +53,7 @@ const PORT = process.env.PORT || 5000;
 
 async function start() {
   await connectDB();
-  startSyncScheduler();
+  await startSyncScheduler();
 
   app.listen(PORT, () => {
     logger.info(`Server running on port ${PORT}`);
