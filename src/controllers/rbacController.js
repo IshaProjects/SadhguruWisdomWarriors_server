@@ -5,10 +5,11 @@ import RbacConfig from '../models/RbacConfig.js';
  * Admin always has access to everything by default.
  */
 const DEFAULT_PAGES = [
-  { key: 'dashboard',  label: 'Dashboard',    roles: { admin: true, manager: true, viewer: true } },
-  { key: 'channels',   label: 'Channels',     roles: { admin: true, manager: true, viewer: true } },
+  { key: 'dashboard',  label: 'Dashboard',    roles: { admin: true, manager: true, viewer: true  } },
+  { key: 'channels',   label: 'Channels',     roles: { admin: true, manager: true, viewer: true  } },
+  { key: 'reports',    label: 'Reports',      roles: { admin: true, manager: true, viewer: false } },
   { key: 'sync',       label: 'Sync Status',  roles: { admin: true, manager: true, viewer: false } },
-  { key: 'settings',   label: 'Settings',     roles: { admin: true, manager: false, viewer: false } },
+  { key: 'settings',   label: 'Settings',     roles: { admin: true, manager: false,viewer: false } },
   { key: 'import',     label: 'Import',       roles: { admin: true, manager: true, viewer: false } },
 ];
 
@@ -39,6 +40,26 @@ export async function getRbacConfig(req, res, next) {
         pages: DEFAULT_PAGES,
         actions: DEFAULT_ACTIONS,
       });
+    } else {
+      // Merge any new default keys that don't exist in the stored config yet
+      const existingPageKeys   = new Set(config.pages.map((p) => p.key));
+      const existingActionKeys = new Set(config.actions.map((a) => a.key));
+
+      const missingPages   = DEFAULT_PAGES.filter((p) => !existingPageKeys.has(p.key));
+      const missingActions = DEFAULT_ACTIONS.filter((a) => !existingActionKeys.has(a.key));
+
+      if (missingPages.length || missingActions.length) {
+        config = await RbacConfig.findOneAndUpdate(
+          { _singletonKey: 'rbac' },
+          {
+            $push: {
+              ...(missingPages.length   && { pages:   { $each: missingPages   } }),
+              ...(missingActions.length && { actions: { $each: missingActions } }),
+            },
+          },
+          { new: true }
+        );
+      }
     }
 
     res.json({ pages: config.pages, actions: config.actions, updatedAt: config.updatedAt });
