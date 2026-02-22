@@ -11,6 +11,7 @@ const DEFAULT_PAGES = [
   { key: 'sync',       label: 'Sync Status',  roles: { admin: true, manager: true, viewer: false } },
   { key: 'settings',   label: 'Settings',     roles: { admin: true, manager: false,viewer: false } },
   { key: 'import',     label: 'Import',       roles: { admin: true, manager: true, viewer: false } },
+  { key: 'ai-studio', label: 'AI Studio',    roles: { admin: true, manager: true, viewer: true  } },
 ];
 
 const DEFAULT_ACTIONS = [
@@ -24,6 +25,8 @@ const DEFAULT_ACTIONS = [
   { key: 'sync.triggerChannel', label: 'Trigger Channel Sync Now', roles: { admin: true, manager: true,  viewer: false } },
   { key: 'sync.triggerVideo',   label: 'Trigger Video Sync Now',   roles: { admin: true, manager: true,  viewer: false } },
   { key: 'sync.configure',      label: 'Configure Sync Schedule',  roles: { admin: true, manager: false, viewer: false } },
+  { key: 'queue.add',           label: 'Add to Ingest Queue',      roles: { admin: true, manager: true,  viewer: false } },
+  { key: 'queue.process',       label: 'Process Ingest Queue',     roles: { admin: true, manager: false, viewer: false } },
 ];
 
 /**

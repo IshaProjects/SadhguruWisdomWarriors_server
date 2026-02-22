@@ -17,6 +17,7 @@ import exportRoutes from './routes/export.js';
 import rbacRoutes from './routes/rbac.js';
 import videoSnapshotRoutes from './routes/videoSnapshots.js';
 import categoryRoutes from './routes/categories.js';
+import videoQueueRoutes from './routes/videoQueue.js';
 
 const app = express();
 
@@ -41,6 +42,7 @@ app.use('/api/export', exportRoutes);
 app.use('/api/rbac', rbacRoutes);
 app.use('/api/video-snapshots', videoSnapshotRoutes);
 app.use('/api/categories', categoryRoutes);
+app.use('/api/video-queue', videoQueueRoutes);
 
 // Health check
 app.get('/api/health', (req, res) => {
