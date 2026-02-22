@@ -8,7 +8,7 @@ import Video from '../models/Video.js';
 ───────────────────────────────────────────────────────────────────── */
 
 function buildChannelFilter(query) {
-  const { search, category, status, tags, minSubs, maxSubs, minViews, maxViews, country } = query;
+  const { search, category, status, tags, minSubs, maxSubs, minViews, maxViews, country, startDate, endDate } = query;
   const filter = {};
 
   if (search) {
@@ -35,6 +35,12 @@ function buildChannelFilter(query) {
     filter['currentStats.views'] = {};
     if (minViews) filter['currentStats.views'].$gte = parseInt(minViews);
     if (maxViews) filter['currentStats.views'].$lte = parseInt(maxViews);
+  }
+  // Date range filters on lastSyncedAt (when channel data was last refreshed)
+  if (startDate || endDate) {
+    filter.lastSyncedAt = {};
+    if (startDate) filter.lastSyncedAt.$gte = new Date(startDate);
+    if (endDate)   filter.lastSyncedAt.$lte = new Date(endDate + 'T23:59:59.999Z');
   }
   return filter;
 }

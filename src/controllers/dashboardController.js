@@ -39,13 +39,18 @@ function getDateRange(period, query = {}) {
 
 function buildChannelFilter(query) {
   const filter = { status: { $ne: 'archived' } };
-  if (query.category) filter.category = query.category;
+  if (query.category)   filter.category   = query.category;
+  if (query.assignedTo) filter.assignedTo = query.assignedTo;
+  if (query.status)     filter.status     = query.status;
   if (query.tags && query.tags.trim()) {
     const tagList = query.tags.split(',').map((t) => t.trim()).filter(Boolean);
     if (tagList.length) filter.tags = { $in: tagList };
   }
-  if (query.assignedTo) filter.assignedTo = query.assignedTo;
-  if (query.status) filter.status = query.status;
+  if (query.startDate || query.endDate) {
+    filter.lastSyncedAt = {};
+    if (query.startDate) filter.lastSyncedAt.$gte = new Date(query.startDate);
+    if (query.endDate)   filter.lastSyncedAt.$lte = new Date(query.endDate + 'T23:59:59.999Z');
+  }
   return filter;
 }
 
