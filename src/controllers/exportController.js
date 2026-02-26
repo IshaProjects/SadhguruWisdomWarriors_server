@@ -1,6 +1,7 @@
 import { Parser } from '@json2csv/plainjs';
 import ExcelJS from 'exceljs';
 import Channel from '../models/Channel.js';
+import ChannelSnapshot from '../models/ChannelSnapshot.js';
 import Video from '../models/Video.js';
 
 /* ─────────────────────────────────────────────────────────────────────
@@ -36,8 +37,11 @@ function buildChannelFilter(query) {
     if (minViews) filter['currentStats.views'].$gte = parseInt(minViews);
     if (maxViews) filter['currentStats.views'].$lte = parseInt(maxViews);
   }
-  // Date range filters on lastSyncedAt (when channel data was last refreshed)
-  if (startDate || endDate) {
+  // Date range: when BOTH dates provided → period metrics mode (no lastSyncedAt filter).
+  // When only one date → filter by lastSyncedAt.
+  if (startDate && endDate) {
+    // Period mode: dates used for snapshot delta, not for filtering
+  } else if (startDate || endDate) {
     filter.lastSyncedAt = {};
     if (startDate) filter.lastSyncedAt.$gte = new Date(startDate);
     if (endDate)   filter.lastSyncedAt.$lte = new Date(endDate + 'T23:59:59.999Z');
@@ -79,12 +83,12 @@ function buildVideoFilter(query) {
   return { channelFilter, videoFilter };
 }
 
-function mapChannel(c) {
+function mapChannel(c, periodMetrics = null) {
   const subs   = c.currentStats?.subscribers ?? 0;
   const views  = c.currentStats?.views       ?? 0;
   const videos = c.currentStats?.videoCount  ?? 0;
   const avgViewsPerVideo = videos > 0 ? Math.round(views / videos) : 0;
-  return {
+  const row = {
     title:               c.title,
     youtube_channel_id:  c.youtubeChannelId,
     custom_url:          c.customUrl || '',
@@ -100,6 +104,11 @@ function mapChannel(c) {
     notes:               c.notes || '',
     last_synced:         c.lastSyncedAt ? c.lastSyncedAt.toISOString().slice(0, 10) : '',
   };
+  if (periodMetrics) {
+    row.views_in_period       = periodMetrics.viewsInPeriod;
+    row.subscribers_in_period = periodMetrics.subscribersInPeriod;
+  }
+  return row;
 }
 
 function mapVideo(v, channelMap, avgViews) {
@@ -129,6 +138,7 @@ function mapVideo(v, channelMap, avgViews) {
 /* ─────────────────────────────────────────────────────────────────────
    Channel report — GET /api/export/report/channels
    ?format=json|csv|excel  + all filter params + sort + page + limit
+   When startDate+endDate provided: adds views_in_period, subscribers_in_period
 ───────────────────────────────────────────────────────────────────── */
 export async function reportChannels(req, res, next) {
   try {
@@ -137,26 +147,125 @@ export async function reportChannels(req, res, next) {
       sort   = '-currentStats.subscribers',
       page   = 1,
       limit  = 50,
+      startDate,
+      endDate,
     } = req.query;
 
     const filter = buildChannelFilter(req.query);
+    const isPeriodMode = !!(startDate && endDate);
 
     const isExport = format === 'csv' || format === 'excel';
-    const skip     = isExport ? 0 : (parseInt(page) - 1) * parseInt(limit);
     const lim      = isExport ? 0 : parseInt(limit); // 0 = no limit for exports
 
-    const query = Channel.find(filter)
-      .populate('assignedTo', 'name email')
-      .sort(sort);
+    let channels;
+    let total;
+    let summary = null;
 
-    if (!isExport) query.skip(skip).limit(lim);
+    let rows;
+    if (isPeriodMode) {
+      // Fetch all matching channels (no skip/limit yet — we need to compute period metrics and sort)
+      channels = await Channel.find(filter)
+        .populate('assignedTo', 'name email')
+        .lean();
+      total = channels.length;
 
-    const [channels, total] = await Promise.all([
-      query,
-      Channel.countDocuments(filter),
-    ]);
+      const channelIds = channels.map((c) => c._id);
+      const startDateObj = new Date(startDate);
+      const endDateObj   = new Date(endDate + 'T23:59:59.999Z');
+      const snapshotFilter = { channelId: { $in: channelIds }, deletedAt: null };
 
-    const rows = channels.map(mapChannel);
+      const [startSnapshots, endSnapshots] = await Promise.all([
+        ChannelSnapshot.aggregate([
+          { $match: { ...snapshotFilter, date: { $lte: startDateObj } } },
+          { $sort: { date: -1 } },
+          { $group: { _id: '$channelId', views: { $first: '$views' }, subscribers: { $first: '$subscribers' } } },
+        ]),
+        ChannelSnapshot.aggregate([
+          { $match: { ...snapshotFilter, date: { $lte: endDateObj } } },
+          { $sort: { date: -1 } },
+          { $group: { _id: '$channelId', views: { $first: '$views' }, subscribers: { $first: '$subscribers' } } },
+        ]),
+      ]);
+
+      const startMap = new Map(startSnapshots.map((s) => [s._id.toString(), s]));
+      const endMap   = new Map(endSnapshots.map((s) => [s._id.toString(), s]));
+
+      rows = channels.map((c) => {
+        const start = startMap.get(c._id.toString());
+        const end   = endMap.get(c._id.toString());
+        const startViews = start?.views ?? 0;
+        const endViews   = end?.views   ?? 0;
+        const startSubs  = start?.subscribers ?? 0;
+        const endSubs    = end?.subscribers   ?? 0;
+        const periodMetrics = {
+          viewsInPeriod:       Math.max(0, endViews - startViews),
+          subscribersInPeriod: endSubs - startSubs,
+        };
+        return mapChannel(c, periodMetrics);
+      });
+
+      // Sort by requested field (support period fields)
+      const rawKey = sort.replace(/^[-+]/, '');
+      const sortDir = sort.startsWith('-') ? -1 : 1;
+      const sortKey = rawKey
+        .replace('currentStats.subscribers', 'subscribers')
+        .replace('currentStats.views', 'total_views')
+        .replace('currentStats.videoCount', 'video_count');
+      rows.sort((a, b) => {
+        const av = Number(a[sortKey]) || 0;
+        const bv = Number(b[sortKey]) || 0;
+        const cmp = av - bv;
+        return sortDir * (cmp > 0 ? 1 : cmp < 0 ? -1 : 0);
+      });
+
+      // Compute summary from full rows before pagination
+      if (format === 'json') {
+        summary = {
+          totalChannels:   rows.length,
+          totalSubscribers: rows.reduce((s, r) => s + (r.subscribers ?? 0), 0),
+          totalViews:      rows.reduce((s, r) => s + (r.total_views ?? 0), 0),
+          totalVideos:     rows.reduce((s, r) => s + (r.video_count ?? 0), 0),
+          totalViewsInPeriod:      rows.reduce((s, r) => s + (r.views_in_period ?? 0), 0),
+          totalSubscribersInPeriod: rows.reduce((s, r) => s + (r.subscribers_in_period ?? 0), 0),
+        };
+      }
+
+      const skip = isExport ? 0 : (parseInt(page) - 1) * parseInt(limit);
+      if (!isExport) rows = rows.slice(skip, skip + parseInt(limit));
+    } else {
+      const skip = isExport ? 0 : (parseInt(page) - 1) * parseInt(limit);
+      const query = Channel.find(filter)
+        .populate('assignedTo', 'name email')
+        .sort(sort);
+
+      if (!isExport) query.skip(skip).limit(lim);
+
+      [channels, total] = await Promise.all([
+        query,
+        Channel.countDocuments(filter),
+      ]);
+      rows = channels.map((c) => mapChannel(c));
+    }
+
+    /* ── Summary (for JSON, non-period mode) ── */
+    if (format === 'json' && !summary) {
+      const agg = await Channel.aggregate([
+        { $match: filter },
+        { $group: {
+          _id: null,
+          totalChannels:   { $sum: 1 },
+          totalSubscribers: { $sum: { $ifNull: ['$currentStats.subscribers', 0] } },
+          totalViews:      { $sum: { $ifNull: ['$currentStats.views', 0] } },
+          totalVideos:     { $sum: { $ifNull: ['$currentStats.videoCount', 0] } },
+        }},
+      ]);
+      summary = agg[0] ? {
+        totalChannels:    agg[0].totalChannels,
+        totalSubscribers: agg[0].totalSubscribers,
+        totalViews:       agg[0].totalViews,
+        totalVideos:      agg[0].totalVideos,
+      } : { totalChannels: 0, totalSubscribers: 0, totalViews: 0, totalVideos: 0 };
+    }
 
     /* ── JSON preview ── */
     if (format === 'json') {
@@ -168,6 +277,7 @@ export async function reportChannels(req, res, next) {
           total,
           pages: Math.ceil(total / parseInt(limit)),
         },
+        summary,
       });
     }
 
@@ -188,7 +298,7 @@ export async function reportChannels(req, res, next) {
       wb.creator = 'YT Manager';
       const ws  = wb.addWorksheet('Channels');
 
-      ws.columns = [
+      const baseColumns = [
         { header: 'Title',               key: 'title',               width: 40 },
         { header: 'YouTube Channel ID',  key: 'youtube_channel_id',  width: 26 },
         { header: 'Custom URL',          key: 'custom_url',          width: 22 },
@@ -198,12 +308,19 @@ export async function reportChannels(req, res, next) {
         { header: 'Tags',                key: 'tags',                width: 24 },
         { header: 'Subscribers',         key: 'subscribers',         width: 16 },
         { header: 'Total Views',         key: 'total_views',         width: 16 },
+        ...(isPeriodMode
+          ? [
+              { header: 'Views (Period)',      key: 'views_in_period',       width: 16 },
+              { header: 'Subscribers (Period)', key: 'subscribers_in_period', width: 18 },
+            ]
+          : []),
         { header: 'Video Count',         key: 'video_count',         width: 14 },
         { header: 'Avg Views/Video',     key: 'avg_views_per_video', width: 18 },
         { header: 'Assigned To',         key: 'assigned_to',         width: 18 },
         { header: 'Notes',               key: 'notes',               width: 30 },
         { header: 'Last Synced',         key: 'last_synced',         width: 14 },
       ];
+      ws.columns = baseColumns;
 
       // Style header row
       ws.getRow(1).eachCell((cell) => {
