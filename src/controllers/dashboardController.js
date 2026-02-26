@@ -276,7 +276,78 @@ export async function getTopVideos(req, res, next) {
 
 export async function getCategoryBreakdown(req, res, next) {
   try {
+    const { startDate, endDate } = req.query;
+    const isPeriodMode = !!(startDate && endDate);
+
     const channelFilter = buildChannelFilter(req.query);
+    if (isPeriodMode) {
+      delete channelFilter.lastSyncedAt;
+    }
+
+    const channels = await Channel.find(channelFilter)
+      .select('_id category')
+      .lean();
+
+    if (channels.length === 0) {
+      return res.json([]);
+    }
+
+    const channelIds = channels.map((c) => c._id);
+
+    if (isPeriodMode) {
+      const startDateObj = new Date(startDate);
+      const endDateObj = new Date(endDate + 'T23:59:59.999Z');
+      const snapshotFilter = { channelId: { $in: channelIds }, deletedAt: null };
+
+      const [startSnapshots, endSnapshots] = await Promise.all([
+        ChannelSnapshot.aggregate([
+          { $match: { ...snapshotFilter, date: { $lte: startDateObj } } },
+          { $sort: { date: -1 } },
+          { $group: { _id: '$channelId', views: { $first: '$views' }, subscribers: { $first: '$subscribers' } } },
+        ]),
+        ChannelSnapshot.aggregate([
+          { $match: { ...snapshotFilter, date: { $lte: endDateObj } } },
+          { $sort: { date: -1 } },
+          { $group: { _id: '$channelId', views: { $first: '$views' }, subscribers: { $first: '$subscribers' } } },
+        ]),
+      ]);
+
+      const startMap = new Map(startSnapshots.map((s) => [s._id.toString(), s]));
+      const endMap = new Map(endSnapshots.map((s) => [s._id.toString(), s]));
+
+      const channelPeriodData = channels.map((c) => {
+        const start = startMap.get(c._id.toString());
+        const end = endMap.get(c._id.toString());
+        const startViews = start?.views ?? 0;
+        const endViews = end?.views ?? 0;
+        const startSubs = start?.subscribers ?? 0;
+        const endSubs = end?.subscribers ?? 0;
+        return {
+          category: c.category || 'Uncategorized',
+          viewsInPeriod: Math.max(0, endViews - startViews),
+          subsInPeriod: endSubs - startSubs,
+        };
+      });
+
+      const byCategory = new Map();
+      for (const d of channelPeriodData) {
+        const cat = d.category;
+        if (!byCategory.has(cat)) {
+          byCategory.set(cat, { count: 0, totalViews: 0, totalSubs: 0 });
+        }
+        const acc = byCategory.get(cat);
+        acc.count += 1;
+        acc.totalViews += d.viewsInPeriod;
+        acc.totalSubs += d.subsInPeriod;
+      }
+
+      const result = Array.from(byCategory.entries())
+        .map(([category, v]) => ({ category, ...v }))
+        .sort((a, b) => b.totalViews - a.totalViews);
+
+      return res.json(result);
+    }
+
     const result = await Channel.aggregate([
       { $match: channelFilter },
       {
