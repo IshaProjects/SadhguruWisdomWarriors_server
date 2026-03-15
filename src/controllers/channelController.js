@@ -3,7 +3,8 @@ import ChannelSnapshot from '../models/ChannelSnapshot.js';
 import Video from '../models/Video.js';
 import Category from '../models/Category.js';
 import { fetchSingleChannel, resolveChannelByHandle, fetchChannelByHandle } from '../services/youtubeApi.js';
-import { syncChannels } from '../services/syncEngine.js';
+import { syncChannels, pullAllChannelVideos, pullAllChannelsVideos } from '../services/syncEngine.js';
+import { classifySadguruVideoBatch } from '../services/vertexAiService.js';
 import { extractChannelId } from '../utils/helpers.js';
 import { softDeleteChannels } from '../utils/softDelete.js';
 import { parse } from 'csv-parse/sync';
@@ -15,6 +16,7 @@ export async function listChannels(req, res, next) {
       limit = 25,
       search,
       category,
+      group,
       tags,
       status,
       assignedTo,
@@ -33,7 +35,13 @@ export async function listChannels(req, res, next) {
       ];
     }
 
-    if (category) filter.category = category;
+    if (group === 'dedicated') {
+      filter.category = { $regex: /^Dedicated/i };
+    } else if (group === 'ihi') {
+      filter.category = { $regex: /IHI/i };
+    } else if (category) {
+      filter.category = category;
+    }
     if (status) filter.status = status;
     else filter.status = { $ne: 'archived' };
 
@@ -288,7 +296,9 @@ export async function getChannel(req, res, next) {
       .sort({ publishedAt: -1 })
       .limit(20);
 
-    res.json({ channel, snapshots: snapshots.reverse(), videos });
+    const videoCountInDb = await Video.countDocuments({ channelId: channel._id, deletedAt: null });
+
+    res.json({ channel, snapshots: snapshots.reverse(), videos, videoCountInDb });
   } catch (err) {
     next(err);
   }
@@ -375,6 +385,33 @@ export async function syncSingleChannel(req, res, next) {
   }
 }
 
+/**
+ * POST /api/channels/:id/pull-videos
+ * Pull all videos for a channel in batches of 100.
+ */
+export async function pullChannelVideos(req, res, next) {
+  try {
+    const channel = await Channel.findById(req.params.id);
+    if (!channel) {
+      return res.status(404).json({ message: 'Channel not found' });
+    }
+    if (channel.allVideosPulled) {
+      return res.status(400).json({ message: 'All videos already pulled for this channel' });
+    }
+
+    const result = await pullAllChannelVideos(channel._id);
+    res.json(result);
+  } catch (err) {
+    if (err.message === 'Pull all videos already in progress') {
+      return res.status(409).json({ message: err.message });
+    }
+    if (err.message === 'QUOTA_EXCEEDED') {
+      return res.status(429).json({ message: 'YouTube API quota exceeded' });
+    }
+    next(err);
+  }
+}
+
 export async function syncAllChannels(req, res, next) {
   try {
     const log = await syncChannels(null, 'manual');
@@ -382,6 +419,25 @@ export async function syncAllChannels(req, res, next) {
   } catch (err) {
     if (err.message === 'Sync already in progress') {
       return res.status(409).json({ message: err.message });
+    }
+    next(err);
+  }
+}
+
+/**
+ * POST /api/channels/pull-all-videos
+ * Pull all videos for all channels (one channel at a time, 100 videos per batch).
+ */
+export async function pullAllChannelsVideosHandler(req, res, next) {
+  try {
+    const result = await pullAllChannelsVideos();
+    res.json(result);
+  } catch (err) {
+    if (err.message === 'Pull all videos already in progress') {
+      return res.status(409).json({ message: err.message });
+    }
+    if (err.message === 'QUOTA_EXCEEDED') {
+      return res.status(429).json({ message: 'YouTube API quota exceeded' });
     }
     next(err);
   }
@@ -410,6 +466,151 @@ export async function getChannelVideos(req, res, next) {
       },
     });
   } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * Classify videos for a single channel.
+ * Dedicated: mark unclassified as sadguru. IHI/other: use Vertex AI / Gemini.
+ * Returns result object or throws.
+ */
+async function classifyVideosForChannel(channel) {
+  let videos = await Video.find({ channelId: channel._id, deletedAt: null });
+  if (videos.length === 0) {
+    return {
+      totalVideos: 0,
+      alreadyClassified: 0,
+      newlyClassified: 0,
+      failed: 0,
+      sadguruCount: 0,
+      nonSadguruCount: 0,
+      isSadhguruChannel: false,
+    };
+  }
+
+  const toMigrate = videos.filter((v) => v.isSadguruVideo != null && !v.classification);
+  for (const v of toMigrate) {
+    await Video.findByIdAndUpdate(v._id, {
+      classification: v.isSadguruVideo ? 'sadhguru' : 'non sadhguru',
+      $unset: { isSadguruVideo: 1 },
+    });
+  }
+  if (toMigrate.length) {
+    videos = await Video.find({ channelId: channel._id, deletedAt: null });
+  }
+
+  const category = (channel.category || '').toLowerCase();
+  const isDedicated = category.startsWith('dedicated');
+  const isEmpty = (v) => !v.classification || String(v.classification).trim() === '';
+
+  if (isDedicated) {
+    const result = await Video.updateMany(
+      { channelId: channel._id, deletedAt: null, $or: [{ classification: '' }, { classification: { $exists: false } }] },
+      { $set: { classification: 'sadhguru' } }
+    );
+    const newlyClassified = result.modifiedCount;
+    return {
+      totalVideos: videos.length,
+      alreadyClassified: videos.length - newlyClassified,
+      newlyClassified,
+      failed: 0,
+      sadguruCount: newlyClassified,
+      nonSadguruCount: 0,
+      isSadhguruChannel: true,
+    };
+  }
+
+  const toClassify = videos.filter(isEmpty);
+  let failed = 0;
+  const classificationMap = await classifySadguruVideoBatch(toClassify);
+  let sadguruCount = 0;
+  for (const video of toClassify) {
+    const value = classificationMap.get(String(video._id));
+    if (value) {
+      await Video.findByIdAndUpdate(video._id, { classification: value });
+      if (value === 'sadhguru') sadguruCount++;
+    } else {
+      failed++;
+    }
+  }
+  const newlyClassified = toClassify.length - failed;
+  return {
+    totalVideos: videos.length,
+    alreadyClassified: videos.length - toClassify.length,
+    newlyClassified,
+    failed,
+    sadguruCount,
+    nonSadguruCount: newlyClassified - sadguruCount,
+    isSadhguruChannel: false,
+  };
+}
+
+/**
+ * POST /api/channels/:id/classify-videos
+ * Dedicated channels: mark all videos as Sadguru by default (no API call).
+ * IHI channels: use Vertex AI to classify each video.
+ */
+export async function classifyChannelVideos(req, res, next) {
+  try {
+    const channel = await Channel.findById(req.params.id);
+    if (!channel) {
+      return res.status(404).json({ message: 'Channel not found' });
+    }
+    const result = await classifyVideosForChannel(channel);
+    res.json(result);
+  } catch (err) {
+    if (err.message?.includes('GEMINI_API_KEY') || err.message?.includes('GOOGLE_CLOUD_PROJECT')) {
+      return res.status(503).json({ message: 'AI not configured. Set GEMINI_API_KEY (from aistudio.google.com) or GOOGLE_CLOUD_PROJECT for Vertex AI.' });
+    }
+    console.error('Classification failed:', err.message);
+    return res.status(500).json({ message: err.message || 'Classification failed' });
+  }
+}
+
+/**
+ * POST /api/channels/classify-all
+ * Classify all videos for all channels using the same logic (Dedicated = sadguru, IHI/other = AI).
+ */
+export async function classifyAllChannelsVideos(req, res, next) {
+  try {
+    const channels = await Channel.find({ status: { $ne: 'archived' } }).sort({ title: 1 });
+
+    let channelsProcessed = 0;
+    let totalVideos = 0;
+    let totalNewlyClassified = 0;
+    let totalSadguru = 0;
+    let totalNonSadguru = 0;
+    let totalFailed = 0;
+    const errors = [];
+
+    for (const channel of channels) {
+      try {
+        const result = await classifyVideosForChannel(channel);
+        channelsProcessed++;
+        totalVideos += result.totalVideos;
+        totalNewlyClassified += result.newlyClassified;
+        totalSadguru += result.sadhguruCount;
+        totalNonSadguru += result.nonSadguruCount;
+        totalFailed += result.failed;
+      } catch (err) {
+        errors.push({ channelId: channel._id, title: channel.title, message: err.message });
+      }
+    }
+
+    res.json({
+      channelsProcessed,
+      totalVideos,
+      totalNewlyClassified,
+      totalSadguru,
+      totalNonSadguru,
+      totalFailed,
+      errors: errors.length > 0 ? errors : undefined,
+    });
+  } catch (err) {
+    if (err.message?.includes('GEMINI_API_KEY') || err.message?.includes('GOOGLE_CLOUD_PROJECT')) {
+      return res.status(503).json({ message: 'AI not configured. Set GEMINI_API_KEY (from aistudio.google.com) or GOOGLE_CLOUD_PROJECT for Vertex AI.' });
+    }
     next(err);
   }
 }

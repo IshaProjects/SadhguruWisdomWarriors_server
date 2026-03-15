@@ -133,6 +133,41 @@ export async function fetchPlaylistItems(playlistId, maxResults = 10) {
   return data.items || [];
 }
 
+/**
+ * Fetch a page of playlist items with optional pagination.
+ * Returns { items, nextPageToken }.
+ */
+export async function fetchPlaylistItemsPage(playlistId, pageToken = null, maxResults = 50) {
+  const params = {
+    part: 'snippet,contentDetails',
+    playlistId,
+    maxResults: String(Math.min(maxResults, 50)),
+  };
+  if (pageToken) params.pageToken = pageToken;
+  const data = await ytFetch('playlistItems', params);
+  return {
+    items: data.items || [],
+    nextPageToken: data.nextPageToken || null,
+  };
+}
+
+/**
+ * Paginate through entire playlist and return all video IDs.
+ */
+export async function fetchAllPlaylistItemIds(playlistId) {
+  const videoIds = [];
+  let pageToken = null;
+  do {
+    const { items, nextPageToken } = await fetchPlaylistItemsPage(playlistId, pageToken, 50);
+    for (const item of items) {
+      const vid = item.contentDetails?.videoId;
+      if (vid) videoIds.push(vid);
+    }
+    pageToken = nextPageToken;
+  } while (pageToken);
+  return videoIds;
+}
+
 export async function fetchVideosBatch(videoIds) {
   const results = [];
   for (let i = 0; i < videoIds.length; i += YT_BATCH_SIZE) {

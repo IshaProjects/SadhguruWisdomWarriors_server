@@ -24,6 +24,7 @@ const videoSchema = new mongoose.Schema(
     duration: { type: String, default: '' },
     lastSyncedAt: { type: Date },
     deletedAt: { type: Date, default: null, index: true },
+    classification: { type: String, default: '' }, // '' = not classified, 'sadhguru' | 'non sadhguru' | future values
   },
   { timestamps: true }
 );

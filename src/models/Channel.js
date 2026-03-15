@@ -41,6 +41,7 @@ const channelSchema = new mongoose.Schema(
     },
 
     lastSyncedAt: { type: Date },
+    allVideosPulled: { type: Boolean, default: false },
     deletedAt: { type: Date, default: null, index: true },
   },
   { timestamps: true }

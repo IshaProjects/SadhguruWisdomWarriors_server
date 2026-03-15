@@ -10,7 +10,11 @@ import {
   bulkDeleteChannels,
   syncSingleChannel,
   syncAllChannels,
+  pullAllChannelsVideosHandler,
+  classifyAllChannelsVideos,
   getChannelVideos,
+  classifyChannelVideos,
+  pullChannelVideos,
 } from '../controllers/channelController.js';
 import { authenticate, authorize } from '../middleware/auth.js';
 
@@ -24,11 +28,15 @@ router.post('/', authorize('admin', 'manager'), addChannel);
 router.post('/bulk', authorize('admin', 'manager'), upload.single('file'), bulkImport);
 router.delete('/bulk', authorize('admin'), bulkDeleteChannels);
 router.post('/sync-all', authorize('admin', 'manager'), syncAllChannels);
+router.post('/pull-all-videos', authorize('admin', 'manager'), pullAllChannelsVideosHandler);
+router.post('/classify-all', authorize('admin', 'manager'), classifyAllChannelsVideos);
 
 router.get('/:id', getChannel);
 router.put('/:id', authorize('admin', 'manager'), updateChannel);
 router.delete('/:id', authorize('admin'), deleteChannel);
 router.post('/:id/sync', authorize('admin', 'manager'), syncSingleChannel);
+router.post('/:id/pull-videos', authorize('admin', 'manager'), pullChannelVideos);
+router.post('/:id/classify-videos', authorize('admin', 'manager'), classifyChannelVideos);
 router.get('/:id/videos', getChannelVideos);
 
 export default router;

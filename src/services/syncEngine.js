@@ -6,16 +6,19 @@ import SyncLog from '../models/SyncLog.js';
 import {
   fetchChannelsBatch,
   fetchPlaylistItems,
+  fetchAllPlaylistItemIds,
   fetchVideosBatch,
+  fetchSingleChannel,
   getQuotaUsage,
 } from './youtubeApi.js';
 import { logger } from '../utils/logger.js';
 
 let isChannelSyncing = false;
 let isVideoSyncing   = false;
+let isPullingAllVideos = false;
 
 export function getSyncStatus() {
-  return { isChannelSyncing, isVideoSyncing };
+  return { isChannelSyncing, isVideoSyncing, isPullingAllVideos };
 }
 
 // ---------------------------------------------------------------------------
@@ -84,6 +87,12 @@ export async function syncChannelStats(channelIds = null, type = 'manual') {
           videoCount:  parseInt(stats.videoCount)      || 0,
         };
         channel.lastSyncedAt = new Date();
+        if (channel.allVideosPulled) {
+          const ourVideoCount = await Video.countDocuments({ channelId: channel._id, deletedAt: null });
+          if (ourVideoCount < channel.currentStats.videoCount) {
+            channel.allVideosPulled = false;
+          }
+        }
         await channel.save();
 
         await ChannelSnapshot.findOneAndUpdate(
@@ -261,4 +270,180 @@ export async function syncVideoStats(channelIds = null, type = 'manual') {
 export async function syncChannels(channelIds = null, type = 'manual') {
   await syncChannelStats(channelIds, type);
   await syncVideoStats(channelIds, type);
+}
+
+// ---------------------------------------------------------------------------
+// Pull all videos for a single channel (batches of 100)
+// ---------------------------------------------------------------------------
+const PULL_VIDEO_BATCH_SIZE = 100;
+
+export async function pullAllChannelVideos(channelId) {
+  if (isPullingAllVideos) {
+    throw new Error('Pull all videos already in progress');
+  }
+
+  isPullingAllVideos = true;
+  const channel = await Channel.findById(channelId);
+  if (!channel) {
+    isPullingAllVideos = false;
+    throw new Error('Channel not found');
+  }
+
+  let uploadsPlaylistId = channel.uploadsPlaylistId;
+  if (!uploadsPlaylistId) {
+    const ytChannel = await fetchSingleChannel(channel.youtubeChannelId);
+    if (!ytChannel?.contentDetails?.relatedPlaylists?.uploads) {
+      isPullingAllVideos = false;
+      throw new Error('Channel has no uploads playlist');
+    }
+    uploadsPlaylistId = ytChannel.contentDetails.relatedPlaylists.uploads;
+    channel.uploadsPlaylistId = uploadsPlaylistId;
+    await channel.save();
+  }
+
+  try {
+    logger.info(`[Pull All Videos] Fetching all video IDs for channel ${channel.youtubeChannelId}...`);
+    const allVideoIds = await fetchAllPlaylistItemIds(uploadsPlaylistId);
+    logger.info(`[Pull All Videos] Found ${allVideoIds.length} videos, processing in batches of ${PULL_VIDEO_BATCH_SIZE}`);
+
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    let videosProcessed = 0;
+
+    for (let i = 0; i < allVideoIds.length; i += PULL_VIDEO_BATCH_SIZE) {
+      const quota = getQuotaUsage();
+      if (quota.remaining < 10) {
+        logger.warn('[Pull All Videos] Approaching quota limit, stopping');
+        break;
+      }
+
+      const batchIds = allVideoIds.slice(i, i + PULL_VIDEO_BATCH_SIZE);
+      const videoData = await fetchVideosBatch(batchIds);
+
+      for (const vid of videoData) {
+        try {
+          const views = parseInt(vid.statistics?.viewCount) || 0;
+          const likes = parseInt(vid.statistics?.likeCount) || 0;
+          const comments = parseInt(vid.statistics?.commentCount) || 0;
+
+          const savedVideo = await Video.findOneAndUpdate(
+            { youtubeVideoId: vid.id },
+            {
+              youtubeVideoId: vid.id,
+              channelId: channel._id,
+              title: vid.snippet?.title || '',
+              description: vid.snippet?.description || '',
+              thumbnailUrl:
+                vid.snippet?.thumbnails?.high?.url ||
+                vid.snippet?.thumbnails?.default?.url || '',
+              publishedAt: vid.snippet?.publishedAt,
+              views,
+              likes,
+              comments,
+              duration: vid.contentDetails?.duration || '',
+              lastSyncedAt: new Date(),
+            },
+            { upsert: true, new: true }
+          );
+
+          await VideoSnapshot.findOneAndUpdate(
+            { videoId: savedVideo._id, date: today },
+            {
+              videoId: savedVideo._id,
+              channelId: channel._id,
+              date: today,
+              views,
+              likes,
+              comments,
+            },
+            { upsert: true, new: true }
+          );
+
+          videosProcessed++;
+        } catch (err) {
+          logger.error(`[Pull All Videos] Error saving video ${vid.id}: ${err.message}`);
+        }
+      }
+    }
+
+    const allPulled = videosProcessed === allVideoIds.length;
+    if (allPulled) {
+      channel.allVideosPulled = true;
+      await channel.save();
+    }
+
+    logger.info(`[Pull All Videos] Done: ${videosProcessed} videos for channel ${channel.title}`);
+    return { videosProcessed, totalIds: allVideoIds.length, allVideosPulled: allPulled };
+  } catch (err) {
+    if (err.message === 'QUOTA_EXCEEDED') throw err;
+    logger.error(`[Pull All Videos] Failed: ${err.message}`);
+    throw err;
+  } finally {
+    isPullingAllVideos = false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Pull all videos for all channels (one channel at a time, 100 videos per batch)
+// ---------------------------------------------------------------------------
+export async function pullAllChannelsVideos() {
+  if (isPullingAllVideos) {
+    throw new Error('Pull all videos already in progress');
+  }
+
+  const channels = await Channel.find({
+    status: { $ne: 'archived' },
+    allVideosPulled: { $ne: true },
+  }).sort({ title: 1 });
+
+  const channelsWithPlaylist = channels.filter(
+    (ch) => ch.uploadsPlaylistId || ch.youtubeChannelId
+  );
+
+  if (channelsWithPlaylist.length === 0) {
+    return {
+      channelsProcessed: 0,
+      channelsSkipped: 0,
+      totalVideosPulled: 0,
+      message: 'No channels need video pull (all already pulled or no uploads playlist)',
+    };
+  }
+
+  let channelsProcessed = 0;
+  let totalVideosPulled = 0;
+  const errors = [];
+
+  for (const channel of channelsWithPlaylist) {
+    const quota = getQuotaUsage();
+    if (quota.remaining < 10) {
+      logger.warn('[Pull All Channels] Approaching quota limit, stopping');
+      break;
+    }
+
+    try {
+      const result = await pullAllChannelVideos(channel._id);
+      channelsProcessed++;
+      totalVideosPulled += result.videosProcessed;
+    } catch (err) {
+      if (err.message === 'QUOTA_EXCEEDED') {
+        logger.warn('[Pull All Channels] Quota exceeded, stopping');
+        break;
+      }
+      logger.error(`[Pull All Channels] Error on ${channel.title}: ${err.message}`);
+      errors.push({ channelId: channel._id, title: channel.title, message: err.message });
+    }
+  }
+
+  const channelsSkipped = channels.length - channelsWithPlaylist.length;
+  logger.info(
+    `[Pull All Channels] Done: ${channelsProcessed} channels, ${totalVideosPulled} videos pulled`
+  );
+
+  return {
+    channelsProcessed,
+    channelsSkipped,
+    totalVideosPulled,
+    errors: errors.length > 0 ? errors : undefined,
+  };
 }

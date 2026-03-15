@@ -1,0 +1,122 @@
+import { VertexAI } from '@google-cloud/vertexai';
+import { GoogleGenerativeAI } from '@google/generative-ai';
+
+const project = process.env.GOOGLE_CLOUD_PROJECT;
+const location = process.env.VERTEX_AI_LOCATION || 'us-central1';
+const geminiApiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
+
+let vertexAI = null;
+let genAI = null;
+
+if (project) {
+  vertexAI = new VertexAI({ project, location });
+}
+if (geminiApiKey) {
+  genAI = new GoogleGenerativeAI(geminiApiKey);
+}
+
+const PROMPT = `You are a classifier. Given a YouTube video title, determine if the video is a Sadguru video.
+A Sadguru video is content that features Sadhguru (the Indian yogi and mystic) - his teachings, speeches, interviews, or content directly from him.
+Answer with exactly one word: YES or NO.
+Video title:`;
+
+/**
+ * Classifies a video title as Sadguru video or not.
+ * Uses Gemini API (GEMINI_API_KEY) if set — simpler, works without GCP.
+ * Otherwise uses Vertex AI (GOOGLE_CLOUD_PROJECT).
+ */
+export async function classifySadguruVideo(title) {
+  if (!title || typeof title !== 'string') {
+    return false;
+  }
+
+  const prompt = PROMPT + ' "' + title.replace(/"/g, '') + '"';
+
+  // Prefer Gemini API (Google AI Studio) — simpler setup, no Vertex AI needed
+  if (genAI) {
+    const modelId = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+    const model = genAI.getGenerativeModel({ model: modelId });
+    const result = await model.generateContent(prompt);
+    const text = result.response?.text?.trim().toUpperCase() || '';
+    return text.startsWith('YES');
+  }
+
+  // Fall back to Vertex AI
+  if (!vertexAI) {
+    throw new Error(
+      'Configure GEMINI_API_KEY (from aistudio.google.com) or GOOGLE_CLOUD_PROJECT for Vertex AI.'
+    );
+  }
+
+  const modelId = process.env.VERTEX_AI_MODEL || 'gemini-2.5-flash';
+  const model = vertexAI.getGenerativeModel({ model: modelId });
+  const result = await model.generateContent({
+    contents: [{ role: 'user', parts: [{ text: prompt }] }],
+  });
+  const response = result.response;
+  const text =
+    response?.candidates?.[0]?.content?.parts?.[0]?.text?.trim().toUpperCase() || '';
+  return text.startsWith('YES');
+}
+
+const BATCH_SIZE = 25;
+
+/**
+ * Batch classify multiple videos in a single API call.
+ * @param {Array<{_id: string, title: string}>} videos
+ * @returns {Promise<Map<string, string>>} Map of videoId -> 'sadhguru' | 'non sadhguru'
+ */
+export async function classifySadguruVideoBatch(videos) {
+  if (!videos || videos.length === 0) {
+    return new Map();
+  }
+
+  const results = new Map();
+
+  for (let i = 0; i < videos.length; i += BATCH_SIZE) {
+    const batch = videos.slice(i, i + BATCH_SIZE);
+    const batchInput = batch.map((v) => ({
+      id: String(v._id),
+      title: (v.title || '').replace(/"/g, "'"),
+    }));
+    const batchPrompt = `You are a classifier. For each YouTube video title, determine if it is a Sadguru video.
+A Sadguru video features Sadhguru (the Indian yogi and mystic) - his teachings, speeches, interviews, or content directly from him.
+
+Videos to classify (JSON array):
+${JSON.stringify(batchInput)}
+
+Return ONLY a JSON object. Key = video id, value = "sadhguru" or "non sadhguru".
+Example: {"id1":"sadhguru","id2":"non sadhguru"}
+No other text.`;
+
+    try {
+      let text = '';
+      if (genAI) {
+        const modelId = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+        const model = genAI.getGenerativeModel({ model: modelId });
+        const result = await model.generateContent(batchPrompt);
+        text = result.response?.text?.trim() || '';
+      } else if (vertexAI) {
+        const modelId = process.env.VERTEX_AI_MODEL || 'gemini-2.5-flash';
+        const model = vertexAI.getGenerativeModel({ model: modelId });
+        const result = await model.generateContent({
+          contents: [{ role: 'user', parts: [{ text: batchPrompt }] }],
+        });
+        text = result.response?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '';
+      } else {
+        throw new Error('Configure GEMINI_API_KEY or GOOGLE_CLOUD_PROJECT.');
+      }
+
+      const jsonStr = text.replace(/```json\s*/i, '').replace(/```\s*/g, '').trim();
+      const parsed = JSON.parse(jsonStr);
+      for (const [id, value] of Object.entries(parsed)) {
+        const v = String(value).toLowerCase();
+        results.set(id, v === 'sadhguru' ? 'sadhguru' : 'non sadhguru');
+      }
+    } catch (err) {
+      throw err;
+    }
+  }
+
+  return results;
+}

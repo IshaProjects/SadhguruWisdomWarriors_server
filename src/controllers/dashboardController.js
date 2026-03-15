@@ -39,12 +39,19 @@ function getDateRange(period, query = {}) {
 
 function buildChannelFilter(query) {
   const filter = { status: { $ne: 'archived' } };
-  if (query.category)   filter.category   = query.category;
   if (query.assignedTo) filter.assignedTo = query.assignedTo;
   if (query.status)     filter.status     = query.status;
   if (query.tags && query.tags.trim()) {
     const tagList = query.tags.split(',').map((t) => t.trim()).filter(Boolean);
     if (tagList.length) filter.tags = { $in: tagList };
+  }
+  // Group filter: 'dedicated' = category starts with "Dedicated", 'ihi' = category contains "IHI"
+  if (query.group === 'dedicated') {
+    filter.category = { $regex: /^Dedicated/i };
+  } else if (query.group === 'ihi') {
+    filter.category = { $regex: /IHI/i };
+  } else if (query.category) {
+    filter.category = query.category;
   }
   if (query.startDate || query.endDate) {
     filter.lastSyncedAt = {};
