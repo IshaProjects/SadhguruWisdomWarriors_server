@@ -59,17 +59,27 @@ export async function listChannels(req, res, next) {
     }
 
     const skip = (parseInt(page) - 1) * parseInt(limit);
-    const [channels, total] = await Promise.all([
+    const [channels, total, channelIdsWithUnclassified] = await Promise.all([
       Channel.find(filter)
         .populate('assignedTo', 'name email')
         .sort(sort)
         .skip(skip)
         .limit(parseInt(limit)),
       Channel.countDocuments(filter),
+      Video.distinct('channelId', {
+        deletedAt: null,
+        $or: [{ classification: '' }, { classification: { $exists: false } }],
+      }),
     ]);
 
+    const unclassifiedSet = new Set(channelIdsWithUnclassified.map((id) => String(id)));
+    const channelsWithFlag = channels.map((ch) => ({
+      ...ch.toObject(),
+      classificationDone: !unclassifiedSet.has(String(ch._id)),
+    }));
+
     res.json({
-      channels,
+      channels: channelsWithFlag,
       pagination: {
         page: parseInt(page),
         limit: parseInt(limit),

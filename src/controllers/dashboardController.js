@@ -1,6 +1,7 @@
 import Channel from '../models/Channel.js';
 import ChannelSnapshot from '../models/ChannelSnapshot.js';
 import Video from '../models/Video.js';
+import VideoSnapshot from '../models/VideoSnapshot.js';
 import DashboardLayout from '../models/DashboardLayout.js';
 
 /**
@@ -66,49 +67,81 @@ export async function getSummary(req, res, next) {
     const channelFilter = buildChannelFilter(req.query);
     const channels = await Channel.find(channelFilter);
     const channelIds = channels.map((c) => c._id);
+    const group = req.query.group;
 
     const totalChannels = channels.length;
     const totalSubscribers = channels.reduce(
       (sum, c) => sum + (c.currentStats?.subscribers || 0),
       0
     );
-    const totalViews = channels.reduce(
-      (sum, c) => sum + (c.currentStats?.views || 0),
-      0
-    );
+
+    // Dedicated: totalViews = sum of channel views. IHI: totalViews = sum of sadhguru video views (MongoDB aggregation)
+    let totalViews;
+    if (group === 'ihi') {
+      const ihiViewsAgg = await Video.aggregate([
+        {
+          $match: {
+            channelId: { $in: channelIds },
+            classification: 'sadhguru',
+            deletedAt: null,
+          },
+        },
+        { $group: { _id: null, total: { $sum: '$views' } } },
+      ]);
+      totalViews = ihiViewsAgg[0]?.total ?? 0;
+    } else {
+      totalViews = channels.reduce(
+        (sum, c) => sum + (c.currentStats?.views || 0),
+        0
+      );
+    }
 
     // Get period comparison data
     const { period = '30d' } = req.query;
     const { start, end } = getDateRange(period, req.query);
 
-    // Get earliest snapshots in the period for comparison
-    const oldSnapshots = await ChannelSnapshot.aggregate([
-      {
-        $match: {
-          channelId: { $in: channelIds },
-          date: { $gte: start, $lte: end },
-        },
-      },
-      {
-        $sort: { date: 1 },
-      },
-      {
-        $group: {
-          _id: '$channelId',
-          firstSubscribers: { $first: '$subscribers' },
-          firstViews: { $first: '$views' },
-        },
-      },
-    ]);
+    let prevSubscribers = 0;
+    let prevViews = 0;
 
-    const prevSubscribers = oldSnapshots.reduce(
-      (sum, s) => sum + (s.firstSubscribers || 0),
-      0
-    );
-    const prevViews = oldSnapshots.reduce(
-      (sum, s) => sum + (s.firstViews || 0),
-      0
-    );
+    if (group === 'ihi') {
+      // IHI: prevViews = sum of first VideoSnapshot views in period for sadhguru videos
+      const oldChannelSnapshots = await ChannelSnapshot.aggregate([
+        { $match: { channelId: { $in: channelIds }, date: { $gte: start, $lte: end } } },
+        { $sort: { date: 1 } },
+        { $group: { _id: '$channelId', firstSubscribers: { $first: '$subscribers' } } },
+      ]);
+      prevSubscribers = oldChannelSnapshots.reduce((s, x) => s + (x.firstSubscribers || 0), 0);
+
+      const ihiPrevViewsAgg = await VideoSnapshot.aggregate([
+        { $match: { channelId: { $in: channelIds }, date: { $gte: start, $lte: end } } },
+        { $lookup: { from: 'videos', localField: 'videoId', foreignField: '_id', as: 'video' } },
+        { $unwind: '$video' },
+        { $match: { 'video.classification': 'sadhguru' } },
+        { $sort: { date: 1 } },
+        { $group: { _id: '$videoId', firstViews: { $first: '$views' } } },
+        { $group: { _id: null, total: { $sum: '$firstViews' } } },
+      ]);
+      prevViews = ihiPrevViewsAgg[0]?.total ?? 0;
+    } else {
+      const oldSnapshots = await ChannelSnapshot.aggregate([
+        {
+          $match: {
+            channelId: { $in: channelIds },
+            date: { $gte: start, $lte: end },
+          },
+        },
+        { $sort: { date: 1 } },
+        {
+          $group: {
+            _id: '$channelId',
+            firstSubscribers: { $first: '$subscribers' },
+            firstViews: { $first: '$views' },
+          },
+        },
+      ]);
+      prevSubscribers = oldSnapshots.reduce((sum, s) => sum + (s.firstSubscribers || 0), 0);
+      prevViews = oldSnapshots.reduce((sum, s) => sum + (s.firstViews || 0), 0);
+    }
 
     const subsChange = prevSubscribers
       ? ((totalSubscribers - prevSubscribers) / prevSubscribers) * 100
@@ -118,18 +151,23 @@ export async function getSummary(req, res, next) {
       : 0;
 
     // Videos published this period
-    const videosThisPeriod = await Video.countDocuments({
-      channelId: { $in: channelIds },
-      publishedAt: { $gte: start, $lte: end },
-    });
+    const videosMatch = { channelId: { $in: channelIds }, publishedAt: { $gte: start, $lte: end } };
+    if (group === 'ihi') {
+      videosMatch.classification = 'sadhguru';
+    }
+    const videosThisPeriod = await Video.countDocuments(videosMatch);
 
     // Average engagement rate (from recent videos)
-    const recentVideos = await Video.find({
+    const recentVideosMatch = {
       channelId: { $in: channelIds },
       publishedAt: { $gte: start, $lte: end },
       views: { $gt: 0 },
       deletedAt: null,
-    }).select('views likes comments');
+    };
+    if (group === 'ihi') {
+      recentVideosMatch.classification = 'sadhguru';
+    }
+    const recentVideos = await Video.find(recentVideosMatch).select('views likes comments');
 
     let avgEngagement = 0;
     if (recentVideos.length > 0) {
@@ -159,26 +197,61 @@ export async function getGrowthData(req, res, next) {
     const channelFilter = buildChannelFilter(req.query);
     const channels = await Channel.find(channelFilter).select('_id');
     const channelIds = channels.map((c) => c._id);
+    const group = req.query.group;
 
     const { start, end } = getDateRange(period, req.query);
 
-    const snapshots = await ChannelSnapshot.aggregate([
-      {
-        $match: {
-          channelId: { $in: channelIds },
-          date: { $gte: start, $lte: end },
+    let snapshots;
+    if (group === 'ihi') {
+      // IHI: views = sum of VideoSnapshot.views for sadhguru videos per day
+      const ihiSnapshots = await VideoSnapshot.aggregate([
+        { $match: { channelId: { $in: channelIds }, date: { $gte: start, $lte: end } } },
+        { $lookup: { from: 'videos', localField: 'videoId', foreignField: '_id', as: 'video' } },
+        { $unwind: '$video' },
+        { $match: { 'video.classification': 'sadhguru' } },
+        {
+          $group: {
+            _id: { $dateToString: { format: '%Y-%m-%d', date: '$date' } },
+            totalViews: { $sum: '$views' },
+          },
         },
-      },
-      {
-        $group: {
-          _id: { $dateToString: { format: '%Y-%m-%d', date: '$date' } },
-          totalSubscribers: { $sum: '$subscribers' },
-          totalViews: { $sum: '$views' },
-          totalVideos: { $sum: '$videoCount' },
+        { $sort: { _id: 1 } },
+      ]);
+      const channelSnapshots = await ChannelSnapshot.aggregate([
+        { $match: { channelId: { $in: channelIds }, date: { $gte: start, $lte: end } } },
+        {
+          $group: {
+            _id: { $dateToString: { format: '%Y-%m-%d', date: '$date' } },
+            totalSubscribers: { $sum: '$subscribers' },
+            totalVideos: { $sum: '$videoCount' },
+          },
         },
-      },
-      { $sort: { _id: 1 } },
-    ]);
+        { $sort: { _id: 1 } },
+      ]);
+      const ihiMap = new Map(ihiSnapshots.map((s) => [s._id, s.totalViews]));
+      snapshots = channelSnapshots.map((s) => ({
+        ...s,
+        totalViews: ihiMap.get(s._id) ?? 0,
+      }));
+    } else {
+      snapshots = await ChannelSnapshot.aggregate([
+        {
+          $match: {
+            channelId: { $in: channelIds },
+            date: { $gte: start, $lte: end },
+          },
+        },
+        {
+          $group: {
+            _id: { $dateToString: { format: '%Y-%m-%d', date: '$date' } },
+            totalSubscribers: { $sum: '$subscribers' },
+            totalViews: { $sum: '$views' },
+            totalVideos: { $sum: '$videoCount' },
+          },
+        },
+        { $sort: { _id: 1 } },
+      ]);
+    }
 
     res.json(
       snapshots.map((s) => ({
@@ -263,14 +336,19 @@ export async function getTopVideos(req, res, next) {
     const channelFilter = buildChannelFilter(req.query);
     const channels = await Channel.find(channelFilter).select('_id title');
     const channelIds = channels.map((c) => c._id);
+    const group = req.query.group;
 
     const { start, end } = getDateRange(period, req.query);
 
-    const videos = await Video.find({
+    const videosMatch = {
       channelId: { $in: channelIds },
       publishedAt: { $gte: start, $lte: end },
       deletedAt: null,
-    })
+    };
+    if (group === 'ihi') {
+      videosMatch.classification = 'sadhguru';
+    }
+    const videos = await Video.find(videosMatch)
       .sort({ views: -1 })
       .limit(parseInt(limit))
       .populate('channelId', 'title thumbnailUrl');
