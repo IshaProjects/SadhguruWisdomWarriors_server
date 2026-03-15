@@ -5,6 +5,7 @@ import {
   getTopChannels,
   getTopVideos,
   getCategoryBreakdown,
+  getMicroUnitsReport,
   getPublishingFrequency,
   getChannelMetrics,
   getLayout,
@@ -20,6 +21,7 @@ router.get('/growth', getGrowthData);
 router.get('/top-channels', getTopChannels);
 router.get('/top-videos', getTopVideos);
 router.get('/categories', getCategoryBreakdown);
+router.get('/micro-units-report', getMicroUnitsReport);
 router.get('/publishing', getPublishingFrequency);
 router.get('/channel-metrics', getChannelMetrics);
 router.get('/layout', getLayout);

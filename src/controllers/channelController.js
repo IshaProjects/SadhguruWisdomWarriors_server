@@ -455,25 +455,56 @@ export async function pullAllChannelsVideosHandler(req, res, next) {
 
 export async function getChannelVideos(req, res, next) {
   try {
-    const { page = 1, limit = 20, sort = '-publishedAt' } = req.query;
+    const { page = 1, limit = 50, sort = '-views', search, classification, minViews, maxViews } = req.query;
     const skip = (parseInt(page) - 1) * parseInt(limit);
+    const lim = Math.min(Math.max(parseInt(limit) || 50, 1), 100);
 
-    const [videos, total] = await Promise.all([
-      Video.find({ channelId: req.params.id, deletedAt: null })
-        .sort(sort)
-        .skip(skip)
-        .limit(parseInt(limit)),
-      Video.countDocuments({ channelId: req.params.id, deletedAt: null }),
+    const filter = { channelId: req.params.id, deletedAt: null };
+    if (search && search.trim()) {
+      filter.$or = [
+        { title: { $regex: search.trim(), $options: 'i' } },
+        { youtubeVideoId: { $regex: search.trim(), $options: 'i' } },
+      ];
+    }
+    if (classification === 'sadhguru') filter.classification = 'sadhguru';
+    else if (classification === 'non_sadhguru') filter.classification = 'non sadhguru';
+    if (minViews != null && minViews !== '') filter.views = { ...filter.views, $gte: parseInt(minViews) };
+    if (maxViews != null && maxViews !== '') filter.views = { ...filter.views, $lte: parseInt(maxViews) };
+
+    const sortMap = {
+      '-views': { views: -1 },
+      views: { views: 1 },
+      '-publishedAt': { publishedAt: -1 },
+      publishedAt: { publishedAt: 1 },
+      '-likes': { likes: -1 },
+      likes: { likes: 1 },
+      '-comments': { comments: -1 },
+      comments: { comments: 1 },
+    };
+    const sortOpt = sortMap[sort] || sortMap['-views'];
+
+    const [videos, total, summaryAgg] = await Promise.all([
+      Video.find(filter).sort(sortOpt).skip(skip).limit(lim).lean(),
+      Video.countDocuments(filter),
+      Video.aggregate([
+        { $match: filter },
+        { $group: { _id: null, totalViews: { $sum: '$views' }, totalLikes: { $sum: '$likes' }, totalComments: { $sum: '$comments' } } },
+      ]),
     ]);
+
+    const summary = summaryAgg[0]
+      ? { totalVideos: total, totalViews: summaryAgg[0].totalViews ?? 0, totalLikes: summaryAgg[0].totalLikes ?? 0, totalComments: summaryAgg[0].totalComments ?? 0 }
+      : { totalVideos: 0, totalViews: 0, totalLikes: 0, totalComments: 0 };
 
     res.json({
       videos,
       pagination: {
         page: parseInt(page),
-        limit: parseInt(limit),
+        limit: lim,
         total,
-        pages: Math.ceil(total / parseInt(limit)),
+        pages: Math.ceil(total / lim),
       },
+      summary,
     });
   } catch (err) {
     next(err);

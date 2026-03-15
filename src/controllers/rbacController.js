@@ -12,6 +12,7 @@ const DEFAULT_PAGES = [
   { key: 'settings',   label: 'Settings',     roles: { admin: true, manager: false,viewer: false } },
   { key: 'import',     label: 'Import',       roles: { admin: true, manager: true, viewer: false } },
   { key: 'ai-studio', label: 'AI Studio',    roles: { admin: true, manager: true, viewer: true  } },
+  { key: 'micro-units', label: 'Micro Units', roles: { admin: true, manager: true, viewer: true  } },
 ];
 
 const DEFAULT_ACTIONS = [

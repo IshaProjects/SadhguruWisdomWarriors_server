@@ -2,6 +2,7 @@ import Channel from '../models/Channel.js';
 import ChannelSnapshot from '../models/ChannelSnapshot.js';
 import Video from '../models/Video.js';
 import VideoSnapshot from '../models/VideoSnapshot.js';
+import MicroUnit from '../models/MicroUnit.js';
 import DashboardLayout from '../models/DashboardLayout.js';
 
 /**
@@ -361,12 +362,17 @@ export async function getTopVideos(req, res, next) {
 
 export async function getCategoryBreakdown(req, res, next) {
   try {
-    const { startDate, endDate } = req.query;
+    const { startDate, endDate, classification } = req.query;
     const isPeriodMode = !!(startDate && endDate);
 
     const channelFilter = buildChannelFilter(req.query);
     if (isPeriodMode) {
       delete channelFilter.lastSyncedAt;
+    }
+    if (classification === 'sadhguru' || classification === 'non_sadhguru') {
+      const cls = classification === 'sadhguru' ? 'sadhguru' : 'non sadhguru';
+      const ids = await Video.distinct('channelId', { classification: cls, deletedAt: null });
+      channelFilter._id = { $in: ids };
     }
 
     const channels = await Channel.find(channelFilter)
@@ -452,6 +458,132 @@ export async function getCategoryBreakdown(req, res, next) {
       totalSubs:  r.totalSubs,
       totalViews: r.totalViews,
     })));
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * GET /api/dashboard/micro-units-report
+ * Returns aggregated stats per micro unit (same structure as category report).
+ * Supports startDate/endDate for period views.
+ */
+export async function getMicroUnitsReport(req, res, next) {
+  try {
+    const { startDate, endDate, classification } = req.query;
+    const isPeriodMode = !!(startDate && endDate);
+
+    const channelFilter = buildChannelFilter(req.query);
+    if (isPeriodMode) {
+      delete channelFilter.lastSyncedAt;
+    }
+    let channelIdsWithClassification = null;
+    if (classification === 'sadhguru' || classification === 'non_sadhguru') {
+      const cls = classification === 'sadhguru' ? 'sadhguru' : 'non sadhguru';
+      const ids = await Video.distinct('channelId', { classification: cls, deletedAt: null });
+      channelIdsWithClassification = new Set(ids.map((i) => i.toString()));
+    }
+
+    const microUnits = await MicroUnit.find()
+      .populate('channelIds', 'currentStats')
+      .lean();
+
+    if (microUnits.length === 0) {
+      return res.json([]);
+    }
+
+    const result = [];
+
+    for (const unit of microUnits) {
+      let rawIds = (unit.channelIds || [])
+        .map((c) => (typeof c === 'object' && c?._id ? c._id : c))
+        .filter(Boolean);
+
+      if (channelIdsWithClassification) {
+        rawIds = rawIds.filter((id) => channelIdsWithClassification.has(id.toString()));
+      }
+
+      if (rawIds.length === 0) {
+        result.push({
+          name: unit.name,
+          count: 0,
+          totalSubs: 0,
+          totalViews: 0,
+        });
+        continue;
+      }
+
+      const channels = await Channel.find({ _id: { $in: rawIds }, ...channelFilter })
+        .select('_id currentStats')
+        .lean();
+
+      const channelIds = channels.map((c) => c._id);
+
+      if (channelIds.length === 0) {
+        result.push({
+          name: unit.name,
+          count: 0,
+          totalSubs: 0,
+          totalViews: 0,
+        });
+        continue;
+      }
+
+      if (isPeriodMode) {
+        const startDateObj = new Date(startDate);
+        const endDateObj = new Date(endDate + 'T23:59:59.999Z');
+        const snapshotFilter = { channelId: { $in: channelIds }, deletedAt: null };
+
+        const [startSnapshots, endSnapshots] = await Promise.all([
+          ChannelSnapshot.aggregate([
+            { $match: { ...snapshotFilter, date: { $lte: startDateObj } } },
+            { $sort: { date: -1 } },
+            { $group: { _id: '$channelId', views: { $first: '$views' }, subscribers: { $first: '$subscribers' } } },
+          ]),
+          ChannelSnapshot.aggregate([
+            { $match: { ...snapshotFilter, date: { $lte: endDateObj } } },
+            { $sort: { date: -1 } },
+            { $group: { _id: '$channelId', views: { $first: '$views' }, subscribers: { $first: '$subscribers' } } },
+          ]),
+        ]);
+
+        const startMap = new Map(startSnapshots.map((s) => [s._id.toString(), s]));
+        const endMap = new Map(endSnapshots.map((s) => [s._id.toString(), s]));
+
+        let totalViews = 0;
+        let totalSubs = 0;
+        for (const cid of channelIds) {
+          const sid = cid.toString();
+          const start = startMap.get(sid);
+          const end = endMap.get(sid);
+          const startViews = start?.views ?? 0;
+          const endViews = end?.views ?? 0;
+          const endSubs = end?.subscribers ?? 0;
+          totalViews += Math.max(0, endViews - startViews);
+          totalSubs += endSubs;
+        }
+
+        result.push({
+          name: unit.name,
+          count: channelIds.length,
+          totalSubs,
+          totalViews,
+        });
+      } else {
+        const totalSubs = channels.reduce((s, c) => s + (c.currentStats?.subscribers || 0), 0);
+        const totalViews = channels.reduce((s, c) => s + (c.currentStats?.views || 0), 0);
+
+        result.push({
+          name: unit.name,
+          count: channels.length,
+          totalSubs,
+          totalViews,
+        });
+      }
+    }
+
+    result.sort((a, b) => b.totalViews - a.totalViews);
+    res.json(result);
   } catch (err) {
     next(err);
   }

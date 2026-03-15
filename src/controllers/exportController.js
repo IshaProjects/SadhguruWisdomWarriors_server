@@ -50,12 +50,16 @@ function buildChannelFilter(query) {
 }
 
 function buildVideoFilter(query) {
-  const { search, channelId, category, tags, status, minViews, maxViews, startDate, endDate } = query;
+  const { search, channelId, category, tags, status, classification, minViews, maxViews, startDate, endDate } = query;
   const channelFilter = {};
   const videoFilter   = {};
 
   if (category) channelFilter.category = category;
   if (status)   channelFilter.status   = status;
+  if (classification) {
+    if (classification === 'sadhguru') videoFilter.classification = 'sadhguru';
+    else if (classification === 'non_sadhguru') videoFilter.classification = 'non sadhguru';
+  }
   if (tags && tags.trim()) {
     const tagList = tags.split(',').map((t) => t.trim()).filter(Boolean);
     if (tagList.length) channelFilter.tags = { $in: tagList };
@@ -83,11 +87,30 @@ function buildVideoFilter(query) {
   return { channelFilter, videoFilter };
 }
 
-function mapChannel(c, periodMetrics = null) {
+async function getClassificationCountsByChannel(channelIds) {
+  if (!channelIds?.length) return new Map();
+  const agg = await Video.aggregate([
+    { $match: { channelId: { $in: channelIds }, deletedAt: null } },
+    { $group: { _id: { channelId: '$channelId', classification: '$classification' }, count: { $sum: 1 } } },
+  ]);
+  const map = new Map();
+  for (const x of agg) {
+    const cid = x._id.channelId?.toString();
+    if (!cid) continue;
+    if (!map.has(cid)) map.set(cid, {});
+    const cls = x._id.classification || '';
+    map.get(cid)[cls] = x.count;
+  }
+  return map;
+}
+
+function mapChannel(c, periodMetrics = null, classificationCounts = null) {
   const subs   = c.currentStats?.subscribers ?? 0;
   const views  = c.currentStats?.views       ?? 0;
   const videos = c.currentStats?.videoCount  ?? 0;
   const avgViewsPerVideo = videos > 0 ? Math.round(views / videos) : 0;
+  const sadhguru = classificationCounts?.sadhguru ?? 0;
+  const nonSadhguru = classificationCounts?.['non sadhguru'] ?? 0;
   const row = {
     title:               c.title,
     youtube_channel_id:  c.youtubeChannelId,
@@ -96,6 +119,8 @@ function mapChannel(c, periodMetrics = null) {
     category:            c.category  || '',
     status:              c.status    || '',
     tags:                c.tags?.join('; ') || '',
+    sadhguru_count:      sadhguru,
+    non_sadhguru_count:  nonSadhguru,
     subscribers:         subs,
     total_views:         views,
     video_count:         videos,
@@ -124,6 +149,7 @@ function mapVideo(v, channelMap, avgViews) {
     youtube_video_id: v.youtubeVideoId,
     channel:          ch.title    || '',
     category:         ch.category || '',
+    classification:  v.classification || '—',
     published_at:     v.publishedAt ? v.publishedAt.toISOString().slice(0, 10) : '',
     views:            v.views    ?? 0,
     likes:            v.likes    ?? 0,
@@ -152,6 +178,13 @@ export async function reportChannels(req, res, next) {
     } = req.query;
 
     const filter = buildChannelFilter(req.query);
+
+    if (req.query.classification) {
+      const cls = req.query.classification === 'sadhguru' ? 'sadhguru' : 'non sadhguru';
+      const ids = await Video.distinct('channelId', { classification: cls, deletedAt: null });
+      filter._id = { $in: ids };
+    }
+
     const isPeriodMode = !!(startDate && endDate);
 
     const isExport = format === 'csv' || format === 'excel';
@@ -190,6 +223,8 @@ export async function reportChannels(req, res, next) {
       const startMap = new Map(startSnapshots.map((s) => [s._id.toString(), s]));
       const endMap   = new Map(endSnapshots.map((s) => [s._id.toString(), s]));
 
+      const classMap = await getClassificationCountsByChannel(channelIds);
+
       rows = channels.map((c) => {
         const start = startMap.get(c._id.toString());
         const end   = endMap.get(c._id.toString());
@@ -201,7 +236,7 @@ export async function reportChannels(req, res, next) {
           viewsInPeriod:       Math.max(0, endViews - startViews),
           subscribersInPeriod: endSubs - startSubs,
         };
-        return mapChannel(c, periodMetrics);
+        return mapChannel(c, periodMetrics, classMap.get(c._id.toString()));
       });
 
       // Sort by requested field (support period fields)
@@ -244,7 +279,9 @@ export async function reportChannels(req, res, next) {
         query,
         Channel.countDocuments(filter),
       ]);
-      rows = channels.map((c) => mapChannel(c));
+      const channelIds = channels.map((c) => c._id);
+      const classMap = await getClassificationCountsByChannel(channelIds);
+      rows = channels.map((c) => mapChannel(c, null, classMap.get(c._id.toString())));
     }
 
     /* ── Summary (for JSON, non-period mode) ── */
@@ -305,6 +342,8 @@ export async function reportChannels(req, res, next) {
         { header: 'Country',             key: 'country',             width: 10 },
         { header: 'Category',            key: 'category',            width: 18 },
         { header: 'Status',              key: 'status',              width: 10 },
+        { header: 'Sadhguru Videos',     key: 'sadhguru_count',     width: 16 },
+        { header: 'Non Sadhguru Videos', key: 'non_sadhguru_count',  width: 18 },
         { header: 'Tags',                key: 'tags',                width: 24 },
         { header: 'Subscribers',         key: 'subscribers',         width: 16 },
         { header: 'Total Views',         key: 'total_views',         width: 16 },
@@ -431,7 +470,8 @@ export async function reportVideos(req, res, next) {
         { header: 'Title',            key: 'title',            width: 50 },
         { header: 'YouTube Video ID', key: 'youtube_video_id', width: 20 },
         { header: 'Channel',          key: 'channel',          width: 30 },
-        { header: 'Category',         key: 'category',         width: 18 },
+        { header: 'Category',        key: 'category',         width: 18 },
+        { header: 'Classification',  key: 'classification',   width: 16 },
         { header: 'Published At',     key: 'published_at',     width: 14 },
         { header: 'Views',            key: 'views',            width: 14 },
         { header: 'Likes',            key: 'likes',            width: 12 },
