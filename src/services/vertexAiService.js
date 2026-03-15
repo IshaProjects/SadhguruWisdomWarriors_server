@@ -1,9 +1,24 @@
+import fs from 'fs';
+import path from 'path';
+import os from 'os';
 import { VertexAI } from '@google-cloud/vertexai';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 
 const project = process.env.GOOGLE_CLOUD_PROJECT;
 const location = process.env.VERTEX_AI_LOCATION || 'us-central1';
 const geminiApiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
+
+// Support credentials from env var (for DigitalOcean, etc.) — write to temp file so Vertex AI can use it
+const credentialsJson = process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON;
+if (credentialsJson && project) {
+  try {
+    const tmpPath = path.join(os.tmpdir(), `vertex-credentials-${project}-${Date.now()}.json`);
+    fs.writeFileSync(tmpPath, credentialsJson, 'utf8');
+    process.env.GOOGLE_APPLICATION_CREDENTIALS = tmpPath;
+  } catch (err) {
+    console.error('[VertexAI] Failed to write credentials from GOOGLE_APPLICATION_CREDENTIALS_JSON:', err.message);
+  }
+}
 
 let vertexAI = null;
 let genAI = null;
