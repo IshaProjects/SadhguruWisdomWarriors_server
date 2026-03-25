@@ -151,6 +151,47 @@ export async function fetchPlaylistItemsPage(playlistId, pageToken = null, maxRe
   };
 }
 
+function playlistItemPublishedAtMs(item) {
+  const raw =
+    item.contentDetails?.videoPublishedAt || item.snippet?.publishedAt;
+  if (!raw) return null;
+  const t = new Date(raw).getTime();
+  return Number.isNaN(t) ? null : t;
+}
+
+/**
+ * Uploads playlist is reverse-chronological. Collects items whose publish time is >= sinceDate.
+ * Stops paginating once an older item is seen.
+ */
+export async function fetchPlaylistItemsPublishedSince(playlistId, sinceDate) {
+  const sinceMs =
+    sinceDate instanceof Date
+      ? sinceDate.getTime()
+      : new Date(sinceDate).getTime();
+  const out = [];
+  let pageToken = null;
+  let pagesFetched = 0;
+  do {
+    const { items, nextPageToken } = await fetchPlaylistItemsPage(
+      playlistId,
+      pageToken,
+      50
+    );
+    pagesFetched += 1;
+    for (const item of items) {
+      const t = playlistItemPublishedAtMs(item);
+      if (t == null) continue;
+      if (t >= sinceMs) {
+        out.push(item);
+      } else {
+        return { items: out, pagesFetched };
+      }
+    }
+    pageToken = nextPageToken;
+  } while (pageToken);
+  return { items: out, pagesFetched };
+}
+
 /**
  * Paginate through entire playlist and return all video IDs.
  */

@@ -9,16 +9,29 @@ import {
   fetchAllPlaylistItemIds,
   fetchVideosBatch,
   fetchSingleChannel,
+  fetchPlaylistItemsPublishedSince,
   getQuotaUsage,
 } from './youtubeApi.js';
+import { classifySadguruVideoBatch } from './vertexAiService.js';
+import { isDedicatedChannel, isIhiChannel } from '../utils/channelGroup.js';
 import { logger } from '../utils/logger.js';
 
 let isChannelSyncing = false;
-let isVideoSyncing   = false;
+let isVideoSyncing = false;
+let isIhiIngestSyncing = false;
+let isIhiSadhguruStatsSyncing = false;
 let isPullingAllVideos = false;
 
+const MS_24H = 24 * 60 * 60 * 1000;
+
 export function getSyncStatus() {
-  return { isChannelSyncing, isVideoSyncing, isPullingAllVideos };
+  return {
+    isChannelSyncing,
+    isVideoSyncing,
+    isIhiIngestSyncing,
+    isIhiSadhguruStatsSyncing,
+    isPullingAllVideos,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -154,7 +167,7 @@ export async function syncVideoStats(channelIds = null, type = 'manual') {
   try {
     const query = { status: { $ne: 'archived' } };
     if (channelIds) query._id = { $in: channelIds };
-    const channels = await Channel.find(query);
+    const channels = (await Channel.find(query)).filter(isDedicatedChannel);
 
     if (channels.length === 0) {
       syncLog.status = 'success';
@@ -170,7 +183,9 @@ export async function syncVideoStats(channelIds = null, type = 'manual') {
     const today = new Date();
     today.setHours(0, 0, 0, 0);
 
-    logger.info(`[Video Sync] Syncing videos for ${channels.length} channels...`);
+    logger.info(
+      `[Video Sync] Dedicated channels only — syncing videos for ${channels.length} channels...`
+    );
 
     for (const channel of channels) {
       if (!channel.uploadsPlaylistId) continue;
@@ -259,6 +274,335 @@ export async function syncVideoStats(channelIds = null, type = 'manual') {
     await syncLog.save();
   } finally {
     isVideoSyncing = false;
+  }
+
+  return syncLog;
+}
+
+// ---------------------------------------------------------------------------
+// IHI — last 24h uploads, upsert, then Vertex classify (title + description)
+// ---------------------------------------------------------------------------
+export async function syncIhiIngestLast24h(channelIds = null, type = 'manual') {
+  if (isIhiIngestSyncing) {
+    throw new Error('IHI ingest sync already in progress');
+  }
+
+  isIhiIngestSyncing = true;
+  const syncLog = await SyncLog.create({
+    syncType: 'ihi_ingest',
+    type,
+    status: 'running',
+    startedAt: new Date(),
+  });
+
+  try {
+    const query = { status: { $ne: 'archived' } };
+    if (channelIds) query._id = { $in: channelIds };
+    const channels = (await Channel.find(query)).filter(isIhiChannel);
+
+    if (channels.length === 0) {
+      syncLog.status = 'success';
+      syncLog.completedAt = new Date();
+      await syncLog.save();
+      return syncLog;
+    }
+
+    const since = new Date(Date.now() - MS_24H);
+    let videosProcessed = 0;
+    let quotaUsed = 0;
+    let classified = 0;
+
+    logger.info(
+      `[IHI Ingest] ${channels.length} channels, videos published since ${since.toISOString()}`
+    );
+
+    for (const channel of channels) {
+      if (!channel.uploadsPlaylistId) continue;
+
+      const quota = getQuotaUsage();
+      if (quota.remaining < 10) {
+        logger.warn('[IHI Ingest] Approaching quota limit, stopping');
+        break;
+      }
+
+      try {
+        const { items: playlistItems, pagesFetched } =
+          await fetchPlaylistItemsPublishedSince(
+            channel.uploadsPlaylistId,
+            since
+          );
+        quotaUsed += pagesFetched;
+
+        if (playlistItems.length === 0) continue;
+
+        const videoIds = [
+          ...new Set(
+            playlistItems
+              .map((item) => item.contentDetails?.videoId)
+              .filter(Boolean)
+          ),
+        ];
+        if (videoIds.length === 0) continue;
+
+        const videoData = await fetchVideosBatch(videoIds);
+        quotaUsed += Math.ceil(videoIds.length / 50);
+
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+
+        for (const vid of videoData) {
+          const views = parseInt(vid.statistics?.viewCount) || 0;
+          const likes = parseInt(vid.statistics?.likeCount) || 0;
+          const comments = parseInt(vid.statistics?.commentCount) || 0;
+
+          const savedVideo = await Video.findOneAndUpdate(
+            { youtubeVideoId: vid.id },
+            {
+              youtubeVideoId: vid.id,
+              channelId: channel._id,
+              title: vid.snippet?.title || '',
+              description: vid.snippet?.description || '',
+              thumbnailUrl:
+                vid.snippet?.thumbnails?.high?.url ||
+                vid.snippet?.thumbnails?.default?.url ||
+                '',
+              publishedAt: vid.snippet?.publishedAt,
+              views,
+              likes,
+              comments,
+              duration: vid.contentDetails?.duration || '',
+              lastSyncedAt: new Date(),
+            },
+            { upsert: true, new: true }
+          );
+
+          await VideoSnapshot.findOneAndUpdate(
+            { videoId: savedVideo._id, date: today },
+            {
+              videoId: savedVideo._id,
+              channelId: channel._id,
+              date: today,
+              views,
+              likes,
+              comments,
+            },
+            { upsert: true, new: true }
+          );
+
+          videosProcessed++;
+        }
+
+        const needsClassify = await Video.find({
+          channelId: channel._id,
+          youtubeVideoId: { $in: videoIds },
+          deletedAt: null,
+          $or: [
+            { classification: { $exists: false } },
+            { classification: '' },
+            { classification: null },
+          ],
+        }).lean();
+
+        if (needsClassify.length > 0) {
+          try {
+            const map = await classifySadguruVideoBatch(
+              needsClassify.map((v) => ({
+                _id: v._id,
+                title: v.title,
+                description: v.description || '',
+              }))
+            );
+            for (const v of needsClassify) {
+              const val = map.get(String(v._id));
+              if (val) {
+                await Video.findByIdAndUpdate(v._id, { classification: val });
+                classified++;
+              }
+            }
+          } catch (aiErr) {
+            logger.error(`[IHI Ingest] Vertex classify failed: ${aiErr.message}`);
+            syncLog.errors.push({
+              channelId: channel.youtubeChannelId,
+              message: `Classification: ${aiErr.message}`,
+            });
+          }
+        }
+      } catch (err) {
+        if (err.message === 'QUOTA_EXCEEDED') {
+          logger.error('[IHI Ingest] Quota exceeded');
+          break;
+        }
+        logger.error(
+          `[IHI Ingest] Error on channel ${channel.youtubeChannelId}: ${err.message}`
+        );
+        syncLog.errors.push({
+          channelId: channel.youtubeChannelId,
+          message: err.message,
+        });
+      }
+    }
+
+    syncLog.videosProcessed = videosProcessed;
+    syncLog.quotaUsed = quotaUsed;
+    syncLog.status =
+      syncLog.errors.length > 0 ? 'partial' : 'success';
+    syncLog.completedAt = new Date();
+    await syncLog.save();
+
+    logger.info(
+      `[IHI Ingest] Done: ${videosProcessed} videos upserted, ${classified} classified, ${quotaUsed} quota`
+    );
+  } catch (err) {
+    logger.error(`[IHI Ingest] Failed: ${err.message}`);
+    syncLog.status = 'failed';
+    syncLog.errors.push({ channelId: 'global', message: err.message });
+    syncLog.completedAt = new Date();
+    await syncLog.save();
+  } finally {
+    isIhiIngestSyncing = false;
+  }
+
+  return syncLog;
+}
+
+// ---------------------------------------------------------------------------
+// IHI — daily stats + snapshots for Sadhguru-classified videos only
+// ---------------------------------------------------------------------------
+export async function syncIhiSadhguruVideoStats(channelIds = null, type = 'manual') {
+  if (isIhiSadhguruStatsSyncing) {
+    throw new Error('IHI Sadhguru stats sync already in progress');
+  }
+
+  isIhiSadhguruStatsSyncing = true;
+  const syncLog = await SyncLog.create({
+    syncType: 'ihi_sadhguru_stats',
+    type,
+    status: 'running',
+    startedAt: new Date(),
+  });
+
+  try {
+    const query = { status: { $ne: 'archived' } };
+    if (channelIds) query._id = { $in: channelIds };
+    const ihiChannelIds = (await Channel.find(query))
+      .filter(isIhiChannel)
+      .map((c) => c._id);
+
+    if (ihiChannelIds.length === 0) {
+      syncLog.status = 'success';
+      syncLog.completedAt = new Date();
+      await syncLog.save();
+      return syncLog;
+    }
+
+    const videos = await Video.find({
+      channelId: { $in: ihiChannelIds },
+      deletedAt: null,
+      classification: 'sadhguru',
+    })
+      .select('youtubeVideoId')
+      .lean();
+
+    if (videos.length === 0) {
+      syncLog.status = 'success';
+      syncLog.completedAt = new Date();
+      await syncLog.save();
+      return syncLog;
+    }
+
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    let videosProcessed = 0;
+    let quotaUsed = 0;
+    const ytIds = videos.map((v) => v.youtubeVideoId).filter(Boolean);
+    const idByYt = new Map(videos.map((v) => [v.youtubeVideoId, v._id]));
+
+    const chunkSize = 50;
+    for (let i = 0; i < ytIds.length; i += chunkSize) {
+      const quota = getQuotaUsage();
+      if (quota.remaining < 5) {
+        logger.warn('[IHI Sadhguru Stats] Approaching quota limit, stopping');
+        break;
+      }
+
+      const batchIds = ytIds.slice(i, i + chunkSize);
+      try {
+        const videoData = await fetchVideosBatch(batchIds);
+        quotaUsed += Math.ceil(batchIds.length / 50);
+
+        for (const vid of videoData) {
+          const mongoId = idByYt.get(vid.id);
+          if (!mongoId) continue;
+
+          const views = parseInt(vid.statistics?.viewCount) || 0;
+          const likes = parseInt(vid.statistics?.likeCount) || 0;
+          const comments = parseInt(vid.statistics?.commentCount) || 0;
+
+          const savedVideo = await Video.findOneAndUpdate(
+            { _id: mongoId },
+            {
+              title: vid.snippet?.title || '',
+              description: vid.snippet?.description || '',
+              thumbnailUrl:
+                vid.snippet?.thumbnails?.high?.url ||
+                vid.snippet?.thumbnails?.default?.url ||
+                '',
+              publishedAt: vid.snippet?.publishedAt,
+              views,
+              likes,
+              comments,
+              duration: vid.contentDetails?.duration || '',
+              lastSyncedAt: new Date(),
+            },
+            { new: true }
+          );
+
+          if (!savedVideo) continue;
+
+          await VideoSnapshot.findOneAndUpdate(
+            { videoId: savedVideo._id, date: today },
+            {
+              videoId: savedVideo._id,
+              channelId: savedVideo.channelId,
+              date: today,
+              views,
+              likes,
+              comments,
+            },
+            { upsert: true, new: true }
+          );
+
+          videosProcessed++;
+        }
+      } catch (err) {
+        if (err.message === 'QUOTA_EXCEEDED') {
+          logger.error('[IHI Sadhguru Stats] Quota exceeded');
+          break;
+        }
+        logger.error(`[IHI Sadhguru Stats] Batch error: ${err.message}`);
+        syncLog.errors.push({ channelId: 'batch', message: err.message });
+      }
+    }
+
+    syncLog.videosProcessed = videosProcessed;
+    syncLog.quotaUsed = quotaUsed;
+    syncLog.status =
+      syncLog.errors.length > 0 ? 'partial' : 'success';
+    syncLog.completedAt = new Date();
+    await syncLog.save();
+
+    logger.info(
+      `[IHI Sadhguru Stats] Done: ${videosProcessed} videos, ${quotaUsed} quota`
+    );
+  } catch (err) {
+    logger.error(`[IHI Sadhguru Stats] Failed: ${err.message}`);
+    syncLog.status = 'failed';
+    syncLog.errors.push({ channelId: 'global', message: err.message });
+    syncLog.completedAt = new Date();
+    await syncLog.save();
+  } finally {
+    isIhiSadhguruStatsSyncing = false;
   }
 
   return syncLog;

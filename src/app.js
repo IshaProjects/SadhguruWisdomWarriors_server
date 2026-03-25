@@ -8,6 +8,7 @@ import connectDB from './config/db.js';
 import { errorHandler } from './middleware/errorHandler.js';
 import { startSyncScheduler } from './jobs/syncScheduler.js';
 import { logger } from './utils/logger.js';
+import { logRateLimitExceeded, getRateLimitLogPath } from './utils/rateLimitLog.js';
 
 import authRoutes from './routes/auth.js';
 import channelRoutes from './routes/channels.js';
@@ -29,8 +30,17 @@ app.use(morgan('dev'));
 
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 200,
+  limit: 200,
   message: { message: 'Too many requests, please try again later' },
+  identifier: 'global-api-15m',
+  handler: (req, res, next, options) => {
+    logRateLimitExceeded(req, options);
+    const body =
+      options.message && typeof options.message === 'object' && !Array.isArray(options.message)
+        ? options.message
+        : { message: String(options.message ?? 'Too many requests, please try again later') };
+    res.status(options.statusCode).json(body);
+  },
 });
 app.use('/api/', limiter);
 
@@ -63,6 +73,7 @@ async function start() {
 
   app.listen(PORT, () => {
     logger.info(`Server running on port ${PORT}`);
+    logger.info(`Rate limit 429 events append to: ${getRateLimitLogPath()}`);
   });
 }
 

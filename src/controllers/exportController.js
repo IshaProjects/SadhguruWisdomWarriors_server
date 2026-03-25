@@ -132,6 +132,7 @@ function mapChannel(c, periodMetrics = null, classificationCounts = null) {
   if (periodMetrics) {
     row.views_in_period       = periodMetrics.viewsInPeriod;
     row.subscribers_in_period = periodMetrics.subscribersInPeriod;
+    row.videos_in_period      = periodMetrics.videosInPeriod;
   }
   return row;
 }
@@ -211,12 +212,26 @@ export async function reportChannels(req, res, next) {
         ChannelSnapshot.aggregate([
           { $match: { ...snapshotFilter, date: { $lte: startDateObj } } },
           { $sort: { date: -1 } },
-          { $group: { _id: '$channelId', views: { $first: '$views' }, subscribers: { $first: '$subscribers' } } },
+          {
+            $group: {
+              _id: '$channelId',
+              views: { $first: '$views' },
+              subscribers: { $first: '$subscribers' },
+              videoCount: { $first: '$videoCount' },
+            },
+          },
         ]),
         ChannelSnapshot.aggregate([
           { $match: { ...snapshotFilter, date: { $lte: endDateObj } } },
           { $sort: { date: -1 } },
-          { $group: { _id: '$channelId', views: { $first: '$views' }, subscribers: { $first: '$subscribers' } } },
+          {
+            $group: {
+              _id: '$channelId',
+              views: { $first: '$views' },
+              subscribers: { $first: '$subscribers' },
+              videoCount: { $first: '$videoCount' },
+            },
+          },
         ]),
       ]);
 
@@ -232,9 +247,12 @@ export async function reportChannels(req, res, next) {
         const endViews   = end?.views   ?? 0;
         const startSubs  = start?.subscribers ?? 0;
         const endSubs    = end?.subscribers   ?? 0;
+        const startVideos = start?.videoCount ?? 0;
+        const endVideos   = end?.videoCount ?? 0;
         const periodMetrics = {
           viewsInPeriod:       Math.max(0, endViews - startViews),
           subscribersInPeriod: endSubs - startSubs,
+          videosInPeriod:      endVideos - startVideos,
         };
         return mapChannel(c, periodMetrics, classMap.get(c._id.toString()));
       });
@@ -253,15 +271,33 @@ export async function reportChannels(req, res, next) {
         return sortDir * (cmp > 0 ? 1 : cmp < 0 ? -1 : 0);
       });
 
-      // Compute summary from full rows before pagination
+      // Compute summary from full rows before pagination (one pass — period totals match sum of period columns)
       if (format === 'json') {
+        const z = (n) => {
+          const v = Number(n);
+          return Number.isFinite(v) ? v : 0;
+        };
+        const sums = rows.reduce(
+          (acc, r) => ({
+            totalSubscribers: acc.totalSubscribers + z(r.subscribers),
+            totalViews: acc.totalViews + z(r.total_views),
+            totalVideos: acc.totalVideos + z(r.video_count),
+            totalViewsInPeriod: acc.totalViewsInPeriod + z(r.views_in_period),
+            totalSubscribersInPeriod: acc.totalSubscribersInPeriod + z(r.subscribers_in_period),
+            totalVideosInPeriod: acc.totalVideosInPeriod + z(r.videos_in_period),
+          }),
+          {
+            totalSubscribers: 0,
+            totalViews: 0,
+            totalVideos: 0,
+            totalViewsInPeriod: 0,
+            totalSubscribersInPeriod: 0,
+            totalVideosInPeriod: 0,
+          },
+        );
         summary = {
-          totalChannels:   rows.length,
-          totalSubscribers: rows.reduce((s, r) => s + (r.subscribers ?? 0), 0),
-          totalViews:      rows.reduce((s, r) => s + (r.total_views ?? 0), 0),
-          totalVideos:     rows.reduce((s, r) => s + (r.video_count ?? 0), 0),
-          totalViewsInPeriod:      rows.reduce((s, r) => s + (r.views_in_period ?? 0), 0),
-          totalSubscribersInPeriod: rows.reduce((s, r) => s + (r.subscribers_in_period ?? 0), 0),
+          totalChannels: rows.length,
+          ...sums,
         };
       }
 
@@ -332,7 +368,7 @@ export async function reportChannels(req, res, next) {
     /* ── Excel ── */
     if (format === 'excel') {
       const wb  = new ExcelJS.Workbook();
-      wb.creator = 'YT Manager';
+      wb.creator = 'Wisdom Warriors';
       const ws  = wb.addWorksheet('Channels');
 
       const baseColumns = [
@@ -351,6 +387,7 @@ export async function reportChannels(req, res, next) {
           ? [
               { header: 'Views (Period)',      key: 'views_in_period',       width: 16 },
               { header: 'Subscribers (Period)', key: 'subscribers_in_period', width: 18 },
+              { header: 'Videos (Period)',      key: 'videos_in_period',      width: 16 },
             ]
           : []),
         { header: 'Video Count',         key: 'video_count',         width: 14 },
@@ -419,10 +456,37 @@ export async function reportVideos(req, res, next) {
     const query = Video.find(videoFilter).sort(sort);
     if (!isExport) query.skip(skip).limit(lim);
 
-    const [videos, total] = await Promise.all([
+    const summaryPipeline = format === 'json'
+      ? Video.aggregate([
+          { $match: videoFilter },
+          {
+            $group: {
+              _id: null,
+              totalVideos: { $sum: 1 },
+              totalViews: { $sum: { $ifNull: ['$views', 0] } },
+              totalLikes: { $sum: { $ifNull: ['$likes', 0] } },
+              totalComments: { $sum: { $ifNull: ['$comments', 0] } },
+            },
+          },
+        ])
+      : Promise.resolve(null);
+
+    const [videos, total, summaryAgg] = await Promise.all([
       query,
       Video.countDocuments(videoFilter),
+      summaryPipeline,
     ]);
+
+    const summary = format === 'json'
+      ? (summaryAgg?.[0]
+        ? {
+            totalVideos: summaryAgg[0].totalVideos,
+            totalViews: summaryAgg[0].totalViews,
+            totalLikes: summaryAgg[0].totalLikes,
+            totalComments: summaryAgg[0].totalComments,
+          }
+        : { totalVideos: 0, totalViews: 0, totalLikes: 0, totalComments: 0 })
+      : undefined;
 
     // Build channel map for joined fields
     const channelIds  = [...new Set(videos.map((v) => v.channelId?.toString()).filter(Boolean))];
@@ -446,6 +510,7 @@ export async function reportVideos(req, res, next) {
           total,
           pages: Math.ceil(total / parseInt(limit)),
         },
+        summary,
       });
     }
 
@@ -463,7 +528,7 @@ export async function reportVideos(req, res, next) {
     /* ── Excel ── */
     if (format === 'excel') {
       const wb = new ExcelJS.Workbook();
-      wb.creator = 'YT Manager';
+      wb.creator = 'Wisdom Warriors';
       const ws = wb.addWorksheet('Videos');
 
       ws.columns = [

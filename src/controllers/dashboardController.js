@@ -509,6 +509,7 @@ export async function getMicroUnitsReport(req, res, next) {
           count: 0,
           totalSubs: 0,
           totalViews: 0,
+          totalVideos: 0,
         });
         continue;
       }
@@ -525,6 +526,7 @@ export async function getMicroUnitsReport(req, res, next) {
           count: 0,
           totalSubs: 0,
           totalViews: 0,
+          totalVideos: 0,
         });
         continue;
       }
@@ -558,26 +560,40 @@ export async function getMicroUnitsReport(req, res, next) {
           const end = endMap.get(sid);
           const startViews = start?.views ?? 0;
           const endViews = end?.views ?? 0;
+          const startSubs = start?.subscribers ?? 0;
           const endSubs = end?.subscribers ?? 0;
           totalViews += Math.max(0, endViews - startViews);
-          totalSubs += endSubs;
+          totalSubs += endSubs - startSubs;
         }
+
+        const videoMatch = {
+          channelId: { $in: channelIds },
+          deletedAt: null,
+          publishedAt: { $gte: startDateObj, $lte: endDateObj },
+        };
+        if (classification === 'sadhguru') videoMatch.classification = 'sadhguru';
+        else if (classification === 'non_sadhguru') videoMatch.classification = 'non sadhguru';
+
+        const totalVideos = await Video.countDocuments(videoMatch);
 
         result.push({
           name: unit.name,
           count: channelIds.length,
           totalSubs,
           totalViews,
+          totalVideos,
         });
       } else {
         const totalSubs = channels.reduce((s, c) => s + (c.currentStats?.subscribers || 0), 0);
         const totalViews = channels.reduce((s, c) => s + (c.currentStats?.views || 0), 0);
+        const totalVideos = channels.reduce((s, c) => s + (c.currentStats?.videoCount || 0), 0);
 
         result.push({
           name: unit.name,
           count: channels.length,
           totalSubs,
           totalViews,
+          totalVideos,
         });
       }
     }

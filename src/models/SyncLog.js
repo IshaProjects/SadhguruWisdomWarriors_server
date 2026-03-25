@@ -3,7 +3,7 @@ import mongoose from 'mongoose';
 const syncLogSchema = new mongoose.Schema({
   syncType: {
     type: String,
-    enum: ['channel', 'video'],
+    enum: ['channel', 'video', 'ihi_ingest', 'ihi_sadhguru_stats'],
     default: 'channel',
   },
   type: {

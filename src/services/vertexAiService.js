@@ -93,8 +93,11 @@ export async function classifySadguruVideoBatch(videos) {
     const batchInput = batch.map((v) => ({
       id: String(v._id),
       title: (v.title || '').replace(/"/g, "'"),
+      description: String(v.description || '')
+        .slice(0, 4000)
+        .replace(/"/g, "'"),
     }));
-    const batchPrompt = `You are a classifier. For each YouTube video title, determine if it is a Sadguru video.
+    const batchPrompt = `You are a classifier. For each YouTube video, using its title and description, determine if it is a Sadguru video.
 A Sadguru video features Sadhguru (the Indian yogi and mystic) - his teachings, speeches, interviews, or content directly from him.
 
 Videos to classify (JSON array):
