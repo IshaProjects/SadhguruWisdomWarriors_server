@@ -137,6 +137,120 @@ function mapChannel(c, periodMetrics = null, classificationCounts = null) {
   return row;
 }
 
+function parseVideoSort(sortStr) {
+  const s = String(sortStr || '-views');
+  const desc = s.startsWith('-');
+  const key = s.replace(/^-/, '');
+  return { key, dir: desc ? -1 : 1 };
+}
+
+/** Map UI/API sort keys to Mongo fields on Video for .find().sort() */
+function mapVideoSortForFind(sortStr) {
+  const { key, dir } = parseVideoSort(sortStr);
+  const alias = {
+    published_at: 'publishedAt',
+    last_synced: 'lastSyncedAt',
+    youtube_video_id: 'youtubeVideoId',
+  };
+  const mongoKey = alias[key] || key;
+  const allowed = new Set([
+    'title', 'views', 'likes', 'comments', 'classification', 'duration',
+    'publishedAt', 'lastSyncedAt', 'youtubeVideoId',
+  ]);
+  if (!allowed.has(mongoKey)) {
+    return { views: dir };
+  }
+  return { [mongoKey]: dir };
+}
+
+function needsAggregateVideoSort(sortStr) {
+  const key = String(sortStr || '').replace(/^-/, '');
+  return ['channel', 'category', 'engagement_rate', 'outlier_score'].includes(key);
+}
+
+/**
+ * Fetch videos with correct ordering. Channel / category / engagement / outlier
+ * require $lookup + computed fields; published_at etc. map to Video schema fields.
+ */
+async function fetchVideosForReportSorted(videoFilter, sortStr, skip, limit, isExport) {
+  const { key, dir } = parseVideoSort(sortStr);
+  const channelColl = Channel.collection.collectionName;
+
+  if (needsAggregateVideoSort(sortStr)) {
+    let globalAvg = 1;
+    if (key === 'outlier_score') {
+      const avgAgg = await Video.aggregate([
+        { $match: videoFilter },
+        { $group: { _id: null, avg: { $avg: '$views' } } },
+      ]);
+      globalAvg = avgAgg[0]?.avg || 1;
+    }
+
+    const pipeline = [
+      { $match: videoFilter },
+      { $lookup: { from: channelColl, localField: 'channelId', foreignField: '_id', as: 'ch' } },
+      { $unwind: { path: '$ch', preserveNullAndEmptyArrays: true } },
+      {
+        $addFields: {
+          _engagementRate: {
+            $cond: [
+              { $gt: [{ $ifNull: ['$views', 0] }, 0] },
+              {
+                $multiply: [
+                  {
+                    $divide: [
+                      { $add: [{ $ifNull: ['$likes', 0] }, { $ifNull: ['$comments', 0] }] },
+                      '$views',
+                    ],
+                  },
+                  100,
+                ],
+              },
+              0,
+            ],
+          },
+          _outlierScore: {
+            $divide: [{ $ifNull: ['$views', 0] }, { $literal: globalAvg || 1 }],
+          },
+        },
+      },
+    ];
+
+    const sortFieldMap = {
+      channel: 'ch.title',
+      category: 'ch.category',
+      engagement_rate: '_engagementRate',
+      outlier_score: '_outlierScore',
+    };
+    const sortField = sortFieldMap[key] || 'views';
+    pipeline.push({ $sort: { [sortField]: dir } });
+    if (!isExport) {
+      pipeline.push({ $skip: skip });
+      if (limit > 0) pipeline.push({ $limit: limit });
+    }
+
+    const docs = await Video.aggregate(pipeline);
+    const channelMap = {};
+    const videos = docs.map((doc) => {
+      if (doc.ch && doc.channelId) {
+        channelMap[doc.channelId.toString()] = doc.ch;
+      }
+      const { ch, _engagementRate, _outlierScore, ...rest } = doc;
+      return rest;
+    });
+    return { videos, channelMap };
+  }
+
+  const sortObj = mapVideoSortForFind(sortStr);
+  let q = Video.find(videoFilter).sort(sortObj);
+  if (!isExport) {
+    q = q.skip(skip);
+    if (limit > 0) q = q.limit(limit);
+  }
+  const videos = await q.lean();
+  return { videos, channelMap: null };
+}
+
 function mapVideo(v, channelMap, avgViews) {
   const ch = channelMap[v.channelId?.toString()] || {};
   const engagement = v.views > 0
@@ -453,8 +567,6 @@ export async function reportVideos(req, res, next) {
     const lim      = isExport ? 0 : parseInt(limit);
 
     videoFilter.deletedAt = null;
-    const query = Video.find(videoFilter).sort(sort);
-    if (!isExport) query.skip(skip).limit(lim);
 
     const summaryPipeline = format === 'json'
       ? Video.aggregate([
@@ -471,11 +583,13 @@ export async function reportVideos(req, res, next) {
         ])
       : Promise.resolve(null);
 
-    const [videos, total, summaryAgg] = await Promise.all([
-      query,
+    const [sortedResult, total, summaryAgg] = await Promise.all([
+      fetchVideosForReportSorted(videoFilter, sort, skip, lim, isExport),
       Video.countDocuments(videoFilter),
       summaryPipeline,
     ]);
+
+    const { videos, channelMap: aggChannelMap } = sortedResult;
 
     const summary = format === 'json'
       ? (summaryAgg?.[0]
@@ -488,11 +602,14 @@ export async function reportVideos(req, res, next) {
         : { totalVideos: 0, totalViews: 0, totalLikes: 0, totalComments: 0 })
       : undefined;
 
-    // Build channel map for joined fields
-    const channelIds  = [...new Set(videos.map((v) => v.channelId?.toString()).filter(Boolean))];
-    const channelDocs = await Channel.find({ _id: { $in: channelIds } }).select('title category');
-    const channelMap  = {};
-    channelDocs.forEach((c) => { channelMap[c._id.toString()] = c; });
+    // Build channel map for joined fields (aggregate path may have pre-filled)
+    let channelMap = aggChannelMap;
+    if (!channelMap) {
+      const channelIds = [...new Set(videos.map((v) => v.channelId?.toString()).filter(Boolean))];
+      const channelDocs = await Channel.find({ _id: { $in: channelIds } }).select('title category');
+      channelMap = {};
+      channelDocs.forEach((c) => { channelMap[c._id.toString()] = c; });
+    }
 
     const avgViews = videos.length
       ? videos.reduce((s, v) => s + (v.views ?? 0), 0) / videos.length
