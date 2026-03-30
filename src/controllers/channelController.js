@@ -2,6 +2,7 @@ import Channel from '../models/Channel.js';
 import ChannelSnapshot from '../models/ChannelSnapshot.js';
 import Video from '../models/Video.js';
 import Category from '../models/Category.js';
+import mongoose from 'mongoose';
 import { fetchSingleChannel, resolveChannelByHandle, fetchChannelByHandle } from '../services/youtubeApi.js';
 import { syncChannels, pullAllChannelVideos, pullAllChannelsVideos } from '../services/syncEngine.js';
 import { classifySadguruVideoBatch } from '../services/vertexAiService.js';
@@ -459,7 +460,14 @@ export async function getChannelVideos(req, res, next) {
     const skip = (parseInt(page) - 1) * parseInt(limit);
     const lim = Math.min(Math.max(parseInt(limit) || 50, 1), 100);
 
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(400).json({ message: 'Invalid channel id' });
+    }
     const filter = { channelId: req.params.id, deletedAt: null };
+    const summaryFilter = {
+      ...filter,
+      channelId: mongoose.Types.ObjectId.createFromHexString(req.params.id),
+    };
     if (search && search.trim()) {
       filter.$or = [
         { title: { $regex: search.trim(), $options: 'i' } },
@@ -487,7 +495,7 @@ export async function getChannelVideos(req, res, next) {
       Video.find(filter).sort(sortOpt).skip(skip).limit(lim).lean(),
       Video.countDocuments(filter),
       Video.aggregate([
-        { $match: filter },
+        { $match: summaryFilter },
         { $group: { _id: null, totalViews: { $sum: '$views' }, totalLikes: { $sum: '$likes' }, totalComments: { $sum: '$comments' } } },
       ]),
     ]);
