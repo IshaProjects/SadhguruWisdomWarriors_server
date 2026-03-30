@@ -50,7 +50,7 @@ function buildChannelFilter(query) {
 }
 
 function buildVideoFilter(query) {
-  const { search, channelId, category, tags, status, classification, minViews, maxViews, startDate, endDate } = query;
+  const { search, channelId, category, tags, status, classification, minViews, maxViews, startDate, endDate, hashtags } = query;
   const channelFilter = {};
   const videoFilter   = {};
 
@@ -67,12 +67,41 @@ function buildVideoFilter(query) {
 
   if (channelId) videoFilter.channelId = channelId;
 
+  const orConditions = [];
+
   if (search) {
-    videoFilter.$or = [
+    orConditions.push(
       { title:          { $regex: search, $options: 'i' } },
       { youtubeVideoId: { $regex: search, $options: 'i' } },
-    ];
+    );
   }
+
+  if (hashtags && hashtags.trim()) {
+    const keywords = hashtags.split(',').map((k) => k.trim().replace(/^#/, '')).filter(Boolean);
+    if (keywords.length) {
+      const hashtagPatterns = keywords.map((kw) => {
+        const escaped = kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        return { $regex: `#${escaped}`, $options: 'i' };
+      });
+      const hashtagOr = [];
+      for (const pattern of hashtagPatterns) {
+        hashtagOr.push({ title: pattern }, { description: pattern });
+      }
+      if (search) {
+        videoFilter.$and = [
+          { $or: orConditions },
+          { $or: hashtagOr },
+        ];
+      } else {
+        videoFilter.$or = hashtagOr;
+      }
+    } else if (orConditions.length) {
+      videoFilter.$or = orConditions;
+    }
+  } else if (orConditions.length) {
+    videoFilter.$or = orConditions;
+  }
+
   if (minViews || maxViews) {
     videoFilter.views = {};
     if (minViews) videoFilter.views.$gte = parseInt(minViews);
@@ -87,10 +116,18 @@ function buildVideoFilter(query) {
   return { channelFilter, videoFilter };
 }
 
-async function getClassificationCountsByChannel(channelIds) {
+async function getClassificationCountsByChannel(channelIds, options = {}) {
   if (!channelIds?.length) return new Map();
+  const { startDate, endDate } = options;
+  const match = { channelId: { $in: channelIds }, deletedAt: null };
+  if (startDate && endDate) {
+    match.publishedAt = {
+      $gte: new Date(startDate),
+      $lte: new Date(`${endDate}T23:59:59.999Z`),
+    };
+  }
   const agg = await Video.aggregate([
-    { $match: { channelId: { $in: channelIds }, deletedAt: null } },
+    { $match: match },
     { $group: { _id: { channelId: '$channelId', classification: '$classification' }, count: { $sum: 1 } } },
   ]);
   const map = new Map();
@@ -352,7 +389,7 @@ export async function reportChannels(req, res, next) {
       const startMap = new Map(startSnapshots.map((s) => [s._id.toString(), s]));
       const endMap   = new Map(endSnapshots.map((s) => [s._id.toString(), s]));
 
-      const classMap = await getClassificationCountsByChannel(channelIds);
+      const classMap = await getClassificationCountsByChannel(channelIds, { startDate, endDate });
 
       rows = channels.map((c) => {
         const start = startMap.get(c._id.toString());
