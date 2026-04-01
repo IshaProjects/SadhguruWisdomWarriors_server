@@ -13,6 +13,7 @@ function generateTokens(userId) {
   return { accessToken, refreshToken };
 }
 
+
 export async function register(req, res, next) {
   try {
     const { email, password, name } = req.body;
