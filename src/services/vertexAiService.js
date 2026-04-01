@@ -30,22 +30,82 @@ if (geminiApiKey) {
   genAI = new GoogleGenerativeAI(geminiApiKey);
 }
 
-const PROMPT = `You are a classifier. Given a YouTube video title, determine if the video is a Sadguru video.
-A Sadguru video is content that features Sadhguru (the Indian yogi and mystic) - his teachings, speeches, interviews, or content directly from him.
-Answer with exactly one word: YES or NO.
-Video title:`;
+const SADHGURU_KEYWORDS = [
+  'sadhguru',
+  'ishafoundation',
+  'isha',
+  'innerengineering',
+  'adiyogi',
+  'yoga',
+  'meditation',
+  'spirituality',
+  'sadhguruquotes',
+  'hathayoga',
+  'ishayoga',
+  'ishayogacenter',
+  'cauverycalling',
+  'savesoil',
+  'consciousness',
+  'consciousliving',
+  'conscious',
+  'miracleofmind',
+  'shiva',
+  'consciousplanet',
+  'soundsofisha',
+  'devi',
+  'lingabhairavi',
+  'sadhguruwisdom',
+  'dhyanalinga',
+];
+
+const normalizeForKeywordMatch = (s) =>
+  String(s || '')
+    .toLowerCase()
+    // "Ignore spaces" as requested; keep punctuation as-is.
+    .replace(/\s+/g, '');
+
+const normalizedKeywords = SADHGURU_KEYWORDS.map(normalizeForKeywordMatch);
+
+function getKeywordHits({ title, description }) {
+  const combined = normalizeForKeywordMatch(`${title || ''} ${description || ''}`);
+  const hits = [];
+  for (let i = 0; i < normalizedKeywords.length; i++) {
+    const kw = normalizedKeywords[i];
+    if (kw && combined.includes(kw)) hits.push(SADHGURU_KEYWORDS[i]);
+  }
+  // Keep the prompt shorter by de-duping while preserving first-seen order.
+  return [...new Set(hits)];
+}
+
+const PROMPT = `You are a classifier. Given a YouTube video title and description, determine if the video is a Sadhguru video.
+A Sadhguru video is content that features Sadhguru (the Indian yogi and mystic) - his teachings, speeches, interviews, or content directly from him.
+
+Evidence keywords detected in the title/description (case-insensitive, spaces ignored). Use these as weak hints only:
+Keywords:
+{KEYWORD_HITS}
+
+Title: {TITLE}
+Description: {DESCRIPTION}
+
+Answer with exactly one word: YES or NO.`;
 
 /**
- * Classifies a video title as Sadguru video or not.
+ * Classifies a video (title + optional description) as Sadguru video or not.
  * Uses Gemini API (GEMINI_API_KEY) if set — simpler, works without GCP.
  * Otherwise uses Vertex AI (GOOGLE_CLOUD_PROJECT).
  */
-export async function classifySadguruVideo(title) {
+export async function classifySadguruVideo(title, description = '') {
   if (!title || typeof title !== 'string') {
     return false;
   }
 
-  const prompt = PROMPT + ' "' + title.replace(/"/g, '') + '"';
+  const safeTitle = title.replace(/"/g, '');
+  const safeDescription = String(description || '').slice(0, 4000).replace(/"/g, '');
+  const keywordHits = getKeywordHits({ title: safeTitle, description: safeDescription });
+
+  const prompt = PROMPT.replace('{KEYWORD_HITS}', keywordHits.length ? keywordHits.join(', ') : 'NONE')
+    .replace('{TITLE}', safeTitle)
+    .replace('{DESCRIPTION}', safeDescription);
 
   // Prefer Gemini API (Google AI Studio) — simpler setup, no Vertex AI needed
   if (genAI) {
@@ -96,9 +156,15 @@ export async function classifySadguruVideoBatch(videos) {
       description: String(v.description || '')
         .slice(0, 4000)
         .replace(/"/g, "'"),
+      keywordHits: getKeywordHits({
+        title: v.title || '',
+        description: v.description || '',
+      }),
     }));
-    const batchPrompt = `You are a classifier. For each YouTube video, using its title and description, determine if it is a Sadguru video.
-A Sadguru video features Sadhguru (the Indian yogi and mystic) - his teachings, speeches, interviews, or content directly from him.
+    const batchPrompt = `You are a classifier. For each YouTube video, using its title and description (and ONLY as weak hints, the detected keyword evidence), determine if it is a Sadguru video.
+A Sadhguru video features Sadhguru (the Indian yogi and mystic) - his teachings, speeches, interviews, or content directly from him.
+
+Evidence keywords detected in the title/description are provided per video as keywordHits (case-insensitive, spaces ignored). Use them as weak hints only:
 
 Videos to classify (JSON array):
 ${JSON.stringify(batchInput)}
