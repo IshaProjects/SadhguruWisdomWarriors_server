@@ -1,5 +1,6 @@
 import { Parser } from '@json2csv/plainjs';
 import ExcelJS from 'exceljs';
+import mongoose from 'mongoose';
 import Channel from '../models/Channel.js';
 import ChannelSnapshot from '../models/ChannelSnapshot.js';
 import Video from '../models/Video.js';
@@ -65,7 +66,11 @@ function buildVideoFilter(query) {
     if (tagList.length) channelFilter.tags = { $in: tagList };
   }
 
-  if (channelId) videoFilter.channelId = channelId;
+  if (channelId) {
+    videoFilter.channelId = mongoose.isValidObjectId(channelId)
+      ? mongoose.Types.ObjectId.createFromHexString(channelId)
+      : channelId;
+  }
 
   const orConditions = [];
 

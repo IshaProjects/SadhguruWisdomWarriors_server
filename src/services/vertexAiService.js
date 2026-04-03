@@ -31,6 +31,7 @@ if (geminiApiKey) {
 }
 
 const SADHGURU_KEYWORDS = [
+  // Core Sadhguru & Isha
   'sadhguru',
   'ishafoundation',
   'isha',
@@ -56,6 +57,47 @@ const SADHGURU_KEYWORDS = [
   'lingabhairavi',
   'sadhguruwisdom',
   'dhyanalinga',
+
+  // Programs & Offerings
+  'innerengineeringonline',
+  'iecompletion',
+  'bhavaspandana',
+  'shoonyameditation',
+  'samyama',
+  'ishavolunteers',
+  'ishalife',
+  'ishaashram',
+  'ishaevents',
+  'sacredspaces',
+  'mahadev',
+  'pranayama',
+  'kriyayoga',
+  'meditationpractice',
+  'guidedmeditation',
+  'yogapractice',
+  'spiritualpractice',
+  'dailysadhana',
+  'energybody',
+  'sadhanapada',
+
+  // Spiritual Concepts
+  'innerpeace',
+  'bliss',
+  'joyfulliving',
+  'mindfulness',
+  'selfawareness',
+  'awakening',
+  'enlightenment',
+  'transformation',
+  'stillness',
+  'silence',
+  'devotion',
+  'gratitude',
+  'divineenergy',
+  'presence',
+  'awareness',
+  'culture',
+  'sanatandharma',
 ];
 
 const normalizeForKeywordMatch = (s) =>
