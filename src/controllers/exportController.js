@@ -152,7 +152,6 @@ function mapChannel(c, periodMetrics = null, classificationCounts = null) {
   const videos = c.currentStats?.videoCount  ?? 0;
   const avgViewsPerVideo = videos > 0 ? Math.round(views / videos) : 0;
   const sadhguru = classificationCounts?.sadhguru ?? 0;
-  const nonSadhguru = classificationCounts?.['non sadhguru'] ?? 0;
   const row = {
     title:               c.title,
     youtube_channel_id:  c.youtubeChannelId,
@@ -162,7 +161,6 @@ function mapChannel(c, periodMetrics = null, classificationCounts = null) {
     status:              c.status    || '',
     tags:                c.tags?.join('; ') || '',
     sadhguru_count:      sadhguru,
-    non_sadhguru_count:  nonSadhguru,
     subscribers:         subs,
     total_views:         views,
     video_count:         videos,
@@ -306,7 +304,7 @@ function mapVideo(v, channelMap, avgViews) {
     youtube_video_id: v.youtubeVideoId,
     channel:          ch.title    || '',
     category:         ch.category || '',
-    classification:  v.classification || '—',
+    classification: v.classification === 'non sadhguru' ? '-' : (v.classification || '—'),
     published_at:     v.publishedAt ? v.publishedAt.toISOString().slice(0, 10) : '',
     views:            v.views    ?? 0,
     likes:            v.likes    ?? 0,
@@ -535,7 +533,6 @@ export async function reportChannels(req, res, next) {
         { header: 'Category',            key: 'category',            width: 18 },
         { header: 'Status',              key: 'status',              width: 10 },
         { header: 'Sadhguru Videos',     key: 'sadhguru_count',     width: 16 },
-        { header: 'Non Sadhguru Videos', key: 'non_sadhguru_count',  width: 18 },
         { header: 'Tags',                key: 'tags',                width: 24 },
         { header: 'Subscribers',         key: 'subscribers',         width: 16 },
         { header: 'Total Views',         key: 'total_views',         width: 16 },
