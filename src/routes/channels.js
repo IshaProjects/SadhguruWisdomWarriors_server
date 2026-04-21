@@ -14,6 +14,7 @@ import {
   classifyAllChannelsVideos,
   getChannelVideos,
   classifyChannelVideos,
+  reclassifyChannelVideos,
   pullChannelVideos,
 } from '../controllers/channelController.js';
 import { authenticate, authorize } from '../middleware/auth.js';
@@ -37,6 +38,7 @@ router.delete('/:id', authorize('admin'), deleteChannel);
 router.post('/:id/sync', authorize('admin', 'manager'), syncSingleChannel);
 router.post('/:id/pull-videos', authorize('admin', 'manager'), pullChannelVideos);
 router.post('/:id/classify-videos', authorize('admin', 'manager'), classifyChannelVideos);
+router.post('/:id/reclassify-videos', authorize('admin'), reclassifyChannelVideos);
 router.get('/:id/videos', getChannelVideos);
 
 export default router;

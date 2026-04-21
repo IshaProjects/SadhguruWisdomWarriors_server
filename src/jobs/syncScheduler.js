@@ -2,6 +2,7 @@ import cron from 'node-cron';
 import {
   syncChannelStats,
   syncVideoStats,
+  syncDedicatedIngestLast24h,
   syncIhiIngestLast24h,
   syncIhiSadhguruVideoStats,
 } from '../services/syncEngine.js';
@@ -10,6 +11,7 @@ import { logger } from '../utils/logger.js';
 
 let channelTask = null;
 let videoTask = null;
+let dedicatedIngestTask = null;
 let ihiIngestTask = null;
 let ihiSadhguruStatsTask = null;
 
@@ -17,6 +19,10 @@ export async function startSyncScheduler() {
   const config = await SyncConfig.getSingleton();
   scheduleChannelSync(config.channelSyncSchedule, config.channelSyncEnabled);
   scheduleVideoSync(config.videoSyncSchedule, config.videoSyncEnabled);
+  scheduleDedicatedIngest(
+    config.dedicatedIngestSchedule || '0 */6 * * *',
+    config.dedicatedIngestEnabled !== false
+  );
   scheduleIhiIngest(
     config.ihiIngestSchedule || '0 */6 * * *',
     config.ihiIngestEnabled !== false
@@ -94,6 +100,29 @@ export function scheduleIhiIngest(cronExpr, enabled) {
     }
   });
   logger.info(`[Scheduler] IHI ingest scheduled: ${cronExpr}`);
+}
+
+export function scheduleDedicatedIngest(cronExpr, enabled) {
+  if (dedicatedIngestTask) {
+    dedicatedIngestTask.stop();
+    dedicatedIngestTask = null;
+  }
+  if (!enabled) {
+    logger.info('[Scheduler] Dedicated ingest sync disabled');
+    return;
+  }
+  dedicatedIngestTask = cron.schedule(cronExpr, async () => {
+    logger.info('[Scheduler] Starting Dedicated ingest (24h + auto classify)...');
+    try {
+      const log = await syncDedicatedIngestLast24h(null, 'auto');
+      logger.info(
+        `[Scheduler] Dedicated ingest done: ${log.videosProcessed} videos, status: ${log.status}`
+      );
+    } catch (err) {
+      logger.error(`[Scheduler] Dedicated ingest failed: ${err.message}`);
+    }
+  });
+  logger.info(`[Scheduler] Dedicated ingest scheduled: ${cronExpr}`);
 }
 
 export function scheduleIhiSadhguruStats(cronExpr, enabled) {

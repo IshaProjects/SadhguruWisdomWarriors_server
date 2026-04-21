@@ -5,6 +5,7 @@ import {
   getLogs,
   triggerChannelSync,
   triggerVideoSync,
+  triggerDedicatedIngest,
   triggerIhiIngest,
   triggerIhiSadhguruStats,
   getConfig,
@@ -18,6 +19,11 @@ router.get('/status', getStatus);
 router.get('/logs', getLogs);
 router.post('/channels/trigger', authorize('admin', 'manager'), triggerChannelSync);
 router.post('/videos/trigger', authorize('admin', 'manager'), triggerVideoSync);
+router.post(
+  '/dedicated/ingest/trigger',
+  authorize('admin', 'manager'),
+  triggerDedicatedIngest
+);
 router.post(
   '/ihi/ingest/trigger',
   authorize('admin', 'manager'),

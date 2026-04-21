@@ -4,6 +4,12 @@ import Video from '../models/Video.js';
 import VideoSnapshot from '../models/VideoSnapshot.js';
 import MicroUnit from '../models/MicroUnit.js';
 import DashboardLayout from '../models/DashboardLayout.js';
+import {
+  parseYmdToUtcEnd,
+  parseYmdToUtcStart,
+  utcEndOfDay,
+  utcStartOfDay,
+} from '../utils/dateUtc.js';
 
 /**
  * Returns { start, end } for filtering. Uses startDate/endDate query params if both
@@ -11,32 +17,28 @@ import DashboardLayout from '../models/DashboardLayout.js';
  */
 function getDateRange(period, query = {}) {
   if (query.startDate && query.endDate) {
-    const start = new Date(query.startDate);
-    const end = new Date(query.endDate);
-    start.setHours(0, 0, 0, 0);
-    end.setHours(23, 59, 59, 999);
+    const start = parseYmdToUtcStart(query.startDate);
+    const end = parseYmdToUtcEnd(query.endDate);
     if (start > end) return getDateRange(period, {}); // fallback if invalid
     return { start, end };
   }
 
-  const end = new Date();
-  const start = new Date();
+  const end = utcEndOfDay();
+  const start = new Date(end);
   switch (period) {
     case '7d':
-      start.setDate(start.getDate() - 7);
+      start.setUTCDate(start.getUTCDate() - 7);
       break;
     case '30d':
-      start.setDate(start.getDate() - 30);
+      start.setUTCDate(start.getUTCDate() - 30);
       break;
     case '90d':
-      start.setDate(start.getDate() - 90);
+      start.setUTCDate(start.getUTCDate() - 90);
       break;
     default:
-      start.setDate(start.getDate() - 30);
+      start.setUTCDate(start.getUTCDate() - 30);
   }
-  start.setHours(0, 0, 0, 0);
-  end.setHours(23, 59, 59, 999);
-  return { start, end };
+  return { start: utcStartOfDay(start), end };
 }
 
 function buildChannelFilter(query) {
@@ -57,8 +59,8 @@ function buildChannelFilter(query) {
   }
   if (query.startDate || query.endDate) {
     filter.lastSyncedAt = {};
-    if (query.startDate) filter.lastSyncedAt.$gte = new Date(query.startDate);
-    if (query.endDate)   filter.lastSyncedAt.$lte = new Date(query.endDate + 'T23:59:59.999Z');
+    if (query.startDate) filter.lastSyncedAt.$gte = parseYmdToUtcStart(query.startDate);
+    if (query.endDate)   filter.lastSyncedAt.$lte = parseYmdToUtcEnd(query.endDate);
   }
   return filter;
 }
@@ -386,8 +388,8 @@ export async function getCategoryBreakdown(req, res, next) {
     const channelIds = channels.map((c) => c._id);
 
     if (isPeriodMode) {
-      const startDateObj = new Date(startDate);
-      const endDateObj = new Date(endDate + 'T23:59:59.999Z');
+      const startDateObj = parseYmdToUtcStart(startDate);
+      const endDateObj = parseYmdToUtcEnd(endDate);
       const snapshotFilter = { channelId: { $in: channelIds }, deletedAt: null };
 
       const [startSnapshots, endSnapshots] = await Promise.all([
@@ -532,8 +534,8 @@ export async function getMicroUnitsReport(req, res, next) {
       }
 
       if (isPeriodMode) {
-        const startDateObj = new Date(startDate);
-        const endDateObj = new Date(endDate + 'T23:59:59.999Z');
+        const startDateObj = parseYmdToUtcStart(startDate);
+        const endDateObj = parseYmdToUtcEnd(endDate);
         const snapshotFilter = { channelId: { $in: channelIds }, deletedAt: null };
 
         const [startSnapshots, endSnapshots] = await Promise.all([
@@ -640,9 +642,7 @@ export async function getChannelMetrics(req, res, next) {
     const videoMap = new Map(videoAgg.map((v) => [v._id.toString(), v]));
 
     // --- 2. ChannelSnapshot: subscriber velocity (7-day lookback) ---
-    const sevenDaysAgo = new Date();
-    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
-    sevenDaysAgo.setHours(0, 0, 0, 0);
+    const sevenDaysAgo = utcStartOfDay(Date.now() - 7 * 24 * 60 * 60 * 1000);
 
     // For each channel get the most recent snapshot on or before 7 days ago
     const snapAgg = await ChannelSnapshot.aggregate([

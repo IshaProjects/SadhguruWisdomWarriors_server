@@ -9,6 +9,7 @@ import { classifySadguruVideoBatch } from '../services/vertexAiService.js';
 import { extractChannelId } from '../utils/helpers.js';
 import { softDeleteChannels } from '../utils/softDelete.js';
 import { parse } from 'csv-parse/sync';
+import { utcStartOfDay } from '../utils/dateUtc.js';
 
 export async function listChannels(req, res, next) {
   try {
@@ -151,8 +152,7 @@ export async function addChannel(req, res, next) {
     });
 
     // Create initial snapshot
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
+    const today = utcStartOfDay();
     await ChannelSnapshot.create({
       channelId: channel._id,
       date: today,
@@ -593,6 +593,34 @@ async function classifyVideosForChannel(channel) {
     nonSadguruCount: newlyClassified - sadguruCount,
     isSadhguruChannel: false,
   };
+}
+
+/**
+ * POST /api/channels/:id/reclassify-videos
+ * Force re-classify ALL videos (clears existing classification first).
+ * Dedicated channels: mark all as sadhguru. IHI/other: use AI.
+ */
+export async function reclassifyChannelVideos(req, res, next) {
+  try {
+    const channel = await Channel.findById(req.params.id);
+    if (!channel) {
+      return res.status(404).json({ message: 'Channel not found' });
+    }
+
+    await Video.updateMany(
+      { channelId: channel._id, deletedAt: null },
+      { $set: { classification: '' } }
+    );
+
+    const result = await classifyVideosForChannel(channel);
+    res.json({ ...result, reclassified: true });
+  } catch (err) {
+    if (err.message?.includes('GEMINI_API_KEY') || err.message?.includes('GOOGLE_CLOUD_PROJECT')) {
+      return res.status(503).json({ message: 'AI not configured. Set GEMINI_API_KEY (from aistudio.google.com) or GOOGLE_CLOUD_PROJECT for Vertex AI.' });
+    }
+    console.error('Reclassification failed:', err.message);
+    return res.status(500).json({ message: err.message || 'Reclassification failed' });
+  }
 }
 
 /**

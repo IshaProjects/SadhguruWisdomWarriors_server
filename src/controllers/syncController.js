@@ -4,6 +4,7 @@ import {
   getSyncStatus,
   syncChannelStats,
   syncVideoStats,
+  syncDedicatedIngestLast24h,
   syncIhiIngestLast24h,
   syncIhiSadhguruVideoStats,
 } from '../services/syncEngine.js';
@@ -11,6 +12,7 @@ import { getQuotaUsage } from '../services/youtubeApi.js';
 import {
   scheduleChannelSync,
   scheduleVideoSync,
+  scheduleDedicatedIngest,
   scheduleIhiIngest,
   scheduleIhiSadhguruStats,
 } from '../jobs/syncScheduler.js';
@@ -19,10 +21,13 @@ function normalizeConfigDoc(config) {
   const o = config.toObject ? config.toObject() : { ...config };
   return {
     ...o,
+    dedicatedIngestSchedule:
+      o.dedicatedIngestSchedule || '0 */6 * * *',
     ihiIngestSchedule:
       o.ihiIngestSchedule || '0 */6 * * *',
     ihiSadhguruStatsSchedule:
       o.ihiSadhguruStatsSchedule || '0 5 * * *',
+    dedicatedIngestEnabled: o.dedicatedIngestEnabled !== false,
     ihiIngestEnabled: o.ihiIngestEnabled !== false,
     ihiSadhguruStatsEnabled: o.ihiSadhguruStatsEnabled !== false,
   };
@@ -106,6 +111,18 @@ export async function triggerIhiIngest(req, res, next) {
   }
 }
 
+export async function triggerDedicatedIngest(req, res, next) {
+  try {
+    const log = await syncDedicatedIngestLast24h(null, 'manual');
+    res.json({ message: 'Dedicated ingest sync started', log });
+  } catch (err) {
+    if (err.message.includes('already in progress')) {
+      return res.status(409).json({ message: err.message });
+    }
+    next(err);
+  }
+}
+
 export async function triggerIhiSadhguruStats(req, res, next) {
   try {
     const log = await syncIhiSadhguruVideoStats(null, 'manual');
@@ -134,10 +151,12 @@ export async function updateConfig(req, res, next) {
     const {
       channelSyncSchedule,
       videoSyncSchedule,
+      dedicatedIngestSchedule,
       ihiIngestSchedule,
       ihiSadhguruStatsSchedule,
       channelSyncEnabled,
       videoSyncEnabled,
+      dedicatedIngestEnabled,
       ihiIngestEnabled,
       ihiSadhguruStatsEnabled,
     } = req.body;
@@ -156,6 +175,12 @@ export async function updateConfig(req, res, next) {
     const videoEnabledChanged =
       videoSyncEnabled !== undefined &&
       videoSyncEnabled !== config.videoSyncEnabled;
+    const dedicatedIngestScheduleChanged =
+      dedicatedIngestSchedule !== undefined &&
+      dedicatedIngestSchedule !== config.dedicatedIngestSchedule;
+    const dedicatedIngestEnabledChanged =
+      dedicatedIngestEnabled !== undefined &&
+      dedicatedIngestEnabled !== config.dedicatedIngestEnabled;
     const ihiIngestScheduleChanged =
       ihiIngestSchedule !== undefined &&
       ihiIngestSchedule !== config.ihiIngestSchedule;
@@ -173,6 +198,8 @@ export async function updateConfig(req, res, next) {
       config.channelSyncSchedule = channelSyncSchedule;
     if (videoSyncSchedule !== undefined)
       config.videoSyncSchedule = videoSyncSchedule;
+    if (dedicatedIngestSchedule !== undefined)
+      config.dedicatedIngestSchedule = dedicatedIngestSchedule;
     if (ihiIngestSchedule !== undefined)
       config.ihiIngestSchedule = ihiIngestSchedule;
     if (ihiSadhguruStatsSchedule !== undefined)
@@ -181,6 +208,8 @@ export async function updateConfig(req, res, next) {
       config.channelSyncEnabled = channelSyncEnabled;
     if (videoSyncEnabled !== undefined)
       config.videoSyncEnabled = videoSyncEnabled;
+    if (dedicatedIngestEnabled !== undefined)
+      config.dedicatedIngestEnabled = dedicatedIngestEnabled;
     if (ihiIngestEnabled !== undefined)
       config.ihiIngestEnabled = ihiIngestEnabled;
     if (ihiSadhguruStatsEnabled !== undefined)
@@ -193,6 +222,12 @@ export async function updateConfig(req, res, next) {
     }
     if (videoScheduleChanged || videoEnabledChanged) {
       scheduleVideoSync(config.videoSyncSchedule, config.videoSyncEnabled);
+    }
+    if (dedicatedIngestScheduleChanged || dedicatedIngestEnabledChanged) {
+      scheduleDedicatedIngest(
+        config.dedicatedIngestSchedule,
+        config.dedicatedIngestEnabled
+      );
     }
     if (ihiIngestScheduleChanged || ihiIngestEnabledChanged) {
       scheduleIhiIngest(config.ihiIngestSchedule, config.ihiIngestEnabled);

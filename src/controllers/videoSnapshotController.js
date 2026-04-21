@@ -1,6 +1,13 @@
 import mongoose from 'mongoose';
 import VideoSnapshot from '../models/VideoSnapshot.js';
 import Video from '../models/Video.js';
+import {
+  parseYmdToUtcEnd,
+  parseYmdToUtcStart,
+  utcDateString,
+  utcEndOfDay,
+  utcStartOfDay,
+} from '../utils/dateUtc.js';
 
 /**
  * GET /api/video-snapshots/video/:videoId
@@ -12,12 +19,10 @@ export async function getVideoSnapshots(req, res, next) {
     const { videoId } = req.params;
     const { startDate, endDate } = req.query;
 
-    const end = endDate ? new Date(endDate) : new Date();
-    end.setHours(23, 59, 59, 999);
-
-    const start = startDate ? new Date(startDate) : new Date();
-    if (!startDate) start.setDate(start.getDate() - 90);
-    start.setHours(0, 0, 0, 0);
+    const end = endDate ? parseYmdToUtcEnd(endDate) : utcEndOfDay();
+    const start = startDate
+      ? parseYmdToUtcStart(startDate)
+      : utcStartOfDay(Date.now() - 90 * 24 * 60 * 60 * 1000);
 
     const snapshots = await VideoSnapshot.find({
       videoId,
@@ -44,12 +49,10 @@ export async function getChannelVideoTrends(req, res, next) {
     const { channelId } = req.params;
     const { startDate, endDate } = req.query;
 
-    const end = endDate ? new Date(endDate) : new Date();
-    end.setHours(23, 59, 59, 999);
-
-    const start = startDate ? new Date(startDate) : new Date();
-    if (!startDate) start.setDate(start.getDate() - 30);
-    start.setHours(0, 0, 0, 0);
+    const end = endDate ? parseYmdToUtcEnd(endDate) : utcEndOfDay();
+    const start = startDate
+      ? parseYmdToUtcStart(startDate)
+      : utcStartOfDay(Date.now() - 30 * 24 * 60 * 60 * 1000);
 
     // 1. Daily aggregated trend across all videos in the channel
     const dailyTrend = await VideoSnapshot.aggregate([
@@ -108,7 +111,7 @@ export async function getChannelVideoTrends(req, res, next) {
       dataPoints: v.dataPoints
         .sort((a, b) => new Date(a.date) - new Date(b.date))
         .map((d) => ({
-          date: d.date.toISOString().slice(0, 10),
+          date: utcDateString(d.date),
           views: d.views,
           likes: d.likes,
           comments: d.comments,

@@ -119,6 +119,13 @@ function getKeywordHits({ title, description }) {
   return [...new Set(hits)];
 }
 
+function extractGeminiText(response) {
+  if (!response) return '';
+  if (typeof response.text === 'function') return response.text().trim();
+  if (typeof response.text === 'string') return response.text.trim();
+  return '';
+}
+
 const PROMPT = `You are a classifier. Given a YouTube video title and description, determine if the video is a Sadhguru video.
 A Sadhguru video is content that features Sadhguru (the Indian yogi and mystic) - his teachings, speeches, interviews, or content directly from him.
 
@@ -154,7 +161,7 @@ export async function classifySadguruVideo(title, description = '') {
     const modelId = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
     const model = genAI.getGenerativeModel({ model: modelId });
     const result = await model.generateContent(prompt);
-    const text = result.response?.text?.trim().toUpperCase() || '';
+    const text = extractGeminiText(result.response).toUpperCase();
     return text.startsWith('YES');
   }
 
@@ -221,7 +228,7 @@ No other text.`;
         const modelId = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
         const model = genAI.getGenerativeModel({ model: modelId });
         const result = await model.generateContent(batchPrompt);
-        text = result.response?.text?.trim() || '';
+        text = extractGeminiText(result.response);
       } else if (vertexAI) {
         const modelId = process.env.VERTEX_AI_MODEL || 'gemini-2.5-flash';
         const model = vertexAI.getGenerativeModel({ model: modelId });

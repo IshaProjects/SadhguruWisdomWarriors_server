@@ -4,6 +4,12 @@ import mongoose from 'mongoose';
 import Channel from '../models/Channel.js';
 import ChannelSnapshot from '../models/ChannelSnapshot.js';
 import Video from '../models/Video.js';
+import VideoSnapshot from '../models/VideoSnapshot.js';
+import {
+  parseYmdToUtcEnd,
+  parseYmdToUtcStart,
+  utcDateString,
+} from '../utils/dateUtc.js';
 
 /* ─────────────────────────────────────────────────────────────────────
    Helpers
@@ -44,8 +50,8 @@ function buildChannelFilter(query) {
     // Period mode: dates used for snapshot delta, not for filtering
   } else if (startDate || endDate) {
     filter.lastSyncedAt = {};
-    if (startDate) filter.lastSyncedAt.$gte = new Date(startDate);
-    if (endDate)   filter.lastSyncedAt.$lte = new Date(endDate + 'T23:59:59.999Z');
+    if (startDate) filter.lastSyncedAt.$gte = parseYmdToUtcStart(startDate);
+    if (endDate)   filter.lastSyncedAt.$lte = parseYmdToUtcEnd(endDate);
   }
   return filter;
 }
@@ -114,8 +120,8 @@ function buildVideoFilter(query) {
   }
   if (startDate || endDate) {
     videoFilter.publishedAt = {};
-    if (startDate) videoFilter.publishedAt.$gte = new Date(startDate);
-    if (endDate)   videoFilter.publishedAt.$lte = new Date(endDate + 'T23:59:59.999Z');
+    if (startDate) videoFilter.publishedAt.$gte = parseYmdToUtcStart(startDate);
+    if (endDate)   videoFilter.publishedAt.$lte = parseYmdToUtcEnd(endDate);
   }
 
   return { channelFilter, videoFilter };
@@ -127,8 +133,8 @@ async function getClassificationCountsByChannel(channelIds, options = {}) {
   const match = { channelId: { $in: channelIds }, deletedAt: null };
   if (startDate && endDate) {
     match.publishedAt = {
-      $gte: new Date(startDate),
-      $lte: new Date(`${endDate}T23:59:59.999Z`),
+      $gte: parseYmdToUtcStart(startDate),
+      $lte: parseYmdToUtcEnd(endDate),
     };
   }
   const agg = await Video.aggregate([
@@ -144,6 +150,51 @@ async function getClassificationCountsByChannel(channelIds, options = {}) {
     map.get(cid)[cls] = x.count;
   }
   return map;
+}
+
+/**
+ * Sum per-video view deltas (latest snapshot on/before end minus latest on/before start)
+ * for videos matching classification. Used when channel report classification filter is
+ * sadhguru | non_sadhguru so "views in period" reflects that bucket only.
+ */
+async function getClassificationPeriodViewsByChannel(channelIds, startDateObj, endDateObj, classificationKey) {
+  if (!channelIds?.length) return new Map();
+  const clsMongo =
+    classificationKey === 'sadhguru' ? 'sadhguru' : 'non sadhguru';
+  const videoClsMatch = { 'video.classification': clsMongo };
+
+  const base = { channelId: { $in: channelIds }, deletedAt: null };
+
+  const snapStages = (boundary) => [
+    { $match: { ...base, date: { $lte: boundary } } },
+    { $sort: { date: -1 } },
+    {
+      $group: {
+        _id: '$videoId',
+        views: { $first: '$views' },
+        channelId: { $first: '$channelId' },
+      },
+    },
+    { $lookup: { from: 'videos', localField: '_id', foreignField: '_id', as: 'video' } },
+    { $unwind: '$video' },
+    { $match: { 'video.deletedAt': null, ...videoClsMatch } },
+  ];
+
+  const [startSnaps, endSnaps] = await Promise.all([
+    VideoSnapshot.aggregate(snapStages(startDateObj)),
+    VideoSnapshot.aggregate(snapStages(endDateObj)),
+  ]);
+
+  const startByVideo = new Map(startSnaps.map((s) => [s._id.toString(), s.views ?? 0]));
+  const totals = new Map();
+  for (const e of endSnaps) {
+    const vid = e._id.toString();
+    const cid = e.channelId.toString();
+    const startV = startByVideo.get(vid) ?? 0;
+    const delta = Math.max(0, (e.views ?? 0) - startV);
+    totals.set(cid, (totals.get(cid) ?? 0) + delta);
+  }
+  return totals;
 }
 
 function mapChannel(c, periodMetrics = null, classificationCounts = null) {
@@ -167,7 +218,7 @@ function mapChannel(c, periodMetrics = null, classificationCounts = null) {
     avg_views_per_video: avgViewsPerVideo,
     assigned_to:         c.assignedTo?.name || '',
     notes:               c.notes || '',
-    last_synced:         c.lastSyncedAt ? c.lastSyncedAt.toISOString().slice(0, 10) : '',
+    last_synced:         c.lastSyncedAt ? utcDateString(c.lastSyncedAt) : '',
   };
   if (periodMetrics) {
     row.views_in_period       = periodMetrics.viewsInPeriod;
@@ -305,14 +356,14 @@ function mapVideo(v, channelMap, avgViews) {
     channel:          ch.title    || '',
     category:         ch.category || '',
     classification: v.classification === 'non sadhguru' ? '-' : (v.classification || '—'),
-    published_at:     v.publishedAt ? v.publishedAt.toISOString().slice(0, 10) : '',
+    published_at:     v.publishedAt ? utcDateString(v.publishedAt) : '',
     views:            v.views    ?? 0,
     likes:            v.likes    ?? 0,
     comments:         v.comments ?? 0,
     engagement_rate:  parseFloat(engagement),
     outlier_score:    outlierScore,
     duration:         v.duration || '',
-    last_synced:      v.lastSyncedAt ? v.lastSyncedAt.toISOString().slice(0, 10) : '',
+    last_synced:      v.lastSyncedAt ? utcDateString(v.lastSyncedAt) : '',
   };
 }
 
@@ -358,8 +409,8 @@ export async function reportChannels(req, res, next) {
       total = channels.length;
 
       const channelIds = channels.map((c) => c._id);
-      const startDateObj = new Date(startDate);
-      const endDateObj   = new Date(endDate + 'T23:59:59.999Z');
+      const startDateObj = parseYmdToUtcStart(startDate);
+      const endDateObj   = parseYmdToUtcEnd(endDate);
       const snapshotFilter = { channelId: { $in: channelIds }, deletedAt: null };
 
       const [startSnapshots, endSnapshots] = await Promise.all([
@@ -394,6 +445,17 @@ export async function reportChannels(req, res, next) {
 
       const classMap = await getClassificationCountsByChannel(channelIds, { startDate, endDate });
 
+      const clsParam = req.query.classification;
+      let periodViewsByChannel = null;
+      if (clsParam === 'sadhguru' || clsParam === 'non_sadhguru') {
+        periodViewsByChannel = await getClassificationPeriodViewsByChannel(
+          channelIds,
+          startDateObj,
+          endDateObj,
+          clsParam
+        );
+      }
+
       rows = channels.map((c) => {
         const start = startMap.get(c._id.toString());
         const end   = endMap.get(c._id.toString());
@@ -403,8 +465,12 @@ export async function reportChannels(req, res, next) {
         const endSubs    = end?.subscribers   ?? 0;
         const startVideos = start?.videoCount ?? 0;
         const endVideos   = end?.videoCount ?? 0;
+        const channelViewsInPeriod = Math.max(0, endViews - startViews);
         const periodMetrics = {
-          viewsInPeriod:       Math.max(0, endViews - startViews),
+          viewsInPeriod:
+            periodViewsByChannel != null
+              ? (periodViewsByChannel.get(c._id.toString()) ?? 0)
+              : channelViewsInPeriod,
           subscribersInPeriod: endSubs - startSubs,
           videosInPeriod:      endVideos - startVideos,
         };
@@ -508,7 +574,7 @@ export async function reportChannels(req, res, next) {
       });
     }
 
-    const filename = `channel-report-${new Date().toISOString().slice(0, 10)}`;
+    const filename = `channel-report-${utcDateString()}`;
 
     /* ── CSV ── */
     if (format === 'csv') {
@@ -670,7 +736,7 @@ export async function reportVideos(req, res, next) {
       });
     }
 
-    const filename = `video-report-${new Date().toISOString().slice(0, 10)}`;
+    const filename = `video-report-${utcDateString()}`;
 
     /* ── CSV ── */
     if (format === 'csv') {

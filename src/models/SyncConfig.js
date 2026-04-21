@@ -15,6 +15,10 @@ const syncConfigSchema = new mongoose.Schema(
       type: String,
       default: '0 4 * * *',   // 4 AM daily — Dedicated channels only
     },
+    dedicatedIngestSchedule: {
+      type: String,
+      default: '0 */6 * * *', // every 6 hours — Dedicated last 24h ingest + auto-classify
+    },
     ihiIngestSchedule: {
       type: String,
       default: '0 */6 * * *', // every 6 hours — IHI last 24h + classify
@@ -25,6 +29,7 @@ const syncConfigSchema = new mongoose.Schema(
     },
     channelSyncEnabled: { type: Boolean, default: true  },
     videoSyncEnabled:   { type: Boolean, default: true  },
+    dedicatedIngestEnabled:      { type: Boolean, default: true },
     ihiIngestEnabled:           { type: Boolean, default: true },
     ihiSadhguruStatsEnabled:    { type: Boolean, default: true },
   },

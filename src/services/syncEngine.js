@@ -15,9 +15,11 @@ import {
 import { classifySadguruVideoBatch } from './vertexAiService.js';
 import { isDedicatedChannel, isIhiChannel } from '../utils/channelGroup.js';
 import { logger } from '../utils/logger.js';
+import { utcStartOfDay } from '../utils/dateUtc.js';
 
 let isChannelSyncing = false;
 let isVideoSyncing = false;
+let isDedicatedIngestSyncing = false;
 let isIhiIngestSyncing = false;
 let isIhiSadhguruStatsSyncing = false;
 let isPullingAllVideos = false;
@@ -28,6 +30,7 @@ export function getSyncStatus() {
   return {
     isChannelSyncing,
     isVideoSyncing,
+    isDedicatedIngestSyncing,
     isIhiIngestSyncing,
     isIhiSadhguruStatsSyncing,
     isPullingAllVideos,
@@ -71,8 +74,7 @@ export async function syncChannelStats(channelIds = null, type = 'manual') {
 
     const channelMap = new Map(channels.map((ch) => [ch.youtubeChannelId, ch]));
 
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
+    const today = utcStartOfDay();
 
     for (const ytChannel of channelData) {
       const channel = channelMap.get(ytChannel.id);
@@ -180,8 +182,7 @@ export async function syncVideoStats(channelIds = null, type = 'manual') {
     let quotaUsed       = 0;
     const quota = getQuotaUsage();
 
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
+    const today = utcStartOfDay();
 
     logger.info(
       `[Video Sync] Dedicated channels only — syncing videos for ${channels.length} channels...`
@@ -347,8 +348,7 @@ export async function syncIhiIngestLast24h(channelIds = null, type = 'manual') {
         const videoData = await fetchVideosBatch(videoIds);
         quotaUsed += Math.ceil(videoIds.length / 50);
 
-        const today = new Date();
-        today.setHours(0, 0, 0, 0);
+        const today = utcStartOfDay();
 
         for (const vid of videoData) {
           const views = parseInt(vid.statistics?.viewCount) || 0;
@@ -466,6 +466,170 @@ export async function syncIhiIngestLast24h(channelIds = null, type = 'manual') {
 }
 
 // ---------------------------------------------------------------------------
+// Dedicated ingest — last 24h uploads, upsert, then auto-classify as sadhguru
+// ---------------------------------------------------------------------------
+export async function syncDedicatedIngestLast24h(channelIds = null, type = 'manual') {
+  if (isDedicatedIngestSyncing) {
+    throw new Error('Dedicated ingest sync already in progress');
+  }
+
+  isDedicatedIngestSyncing = true;
+  const syncLog = await SyncLog.create({
+    syncType: 'dedicated_ingest',
+    type,
+    status: 'running',
+    startedAt: new Date(),
+  });
+
+  try {
+    const query = { status: { $ne: 'archived' } };
+    if (channelIds) query._id = { $in: channelIds };
+    const channels = (await Channel.find(query)).filter(isDedicatedChannel);
+
+    if (channels.length === 0) {
+      syncLog.status = 'success';
+      syncLog.completedAt = new Date();
+      await syncLog.save();
+      return syncLog;
+    }
+
+    const since = new Date(Date.now() - MS_24H);
+    let videosProcessed = 0;
+    let quotaUsed = 0;
+    let classified = 0;
+
+    logger.info(
+      `[Dedicated Ingest] ${channels.length} channels, videos published since ${since.toISOString()}`
+    );
+
+    for (const channel of channels) {
+      if (!channel.uploadsPlaylistId) continue;
+
+      const quota = getQuotaUsage();
+      if (quota.remaining < 10) {
+        logger.warn('[Dedicated Ingest] Approaching quota limit, stopping');
+        break;
+      }
+
+      try {
+        const { items: playlistItems, pagesFetched } =
+          await fetchPlaylistItemsPublishedSince(
+            channel.uploadsPlaylistId,
+            since
+          );
+        quotaUsed += pagesFetched;
+
+        if (playlistItems.length === 0) continue;
+
+        const videoIds = [
+          ...new Set(
+            playlistItems
+              .map((item) => item.contentDetails?.videoId)
+              .filter(Boolean)
+          ),
+        ];
+        if (videoIds.length === 0) continue;
+
+        const videoData = await fetchVideosBatch(videoIds);
+        quotaUsed += Math.ceil(videoIds.length / 50);
+
+        const today = utcStartOfDay();
+
+        for (const vid of videoData) {
+          const views = parseInt(vid.statistics?.viewCount) || 0;
+          const likes = parseInt(vid.statistics?.likeCount) || 0;
+          const comments = parseInt(vid.statistics?.commentCount) || 0;
+
+          const savedVideo = await Video.findOneAndUpdate(
+            { youtubeVideoId: vid.id },
+            {
+              youtubeVideoId: vid.id,
+              channelId: channel._id,
+              title: vid.snippet?.title || '',
+              description: vid.snippet?.description || '',
+              thumbnailUrl:
+                vid.snippet?.thumbnails?.high?.url ||
+                vid.snippet?.thumbnails?.default?.url ||
+                '',
+              publishedAt: vid.snippet?.publishedAt,
+              views,
+              likes,
+              comments,
+              duration: vid.contentDetails?.duration || '',
+              lastSyncedAt: new Date(),
+            },
+            { upsert: true, new: true }
+          );
+
+          await VideoSnapshot.findOneAndUpdate(
+            { videoId: savedVideo._id, date: today },
+            {
+              videoId: savedVideo._id,
+              channelId: channel._id,
+              date: today,
+              views,
+              likes,
+              comments,
+            },
+            { upsert: true, new: true }
+          );
+
+          videosProcessed++;
+        }
+
+        const classifyResult = await Video.updateMany(
+          {
+            channelId: channel._id,
+            youtubeVideoId: { $in: videoIds },
+            deletedAt: null,
+            $or: [
+              { classification: { $exists: false } },
+              { classification: '' },
+              { classification: null },
+            ],
+          },
+          { $set: { classification: 'sadhguru' } }
+        );
+        classified += classifyResult.modifiedCount || 0;
+      } catch (err) {
+        if (err.message === 'QUOTA_EXCEEDED') {
+          logger.error('[Dedicated Ingest] Quota exceeded');
+          break;
+        }
+        logger.error(
+          `[Dedicated Ingest] Error on channel ${channel.youtubeChannelId}: ${err.message}`
+        );
+        syncLog.errors.push({
+          channelId: channel.youtubeChannelId,
+          message: err.message,
+        });
+      }
+    }
+
+    syncLog.videosProcessed = videosProcessed;
+    syncLog.quotaUsed = quotaUsed;
+    syncLog.status =
+      syncLog.errors.length > 0 ? 'partial' : 'success';
+    syncLog.completedAt = new Date();
+    await syncLog.save();
+
+    logger.info(
+      `[Dedicated Ingest] Done: ${videosProcessed} videos, ${quotaUsed} quota used, auto-classified: ${classified}`
+    );
+  } catch (err) {
+    logger.error(`[Dedicated Ingest] Failed: ${err.message}`);
+    syncLog.status = 'failed';
+    syncLog.errors.push({ channelId: 'global', message: err.message });
+    syncLog.completedAt = new Date();
+    await syncLog.save();
+  } finally {
+    isDedicatedIngestSyncing = false;
+  }
+
+  return syncLog;
+}
+
+// ---------------------------------------------------------------------------
 // IHI — daily stats + snapshots for Sadhguru-classified videos only
 // ---------------------------------------------------------------------------
 export async function syncIhiSadhguruVideoStats(channelIds = null, type = 'manual') {
@@ -510,8 +674,7 @@ export async function syncIhiSadhguruVideoStats(channelIds = null, type = 'manua
       return syncLog;
     }
 
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
+    const today = utcStartOfDay();
 
     let videosProcessed = 0;
     let quotaUsed = 0;
@@ -650,8 +813,7 @@ export async function pullAllChannelVideos(channelId) {
     const allVideoIds = await fetchAllPlaylistItemIds(uploadsPlaylistId);
     logger.info(`[Pull All Videos] Found ${allVideoIds.length} videos, processing in batches of ${PULL_VIDEO_BATCH_SIZE}`);
 
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
+    const today = utcStartOfDay();
 
     let videosProcessed = 0;
 
@@ -717,8 +879,35 @@ export async function pullAllChannelVideos(channelId) {
       await channel.save();
     }
 
+    let dedicatedAutoClassified = 0;
+    if (isDedicatedChannel(channel)) {
+      const classifyResult = await Video.updateMany(
+        {
+          channelId: channel._id,
+          deletedAt: null,
+          $or: [
+            { classification: { $exists: false } },
+            { classification: '' },
+            { classification: null },
+          ],
+        },
+        { $set: { classification: 'sadhguru' } }
+      );
+      dedicatedAutoClassified = classifyResult.modifiedCount || 0;
+      if (dedicatedAutoClassified > 0) {
+        logger.info(
+          `[Pull All Videos] Dedicated auto-classified ${dedicatedAutoClassified} videos as sadhguru for channel ${channel.title}`
+        );
+      }
+    }
+
     logger.info(`[Pull All Videos] Done: ${videosProcessed} videos for channel ${channel.title}`);
-    return { videosProcessed, totalIds: allVideoIds.length, allVideosPulled: allPulled };
+    return {
+      videosProcessed,
+      totalIds: allVideoIds.length,
+      allVideosPulled: allPulled,
+      dedicatedAutoClassified,
+    };
   } catch (err) {
     if (err.message === 'QUOTA_EXCEEDED') throw err;
     logger.error(`[Pull All Videos] Failed: ${err.message}`);

@@ -5,7 +5,9 @@
   "scripts": {
     "dev": "nodemon src/app.js",
     "start": "node src/app.js",
-    "test:classify": "node scripts/test-classification.js"
+    "test:classify": "node scripts/test-classification.js",
+    "mongo:local": "bash scripts/setup-local-mongodb.sh",
+    "migrate:snapshots:utc": "node scripts/migrate-snapshot-dates-to-utc.js"
   },
   "dependencies": {
     "@google-cloud/vertexai": "^1.10.0",
