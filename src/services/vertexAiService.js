@@ -126,6 +126,23 @@ function extractGeminiText(response) {
   return '';
 }
 
+function classifyByRuleScore({ title, description }) {
+  // Per requirement: all configured keywords are treated as strong anchors.
+  const keywordHits = getKeywordHits({ title, description });
+  const hasStrongAnchor = keywordHits.length > 0;
+  const score = hasStrongAnchor ? 5 : 0;
+
+  if (score >= 5) {
+    return { classification: 'sadhguru', score, keywordHits, hasStrongAnchor, isAmbiguous: false };
+  }
+
+  if (score <= 0 && !hasStrongAnchor) {
+    return { classification: 'non sadhguru', score, keywordHits, hasStrongAnchor, isAmbiguous: false };
+  }
+
+  return { classification: null, score, keywordHits, hasStrongAnchor, isAmbiguous: true };
+}
+
 const PROMPT = `You are a classifier. Given a YouTube video title and description, determine if the video is a Sadhguru video.
 A Sadhguru video is content that features Sadhguru (the Indian yogi and mystic) - his teachings, speeches, interviews, or content directly from him.
 
@@ -150,7 +167,11 @@ export async function classifySadguruVideo(title, description = '') {
 
   const safeTitle = title.replace(/"/g, '');
   const safeDescription = String(description || '').slice(0, 4000).replace(/"/g, '');
-  const keywordHits = getKeywordHits({ title: safeTitle, description: safeDescription });
+  const ruleResult = classifyByRuleScore({ title: safeTitle, description: safeDescription });
+  if (!ruleResult.isAmbiguous) {
+    return ruleResult.classification === 'sadhguru';
+  }
+  const { keywordHits } = ruleResult;
 
   const prompt = PROMPT.replace('{KEYWORD_HITS}', keywordHits.length ? keywordHits.join(', ') : 'NONE')
     .replace('{TITLE}', safeTitle)
@@ -197,8 +218,21 @@ export async function classifySadguruVideoBatch(videos) {
 
   const results = new Map();
 
-  for (let i = 0; i < videos.length; i += BATCH_SIZE) {
-    const batch = videos.slice(i, i + BATCH_SIZE);
+  const unresolved = [];
+  for (const v of videos) {
+    const ruleResult = classifyByRuleScore({
+      title: v.title || '',
+      description: v.description || '',
+    });
+    if (!ruleResult.isAmbiguous) {
+      results.set(String(v._id), ruleResult.classification);
+    } else {
+      unresolved.push(v);
+    }
+  }
+
+  for (let i = 0; i < unresolved.length; i += BATCH_SIZE) {
+    const batch = unresolved.slice(i, i + BATCH_SIZE);
     const batchInput = batch.map((v) => ({
       id: String(v._id),
       title: (v.title || '').replace(/"/g, "'"),
