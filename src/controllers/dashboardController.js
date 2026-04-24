@@ -394,8 +394,8 @@ export async function getCategoryBreakdown(req, res, next) {
 
       const [startSnapshots, endSnapshots] = await Promise.all([
         ChannelSnapshot.aggregate([
-          { $match: { ...snapshotFilter, date: { $lte: startDateObj } } },
-          { $sort: { date: -1 } },
+          { $match: { ...snapshotFilter, date: { $gte: startDateObj, $lte: endDateObj } } },
+          { $sort: { date: 1 } },
           { $group: { _id: '$channelId', views: { $first: '$views' }, subscribers: { $first: '$subscribers' } } },
         ]),
         ChannelSnapshot.aggregate([
@@ -410,7 +410,14 @@ export async function getCategoryBreakdown(req, res, next) {
 
       const channelPeriodData = channels.map((c) => {
         const start = startMap.get(c._id.toString());
-        const end = endMap.get(c._id.toString());
+        const end = endMap.get(c._id.toString()) || start;
+        if (!start) {
+          return {
+            category: c.category || 'Uncategorized',
+            viewsInPeriod: 0,
+            subsInPeriod: 0,
+          };
+        }
         const startViews = start?.views ?? 0;
         const endViews = end?.views ?? 0;
         const startSubs = start?.subscribers ?? 0;
@@ -540,8 +547,8 @@ export async function getMicroUnitsReport(req, res, next) {
 
         const [startSnapshots, endSnapshots] = await Promise.all([
           ChannelSnapshot.aggregate([
-            { $match: { ...snapshotFilter, date: { $lte: startDateObj } } },
-            { $sort: { date: -1 } },
+            { $match: { ...snapshotFilter, date: { $gte: startDateObj, $lte: endDateObj } } },
+            { $sort: { date: 1 } },
             { $group: { _id: '$channelId', views: { $first: '$views' }, subscribers: { $first: '$subscribers' } } },
           ]),
           ChannelSnapshot.aggregate([
@@ -559,7 +566,8 @@ export async function getMicroUnitsReport(req, res, next) {
         for (const cid of channelIds) {
           const sid = cid.toString();
           const start = startMap.get(sid);
-          const end = endMap.get(sid);
+          const end = endMap.get(sid) || start;
+          if (!start) continue;
           const startViews = start?.views ?? 0;
           const endViews = end?.views ?? 0;
           const startSubs = start?.subscribers ?? 0;

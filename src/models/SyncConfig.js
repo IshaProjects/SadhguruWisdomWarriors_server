@@ -17,7 +17,7 @@ const syncConfigSchema = new mongoose.Schema(
     },
     dedicatedIngestSchedule: {
       type: String,
-      default: '0 */6 * * *', // every 6 hours — Dedicated last 24h ingest + auto-classify
+      default: '0 0 * * *', // daily midnight — Dedicated last 24h ingest + auto-classify
     },
     ihiIngestSchedule: {
       type: String,

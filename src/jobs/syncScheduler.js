@@ -20,7 +20,7 @@ export async function startSyncScheduler() {
   scheduleChannelSync(config.channelSyncSchedule, config.channelSyncEnabled);
   scheduleVideoSync(config.videoSyncSchedule, config.videoSyncEnabled);
   scheduleDedicatedIngest(
-    config.dedicatedIngestSchedule || '0 */6 * * *',
+    config.dedicatedIngestSchedule || '0 0 * * *',
     config.dedicatedIngestEnabled !== false
   );
   scheduleIhiIngest(

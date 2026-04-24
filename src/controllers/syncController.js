@@ -22,7 +22,7 @@ function normalizeConfigDoc(config) {
   return {
     ...o,
     dedicatedIngestSchedule:
-      o.dedicatedIngestSchedule || '0 */6 * * *',
+      o.dedicatedIngestSchedule || '0 0 * * *',
     ihiIngestSchedule:
       o.ihiIngestSchedule || '0 */6 * * *',
     ihiSadhguruStatsSchedule:

@@ -153,9 +153,10 @@ async function getClassificationCountsByChannel(channelIds, options = {}) {
 }
 
 /**
- * Sum per-video view deltas (latest snapshot on/before end minus latest on/before start)
- * for videos matching classification. Used when channel report classification filter is
- * sadhguru | non_sadhguru so "views in period" reflects that bucket only.
+ * Sum per-video view deltas using first snapshot within range as baseline
+ * and latest snapshot on/before end as closing point.
+ * Used when channel report classification filter is sadhguru | non_sadhguru
+ * so "views in period" reflects only in-range growth.
  */
 async function getClassificationPeriodViewsByChannel(channelIds, startDateObj, endDateObj, classificationKey) {
   if (!channelIds?.length) return new Map();
@@ -165,8 +166,21 @@ async function getClassificationPeriodViewsByChannel(channelIds, startDateObj, e
 
   const base = { channelId: { $in: channelIds }, deletedAt: null };
 
-  const snapStages = (boundary) => [
-    { $match: { ...base, date: { $lte: boundary } } },
+  const startStages = [
+    { $match: { ...base, date: { $gte: startDateObj, $lte: endDateObj } } },
+    { $sort: { date: 1 } },
+    {
+      $group: {
+        _id: '$videoId',
+        views: { $first: '$views' },
+      },
+    },
+    { $lookup: { from: 'videos', localField: '_id', foreignField: '_id', as: 'video' } },
+    { $unwind: '$video' },
+    { $match: { 'video.deletedAt': null, ...videoClsMatch } },
+  ];
+  const endStages = [
+    { $match: { ...base, date: { $lte: endDateObj } } },
     { $sort: { date: -1 } },
     {
       $group: {
@@ -181,16 +195,17 @@ async function getClassificationPeriodViewsByChannel(channelIds, startDateObj, e
   ];
 
   const [startSnaps, endSnaps] = await Promise.all([
-    VideoSnapshot.aggregate(snapStages(startDateObj)),
-    VideoSnapshot.aggregate(snapStages(endDateObj)),
+    VideoSnapshot.aggregate(startStages),
+    VideoSnapshot.aggregate(endStages),
   ]);
 
   const startByVideo = new Map(startSnaps.map((s) => [s._id.toString(), s.views ?? 0]));
   const totals = new Map();
   for (const e of endSnaps) {
     const vid = e._id.toString();
+    if (!startByVideo.has(vid)) continue;
     const cid = e.channelId.toString();
-    const startV = startByVideo.get(vid) ?? 0;
+    const startV = startByVideo.get(vid);
     const delta = Math.max(0, (e.views ?? 0) - startV);
     totals.set(cid, (totals.get(cid) ?? 0) + delta);
   }
@@ -218,6 +233,7 @@ function mapChannel(c, periodMetrics = null, classificationCounts = null) {
     avg_views_per_video: avgViewsPerVideo,
     assigned_to:         c.assignedTo?.name || '',
     notes:               c.notes || '',
+    added_on:            c.createdAt ? utcDateString(c.createdAt) : '',
     last_synced:         c.lastSyncedAt ? utcDateString(c.lastSyncedAt) : '',
   };
   if (periodMetrics) {
@@ -415,8 +431,8 @@ export async function reportChannels(req, res, next) {
 
       const [startSnapshots, endSnapshots] = await Promise.all([
         ChannelSnapshot.aggregate([
-          { $match: { ...snapshotFilter, date: { $lte: startDateObj } } },
-          { $sort: { date: -1 } },
+          { $match: { ...snapshotFilter, date: { $gte: startDateObj, $lte: endDateObj } } },
+          { $sort: { date: 1 } },
           {
             $group: {
               _id: '$channelId',
@@ -458,7 +474,14 @@ export async function reportChannels(req, res, next) {
 
       rows = channels.map((c) => {
         const start = startMap.get(c._id.toString());
-        const end   = endMap.get(c._id.toString());
+        const end   = endMap.get(c._id.toString()) || start;
+        if (!start) {
+          return mapChannel(c, {
+            viewsInPeriod: 0,
+            subscribersInPeriod: 0,
+            videosInPeriod: 0,
+          }, classMap.get(c._id.toString()));
+        }
         const startViews = start?.views ?? 0;
         const endViews   = end?.views   ?? 0;
         const startSubs  = start?.subscribers ?? 0;
