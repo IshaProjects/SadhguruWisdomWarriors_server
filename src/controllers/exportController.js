@@ -153,60 +153,90 @@ async function getClassificationCountsByChannel(channelIds, options = {}) {
 }
 
 /**
- * Sum per-video view deltas using first snapshot within range as baseline
- * and latest snapshot on/before end as closing point.
- * Used when channel report classification filter is sadhguru | non_sadhguru
- * so "views in period" reflects only in-range growth.
+ * Per-video view growth in [startDateObj, endDateObj], summed per channel.
+ * Opening = latest snapshot with date &lt; start (state just before the period),
+ * else first snapshot in-range (video had no history before this window).
+ * Closing = latest snapshot with date &lt;= end.
+ * classificationKey: null = all videos; otherwise 'sadhguru' | 'non_sadhguru'.
+ * This avoids the old bug where only snapshots *inside* the range were used as
+ * baseline (most view growth was dropped). “All” uses the same logic as filtered
+ * modes so numbers are comparable.
  */
-async function getClassificationPeriodViewsByChannel(channelIds, startDateObj, endDateObj, classificationKey) {
+async function getVideoSnapshotPeriodViewsByChannel(channelIds, startDateObj, endDateObj, classificationKey) {
   if (!channelIds?.length) return new Map();
-  const clsMongo =
-    classificationKey === 'sadhguru' ? 'sadhguru' : 'non sadhguru';
-  const videoClsMatch = { 'video.classification': clsMongo };
-
   const base = { channelId: { $in: channelIds }, deletedAt: null };
 
-  const startStages = [
-    { $match: { ...base, date: { $gte: startDateObj, $lte: endDateObj } } },
-    { $sort: { date: 1 } },
-    {
-      $group: {
-        _id: '$videoId',
-        views: { $first: '$views' },
+  const [beforeStart, firstInRange, atEnd] = await Promise.all([
+    VideoSnapshot.aggregate([
+      { $match: { ...base, date: { $lt: startDateObj } } },
+      { $sort: { date: -1 } },
+      {
+        $group: {
+          _id: '$videoId',
+          views: { $first: '$views' },
+          channelId: { $first: '$channelId' },
+        },
       },
-    },
-    { $lookup: { from: 'videos', localField: '_id', foreignField: '_id', as: 'video' } },
-    { $unwind: '$video' },
-    { $match: { 'video.deletedAt': null, ...videoClsMatch } },
-  ];
-  const endStages = [
-    { $match: { ...base, date: { $lte: endDateObj } } },
-    { $sort: { date: -1 } },
-    {
-      $group: {
-        _id: '$videoId',
-        views: { $first: '$views' },
-        channelId: { $first: '$channelId' },
+    ]),
+    VideoSnapshot.aggregate([
+      { $match: { ...base, date: { $gte: startDateObj, $lte: endDateObj } } },
+      { $sort: { date: 1 } },
+      {
+        $group: {
+          _id: '$videoId',
+          views: { $first: '$views' },
+          channelId: { $first: '$channelId' },
+        },
       },
-    },
-    { $lookup: { from: 'videos', localField: '_id', foreignField: '_id', as: 'video' } },
-    { $unwind: '$video' },
-    { $match: { 'video.deletedAt': null, ...videoClsMatch } },
-  ];
-
-  const [startSnaps, endSnaps] = await Promise.all([
-    VideoSnapshot.aggregate(startStages),
-    VideoSnapshot.aggregate(endStages),
+    ]),
+    VideoSnapshot.aggregate([
+      { $match: { ...base, date: { $lte: endDateObj } } },
+      { $sort: { date: -1 } },
+      {
+        $group: {
+          _id: '$videoId',
+          views: { $first: '$views' },
+          channelId: { $first: '$channelId' },
+        },
+      },
+    ]),
   ]);
 
-  const startByVideo = new Map(startSnaps.map((s) => [s._id.toString(), s.views ?? 0]));
+  const beforeMap = new Map(beforeStart.map((s) => [s._id.toString(), s]));
+  const firstMap = new Map(firstInRange.map((s) => [s._id.toString(), s]));
+
+  const vidSet = new Set(atEnd.map((e) => e._id.toString()));
+  const videoDocs = vidSet.size
+    ? await Video.find({ _id: { $in: [...vidSet] }, deletedAt: null }).select('classification').lean()
+    : [];
+  const clsByVid = new Map(videoDocs.map((v) => [v._id.toString(), v.classification]));
+
+  const matchesClassification = (vidStr) => {
+    if (!classificationKey) return true;
+    const c = clsByVid.get(vidStr);
+    if (classificationKey === 'sadhguru') return c === 'sadhguru';
+    if (classificationKey === 'non_sadhguru') return c === 'non sadhguru';
+    return true;
+  };
+
   const totals = new Map();
-  for (const e of endSnaps) {
+  for (const e of atEnd) {
     const vid = e._id.toString();
-    if (!startByVideo.has(vid)) continue;
+    if (!matchesClassification(vid)) continue;
+
+    const opening =
+      beforeMap.has(vid)
+        ? (beforeMap.get(vid).views ?? 0)
+        : firstMap.has(vid)
+          ? (firstMap.get(vid).views ?? 0)
+          : null;
+
+    // No usable baseline (should be rare): skip rather than inflate.
+    if (opening === null) continue;
+
+    const close = e.views ?? 0;
+    const delta = Math.max(0, close - opening);
     const cid = e.channelId.toString();
-    const startV = startByVideo.get(vid);
-    const delta = Math.max(0, (e.views ?? 0) - startV);
     totals.set(cid, (totals.get(cid) ?? 0) + delta);
   }
   return totals;
@@ -462,15 +492,16 @@ export async function reportChannels(req, res, next) {
       const classMap = await getClassificationCountsByChannel(channelIds, { startDate, endDate });
 
       const clsParam = req.query.classification;
-      let periodViewsByChannel = null;
-      if (clsParam === 'sadhguru' || clsParam === 'non_sadhguru') {
-        periodViewsByChannel = await getClassificationPeriodViewsByChannel(
-          channelIds,
-          startDateObj,
-          endDateObj,
-          clsParam
-        );
-      }
+      let classificationKey = null;
+      if (clsParam === 'sadhguru') classificationKey = 'sadhguru';
+      else if (clsParam === 'non_sadhguru') classificationKey = 'non_sadhguru';
+
+      const periodViewsByChannel = await getVideoSnapshotPeriodViewsByChannel(
+        channelIds,
+        startDateObj,
+        endDateObj,
+        classificationKey
+      );
 
       rows = channels.map((c) => {
         const start = startMap.get(c._id.toString());
@@ -482,20 +513,14 @@ export async function reportChannels(req, res, next) {
             videosInPeriod: 0,
           }, classMap.get(c._id.toString()));
         }
-        const startViews = start?.views ?? 0;
-        const endViews   = end?.views   ?? 0;
-        const startSubs  = start?.subscribers ?? 0;
-        const endSubs    = end?.subscribers   ?? 0;
+        const endSubs     = end?.subscribers   ?? 0;
+        const startSubs   = start?.subscribers ?? 0;
         const startVideos = start?.videoCount ?? 0;
         const endVideos   = end?.videoCount ?? 0;
-        const channelViewsInPeriod = Math.max(0, endViews - startViews);
         const periodMetrics = {
-          viewsInPeriod:
-            periodViewsByChannel != null
-              ? (periodViewsByChannel.get(c._id.toString()) ?? 0)
-              : channelViewsInPeriod,
+          viewsInPeriod:      periodViewsByChannel.get(c._id.toString()) ?? 0,
           subscribersInPeriod: endSubs - startSubs,
-          videosInPeriod:      endVideos - startVideos,
+          videosInPeriod:     endVideos - startVideos,
         };
         return mapChannel(c, periodMetrics, classMap.get(c._id.toString()));
       });
