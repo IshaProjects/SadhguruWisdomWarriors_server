@@ -379,6 +379,68 @@ export async function bulkDeleteChannels(req, res, next) {
   }
 }
 
+/**
+ * POST /api/channels/reclassify-bulk
+ * Force re-classify ALL videos for selected channels (clears existing classification first).
+ * Dedicated channels: mark all as sadhguru. IHI/other: use AI.
+ */
+export async function bulkReclassifyChannelVideos(req, res, next) {
+  try {
+    const { ids } = req.body;
+    if (!Array.isArray(ids) || ids.length === 0) {
+      return res.status(400).json({ message: 'ids array is required' });
+    }
+
+    const channels = await Channel.find({
+      _id: { $in: ids },
+      status: { $ne: 'archived' },
+    }).sort({ title: 1 });
+
+    let channelsProcessed = 0;
+    let totalVideos = 0;
+    let totalNewlyClassified = 0;
+    let totalSadguru = 0;
+    let totalNonSadguru = 0;
+    let totalFailed = 0;
+    const errors = [];
+
+    for (const channel of channels) {
+      try {
+        await Video.updateMany(
+          { channelId: channel._id, deletedAt: null },
+          { $set: { classification: '' } }
+        );
+
+        const result = await classifyVideosForChannel(channel);
+        channelsProcessed++;
+        totalVideos += result.totalVideos;
+        totalNewlyClassified += result.newlyClassified;
+        totalSadguru += result.sadhguruCount;
+        totalNonSadguru += result.nonSadguruCount;
+        totalFailed += result.failed;
+      } catch (err) {
+        errors.push({ channelId: channel._id, title: channel.title, message: err.message });
+      }
+    }
+
+    res.json({
+      channelsRequested: ids.length,
+      channelsProcessed,
+      totalVideos,
+      totalNewlyClassified,
+      totalSadguru,
+      totalNonSadguru,
+      totalFailed,
+      errors: errors.length > 0 ? errors : undefined,
+    });
+  } catch (err) {
+    if (err.message?.includes('GEMINI_API_KEY') || err.message?.includes('GOOGLE_CLOUD_PROJECT')) {
+      return res.status(503).json({ message: 'AI not configured. Set GEMINI_API_KEY (from aistudio.google.com) or GOOGLE_CLOUD_PROJECT for Vertex AI.' });
+    }
+    next(err);
+  }
+}
+
 export async function syncSingleChannel(req, res, next) {
   try {
     const channel = await Channel.findById(req.params.id);

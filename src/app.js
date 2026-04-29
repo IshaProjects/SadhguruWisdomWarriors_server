@@ -42,10 +42,9 @@ const limiter = rateLimit({
     res.status(options.statusCode).json(body);
   },
 });
-app.use('/api/', limiter);
 
 // Routes
-app.use('/api/auth', authRoutes);
+app.use('/api/auth', limiter, authRoutes);
 app.use('/api/channels', channelRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/sync', syncRoutes);

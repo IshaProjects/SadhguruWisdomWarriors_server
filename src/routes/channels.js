@@ -8,6 +8,7 @@ import {
   updateChannel,
   deleteChannel,
   bulkDeleteChannels,
+  bulkReclassifyChannelVideos,
   syncSingleChannel,
   syncAllChannels,
   pullAllChannelsVideosHandler,
@@ -28,6 +29,7 @@ router.get('/', listChannels);
 router.post('/', authorize('admin', 'manager'), addChannel);
 router.post('/bulk', authorize('admin', 'manager'), upload.single('file'), bulkImport);
 router.delete('/bulk', authorize('admin'), bulkDeleteChannels);
+router.post('/reclassify-bulk', authorize('admin'), bulkReclassifyChannelVideos);
 router.post('/sync-all', authorize('admin', 'manager'), syncAllChannels);
 router.post('/pull-all-videos', authorize('admin', 'manager'), pullAllChannelsVideosHandler);
 router.post('/classify-all', authorize('admin', 'manager'), classifyAllChannelsVideos);
