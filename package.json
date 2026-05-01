@@ -7,7 +7,8 @@
     "start": "node src/app.js",
     "test:classify": "node scripts/test-classification.js",
     "mongo:local": "bash scripts/setup-local-mongodb.sh",
-    "migrate:snapshots:utc": "node scripts/migrate-snapshot-dates-to-utc.js"
+    "migrate:snapshots:utc": "node scripts/migrate-snapshot-dates-to-utc.js",
+    "reclassify:all-videos": "node scripts/reclassify-all-videos-by-channel.js"
   },
   "dependencies": {
     "@google-cloud/vertexai": "^1.10.0",
