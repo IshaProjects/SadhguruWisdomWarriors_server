@@ -152,6 +152,29 @@ async function getClassificationCountsByChannel(channelIds, options = {}) {
   return map;
 }
 
+async function getPublishedVideoCountsByChannel(channelIds, options = {}) {
+  if (!channelIds?.length) return new Map();
+  const { startDate, endDate } = options;
+  const match = { channelId: { $in: channelIds }, deletedAt: null };
+  if (startDate && endDate) {
+    match.publishedAt = {
+      $gte: parseYmdToUtcStart(startDate),
+      $lte: parseYmdToUtcEnd(endDate),
+    };
+  }
+
+  const agg = await Video.aggregate([
+    { $match: match },
+    { $group: { _id: '$channelId', count: { $sum: 1 } } },
+  ]);
+
+  const map = new Map();
+  for (const row of agg) {
+    map.set(row._id.toString(), row.count);
+  }
+  return map;
+}
+
 /**
  * Per-video view growth in [startDateObj, endDateObj], summed per channel.
  * Opening = latest snapshot with date &lt; start (state just before the period),
@@ -490,6 +513,7 @@ export async function reportChannels(req, res, next) {
       const endMap   = new Map(endSnapshots.map((s) => [s._id.toString(), s]));
 
       const classMap = await getClassificationCountsByChannel(channelIds, { startDate, endDate });
+      const publishedVideoCountMap = await getPublishedVideoCountsByChannel(channelIds, { startDate, endDate });
 
       const clsParam = req.query.classification;
       let classificationKey = null;
@@ -515,12 +539,10 @@ export async function reportChannels(req, res, next) {
         }
         const endSubs     = end?.subscribers   ?? 0;
         const startSubs   = start?.subscribers ?? 0;
-        const startVideos = start?.videoCount ?? 0;
-        const endVideos   = end?.videoCount ?? 0;
         const periodMetrics = {
           viewsInPeriod:      periodViewsByChannel.get(c._id.toString()) ?? 0,
           subscribersInPeriod: endSubs - startSubs,
-          videosInPeriod:     endVideos - startVideos,
+          videosInPeriod:     publishedVideoCountMap.get(c._id.toString()) ?? 0,
         };
         return mapChannel(c, periodMetrics, classMap.get(c._id.toString()));
       });
