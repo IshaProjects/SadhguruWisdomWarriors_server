@@ -108,12 +108,27 @@ const normalizeForKeywordMatch = (s) =>
 
 const normalizedKeywords = SADHGURU_KEYWORDS.map(normalizeForKeywordMatch);
 
+/**
+ * Alphanumeric “words” from title + description (lowercase). Keywords match only as whole tokens —
+ * no substring matches (e.g. "isha" does not match inside "divisha"; "meditation" does not match inside "premeditation").
+ * Compound list entries like "innerengineering" match only if they appear as one token (e.g. hashtag).
+ */
+function tokenSetForKeywordMatch(title, description) {
+  const raw = `${title || ''} ${description || ''}`.toLowerCase();
+  const tokens = new Set();
+  for (const m of raw.matchAll(/[a-z0-9]+/g)) {
+    if (m[0]) tokens.add(m[0]);
+  }
+  return tokens;
+}
+
 function getKeywordHits({ title, description }) {
-  const combined = normalizeForKeywordMatch(`${title || ''} ${description || ''}`);
+  const tokenSet = tokenSetForKeywordMatch(title, description);
   const hits = [];
   for (let i = 0; i < normalizedKeywords.length; i++) {
     const kw = normalizedKeywords[i];
-    if (kw && combined.includes(kw)) hits.push(SADHGURU_KEYWORDS[i]);
+    if (!kw) continue;
+    if (tokenSet.has(kw)) hits.push(SADHGURU_KEYWORDS[i]);
   }
   // Keep the prompt shorter by de-duping while preserving first-seen order.
   return [...new Set(hits)];
