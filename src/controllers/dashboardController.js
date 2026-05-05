@@ -10,6 +10,7 @@ import {
   utcEndOfDay,
   utcStartOfDay,
 } from '../utils/dateUtc.js';
+import { aggregateChannelOpeningAndClosingMaps } from '../utils/channelSnapshotPeriod.js';
 
 /**
  * Returns { start, end } for filtering. Uses startDate/endDate query params if both
@@ -390,42 +391,31 @@ export async function getCategoryBreakdown(req, res, next) {
     if (isPeriodMode) {
       const startDateObj = parseYmdToUtcStart(startDate);
       const endDateObj = parseYmdToUtcEnd(endDate);
-      const snapshotFilter = { channelId: { $in: channelIds }, deletedAt: null };
+      let classificationKey = null;
+      if (classification === 'sadhguru') classificationKey = 'sadhguru';
+      else if (classification === 'non_sadhguru') classificationKey = 'non_sadhguru';
 
-      const [startSnapshots, endSnapshots] = await Promise.all([
-        ChannelSnapshot.aggregate([
-          { $match: { ...snapshotFilter, date: { $gte: startDateObj, $lte: endDateObj } } },
-          { $sort: { date: 1 } },
-          { $group: { _id: '$channelId', views: { $first: '$views' }, subscribers: { $first: '$subscribers' } } },
-        ]),
-        ChannelSnapshot.aggregate([
-          { $match: { ...snapshotFilter, date: { $lte: endDateObj } } },
-          { $sort: { date: -1 } },
-          { $group: { _id: '$channelId', views: { $first: '$views' }, subscribers: { $first: '$subscribers' } } },
-        ]),
-      ]);
-
-      const startMap = new Map(startSnapshots.map((s) => [s._id.toString(), s]));
-      const endMap = new Map(endSnapshots.map((s) => [s._id.toString(), s]));
+      const { openingMap, closingMap } = await aggregateChannelOpeningAndClosingMaps(
+        channelIds,
+        startDateObj,
+        endDateObj,
+      );
 
       const channelPeriodData = channels.map((c) => {
-        const start = startMap.get(c._id.toString());
-        const end = endMap.get(c._id.toString()) || start;
-        if (!start) {
+        const sid = c._id.toString();
+        const opening = openingMap.get(sid);
+        const closing = closingMap.get(sid) || opening;
+        if (!closing || !opening) {
           return {
             category: c.category || 'Uncategorized',
             viewsInPeriod: 0,
             subsInPeriod: 0,
           };
         }
-        const startViews = start?.views ?? 0;
-        const endViews = end?.views ?? 0;
-        const startSubs = start?.subscribers ?? 0;
-        const endSubs = end?.subscribers ?? 0;
         return {
           category: c.category || 'Uncategorized',
-          viewsInPeriod: Math.max(0, endViews - startViews),
-          subsInPeriod: endSubs - startSubs,
+          viewsInPeriod: Math.max(0, (closing.views ?? 0) - (opening.views ?? 0)),
+          subsInPeriod: (closing.subscribers ?? 0) - (opening.subscribers ?? 0),
         };
       });
 
@@ -543,37 +533,22 @@ export async function getMicroUnitsReport(req, res, next) {
       if (isPeriodMode) {
         const startDateObj = parseYmdToUtcStart(startDate);
         const endDateObj = parseYmdToUtcEnd(endDate);
-        const snapshotFilter = { channelId: { $in: channelIds }, deletedAt: null };
 
-        const [startSnapshots, endSnapshots] = await Promise.all([
-          ChannelSnapshot.aggregate([
-            { $match: { ...snapshotFilter, date: { $gte: startDateObj, $lte: endDateObj } } },
-            { $sort: { date: 1 } },
-            { $group: { _id: '$channelId', views: { $first: '$views' }, subscribers: { $first: '$subscribers' } } },
-          ]),
-          ChannelSnapshot.aggregate([
-            { $match: { ...snapshotFilter, date: { $lte: endDateObj } } },
-            { $sort: { date: -1 } },
-            { $group: { _id: '$channelId', views: { $first: '$views' }, subscribers: { $first: '$subscribers' } } },
-          ]),
-        ]);
-
-        const startMap = new Map(startSnapshots.map((s) => [s._id.toString(), s]));
-        const endMap = new Map(endSnapshots.map((s) => [s._id.toString(), s]));
+        const { openingMap, closingMap } = await aggregateChannelOpeningAndClosingMaps(
+          channelIds,
+          startDateObj,
+          endDateObj,
+        );
 
         let totalViews = 0;
         let totalSubs = 0;
         for (const cid of channelIds) {
           const sid = cid.toString();
-          const start = startMap.get(sid);
-          const end = endMap.get(sid) || start;
-          if (!start) continue;
-          const startViews = start?.views ?? 0;
-          const endViews = end?.views ?? 0;
-          const startSubs = start?.subscribers ?? 0;
-          const endSubs = end?.subscribers ?? 0;
-          totalViews += Math.max(0, endViews - startViews);
-          totalSubs += endSubs - startSubs;
+          const opening = openingMap.get(sid);
+          const closing = closingMap.get(sid) || opening;
+          if (!closing || !opening) continue;
+          totalViews += Math.max(0, (closing.views ?? 0) - (opening.views ?? 0));
+          totalSubs += (closing.subscribers ?? 0) - (opening.subscribers ?? 0);
         }
 
         const videoMatch = {
