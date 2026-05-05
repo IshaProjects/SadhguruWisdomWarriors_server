@@ -6,7 +6,7 @@ import mongoose from 'mongoose';
 import { fetchSingleChannel, resolveChannelByHandle, fetchChannelByHandle } from '../services/youtubeApi.js';
 import { syncChannels, pullAllChannelVideos, pullAllChannelsVideos } from '../services/syncEngine.js';
 import { classifySadguruVideoBatch } from '../services/vertexAiService.js';
-import { extractChannelId } from '../utils/helpers.js';
+import { extractChannelId, parseYoutubeStatInt } from '../utils/helpers.js';
 import { softDeleteChannels } from '../utils/softDelete.js';
 import { parse } from 'csv-parse/sync';
 import { utcStartOfDay } from '../utils/dateUtc.js';
@@ -144,9 +144,9 @@ export async function addChannel(req, res, next) {
       notes: notes || '',
       assignedTo: assignedTo || null,
       currentStats: {
-        subscribers: parseInt(ytData.statistics.subscriberCount) || 0,
-        views: parseInt(ytData.statistics.viewCount) || 0,
-        videoCount: parseInt(ytData.statistics.videoCount) || 0,
+        subscribers: parseYoutubeStatInt(ytData.statistics.subscriberCount),
+        views: parseYoutubeStatInt(ytData.statistics.viewCount),
+        videoCount: parseYoutubeStatInt(ytData.statistics.videoCount),
       },
       lastSyncedAt: new Date(),
     });
@@ -258,9 +258,9 @@ export async function bulkImport(req, res, next) {
           tags,
           notes:            record.notes || '',
           currentStats: {
-            subscribers: parseInt(ytData.statistics?.subscriberCount) || 0,
-            views:       parseInt(ytData.statistics?.viewCount)       || 0,
-            videoCount:  parseInt(ytData.statistics?.videoCount)      || 0,
+            subscribers: parseYoutubeStatInt(ytData.statistics?.subscriberCount),
+            views:       parseYoutubeStatInt(ytData.statistics?.viewCount),
+            videoCount:  parseYoutubeStatInt(ytData.statistics?.videoCount),
           },
           lastSyncedAt: new Date(),
         });

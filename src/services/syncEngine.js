@@ -16,6 +16,7 @@ import { classifySadguruVideoBatch } from './vertexAiService.js';
 import { isDedicatedChannel, isIhiChannel } from '../utils/channelGroup.js';
 import { logger } from '../utils/logger.js';
 import { utcStartOfDay } from '../utils/dateUtc.js';
+import { parseYoutubeStatInt } from '../utils/helpers.js';
 
 let isChannelSyncing = false;
 let isVideoSyncing = false;
@@ -97,9 +98,9 @@ export async function syncChannelStats(channelIds = null, type = 'manual') {
           ytChannel.contentDetails?.relatedPlaylists?.uploads || '';
 
         channel.currentStats = {
-          subscribers: parseInt(stats.subscriberCount) || 0,
-          views:       parseInt(stats.viewCount)       || 0,
-          videoCount:  parseInt(stats.videoCount)      || 0,
+          subscribers: parseYoutubeStatInt(stats.subscriberCount),
+          views:       parseYoutubeStatInt(stats.viewCount),
+          videoCount:  parseYoutubeStatInt(stats.videoCount),
         };
         channel.lastSyncedAt = new Date();
         if (channel.allVideosPulled) {

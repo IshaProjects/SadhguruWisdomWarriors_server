@@ -68,3 +68,10 @@ export function calculateEngagementRate(views, likes, comments) {
 export function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+/** YouTube statistics fields are strings; strip commas so parseInt is not truncated at ",". */
+export function parseYoutubeStatInt(value) {
+  if (value == null || value === '') return 0;
+  const n = parseInt(String(value).replace(/,/g, ''), 10);
+  return Number.isFinite(n) ? n : 0;
+}
