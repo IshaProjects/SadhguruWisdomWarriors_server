@@ -11,6 +11,7 @@ import {
   utcStartOfDay,
 } from '../utils/dateUtc.js';
 import { aggregateChannelOpeningAndClosingMaps } from '../utils/channelSnapshotPeriod.js';
+import { getVideoSnapshotPeriodViewsByChannel } from '../utils/videoSnapshotPeriodViews.js';
 
 /**
  * Returns { start, end } for filtering. Uses startDate/endDate query params if both
@@ -395,11 +396,10 @@ export async function getCategoryBreakdown(req, res, next) {
       if (classification === 'sadhguru') classificationKey = 'sadhguru';
       else if (classification === 'non_sadhguru') classificationKey = 'non_sadhguru';
 
-      const { openingMap, closingMap } = await aggregateChannelOpeningAndClosingMaps(
-        channelIds,
-        startDateObj,
-        endDateObj,
-      );
+      const [{ openingMap, closingMap }, periodViewsByChannel] = await Promise.all([
+        aggregateChannelOpeningAndClosingMaps(channelIds, startDateObj, endDateObj),
+        getVideoSnapshotPeriodViewsByChannel(channelIds, startDateObj, endDateObj, classificationKey),
+      ]);
 
       const channelPeriodData = channels.map((c) => {
         const sid = c._id.toString();
@@ -414,7 +414,7 @@ export async function getCategoryBreakdown(req, res, next) {
         }
         return {
           category: c.category || 'Uncategorized',
-          viewsInPeriod: Math.max(0, (closing.views ?? 0) - (opening.views ?? 0)),
+          viewsInPeriod: periodViewsByChannel.get(sid) ?? 0,
           subsInPeriod: (closing.subscribers ?? 0) - (opening.subscribers ?? 0),
         };
       });
@@ -533,12 +533,14 @@ export async function getMicroUnitsReport(req, res, next) {
       if (isPeriodMode) {
         const startDateObj = parseYmdToUtcStart(startDate);
         const endDateObj = parseYmdToUtcEnd(endDate);
+        let classificationKey = null;
+        if (classification === 'sadhguru') classificationKey = 'sadhguru';
+        else if (classification === 'non_sadhguru') classificationKey = 'non_sadhguru';
 
-        const { openingMap, closingMap } = await aggregateChannelOpeningAndClosingMaps(
-          channelIds,
-          startDateObj,
-          endDateObj,
-        );
+        const [{ openingMap, closingMap }, periodViewsByChannel] = await Promise.all([
+          aggregateChannelOpeningAndClosingMaps(channelIds, startDateObj, endDateObj),
+          getVideoSnapshotPeriodViewsByChannel(channelIds, startDateObj, endDateObj, classificationKey),
+        ]);
 
         let totalViews = 0;
         let totalSubs = 0;
@@ -547,7 +549,7 @@ export async function getMicroUnitsReport(req, res, next) {
           const opening = openingMap.get(sid);
           const closing = closingMap.get(sid) || opening;
           if (!closing || !opening) continue;
-          totalViews += Math.max(0, (closing.views ?? 0) - (opening.views ?? 0));
+          totalViews += periodViewsByChannel.get(sid) ?? 0;
           totalSubs += (closing.subscribers ?? 0) - (opening.subscribers ?? 0);
         }
 
