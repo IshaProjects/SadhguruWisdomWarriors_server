@@ -8,6 +8,7 @@ import {
   getMicroUnitsReport,
   getPublishingFrequency,
   getChannelMetrics,
+  getGradeGrid,
   getLayout,
   saveLayout,
 } from '../controllers/dashboardController.js';
@@ -24,6 +25,7 @@ router.get('/categories', getCategoryBreakdown);
 router.get('/micro-units-report', getMicroUnitsReport);
 router.get('/publishing', getPublishingFrequency);
 router.get('/channel-metrics', getChannelMetrics);
+router.get('/grade-grid', getGradeGrid);
 router.get('/layout', getLayout);
 router.put('/layout', authorize('admin', 'manager'), saveLayout);
 

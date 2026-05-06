@@ -42,6 +42,15 @@ export async function getVideoSnapshotPeriodViewsByChannel(
   };
   if (videoIdFilter) match.videoId = { $in: videoIdFilter };
 
+  // Videos uploaded WITHIN the period get opening=0 instead of firstInRange,
+  // so views accrued between upload and the first daily snapshot are not lost.
+  const newInPeriodIds = await Video.distinct('_id', {
+    channelId: { $in: channelIds },
+    deletedAt: null,
+    publishedAt: { $gte: startDateObj, $lte: endDateObj },
+    ...(videoIdFilter ? { _id: { $in: videoIdFilter } } : {}),
+  });
+
   const result = await VideoSnapshot.aggregate([
     { $match: match },
     { $sort: { videoId: 1, date: 1 } },
@@ -71,33 +80,40 @@ export async function getVideoSnapshotPeriodViewsByChannel(
                 },
               },
               closing: { $arrayElemAt: ['$snapshots', -1] },
+              isNewInPeriod: { $in: ['$_id', newInPeriodIds] },
             },
             in: {
               $let: {
                 vars: {
-                  opening: {
+                  // openingViews: 0 if uploaded in-period (no prior history exists),
+                  //   else views from last pre-period snapshot,
+                  //   else (no pre-period snapshot at all) views from first in-period snapshot.
+                  openingViews: {
                     $cond: [
                       { $gt: [{ $size: '$$preStart' }, 0] },
-                      { $arrayElemAt: ['$$preStart', -1] },
-                      { $arrayElemAt: ['$$inRange', 0] },
+                      { $ifNull: [{ $getField: { field: 'views', input: { $arrayElemAt: ['$$preStart', -1] } } }, 0] },
+                      {
+                        $cond: [
+                          '$$isNewInPeriod',
+                          0,
+                          { $ifNull: [{ $getField: { field: 'views', input: { $arrayElemAt: ['$$inRange', 0] } } }, 0] },
+                        ],
+                      },
+                    ],
+                  },
+                  closingViews: { $ifNull: [{ $getField: { field: 'views', input: '$$closing' } }, 0] },
+                  hasObservation: {
+                    $or: [
+                      { $gt: [{ $size: '$$preStart' }, 0] },
+                      { $gt: [{ $size: '$$inRange' }, 0] },
                     ],
                   },
                 },
                 in: {
                   $cond: [
-                    { $eq: ['$$opening', null] },
+                    { $not: '$$hasObservation' },
                     0,
-                    {
-                      $max: [
-                        0,
-                        {
-                          $subtract: [
-                            { $ifNull: ['$$closing.views', 0] },
-                            { $ifNull: ['$$opening.views', 0] },
-                          ],
-                        },
-                      ],
-                    },
+                    { $max: [0, { $subtract: ['$$closingViews', '$$openingViews'] }] },
                   ],
                 },
               },

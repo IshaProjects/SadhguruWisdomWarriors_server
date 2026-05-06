@@ -735,6 +735,132 @@ export async function getPublishingFrequency(req, res, next) {
   }
 }
 
+/**
+ * GET /api/dashboard/grade-grid
+ * Returns counts and (optionally) views growth + top-10 channels per grade
+ * bucket (A, B, C, D, E, Inactive), scoped by group (ihi | dedicated | both).
+ *
+ * Query params:
+ *   group     '' | 'ihi' | 'dedicated'  — default '' = combine both
+ *   startDate YYYY-MM-DD                — both required for rows 2 & 3
+ *   endDate   YYYY-MM-DD
+ *
+ * Spec: docs/superpowers/specs/2026-05-06-grade-grid-dashboard-design.md
+ */
+export async function getGradeGrid(req, res, next) {
+  try {
+    const { group = '', startDate, endDate } = req.query;
+
+    // ---- 1. Resolve channel set scoped by group ----
+    const channelFilter = { status: { $ne: 'archived' } };
+    if (group === 'dedicated') {
+      channelFilter.category = { $regex: /^Dedicated/i };
+    } else if (group === 'ihi') {
+      // Mirrors the existing /^IHI/i style in dashboardController.js.
+      // Current data only has "IHI - …" and "Dedicated - …" categories, so
+      // /IHI/i never matches a Dedicated row. The JS-side `isIhi(cat)` below
+      // performs the formal "contains IHI AND not Dedicated" disambiguation
+      // when bucketing, so the Mongo filter doesn't need to.
+      channelFilter.category = { $regex: /IHI/i };
+    } else {
+      channelFilter.category = { $regex: /^(Dedicated|IHI)\s*-/i };
+    }
+
+    const channels = await Channel.find(channelFilter).select(
+      '_id title thumbnailUrl category'
+    );
+
+    // ---- 2. Bucket each channel by category suffix ----
+    const BUCKETS = ['A', 'B', 'C', 'D', 'E', 'Inactive'];
+    const bucketOf = (cat) => {
+      const c = (cat || '').trim();
+      const m = c.match(/Grade\s+([A-E])$/i);
+      if (m) return m[1].toUpperCase();
+      if (/Inactive$/i.test(c)) return 'Inactive';
+      return null;
+    };
+    const isIhi = (cat) => /IHI/i.test(cat) && !/^Dedicated/i.test(cat);
+
+    const channelsByBucket = Object.fromEntries(BUCKETS.map((b) => [b, []]));
+    for (const ch of channels) {
+      const b = bucketOf(ch.category);
+      if (b) channelsByBucket[b].push(ch);
+    }
+
+    // ---- 3. Row 1: counts ----
+    const row1 = Object.fromEntries(
+      BUCKETS.map((b) => [b, channelsByBucket[b].length]),
+    );
+
+    // ---- 4. Decide whether to compute rows 2 & 3 ----
+    const wantRange = !!(startDate && endDate);
+    let row2 = null;
+    let row3 = null;
+
+    if (wantRange) {
+      const start = parseYmdToUtcStart(startDate);
+      const end = parseYmdToUtcEnd(endDate);
+
+      if (start > end) {
+        // Invalid range: leave rows 2 & 3 as null (matches spec).
+        return res.json({ row1, row2, row3 });
+      }
+
+      // Split channel ids by source-of-views (IHI uses sadhguru videos,
+      // Dedicated uses channel snapshots). A channel is one or the other.
+      const ihiChannelIds = [];
+      const dedChannelIds = [];
+      for (const ch of channels) {
+        if (isIhi(ch.category)) ihiChannelIds.push(ch._id);
+        else dedChannelIds.push(ch._id);
+      }
+
+      const [openClose, ihiTotalsMap] = await Promise.all([
+        aggregateChannelOpeningAndClosingMaps(dedChannelIds, start, end),
+        getVideoSnapshotPeriodViewsByChannel(
+          ihiChannelIds,
+          start,
+          end,
+          'sadhguru',
+        ),
+      ]);
+
+      // Build a single Map<channelIdStr, viewsGrowth> covering both sources.
+      const growthByChannel = new Map();
+      for (const ch of channels) {
+        const idStr = ch._id.toString();
+        let g = 0;
+        if (isIhi(ch.category)) {
+          g = ihiTotalsMap.get(idStr) || 0;
+        } else {
+          const o = openClose.openingMap.get(idStr);
+          const c = openClose.closingMap.get(idStr);
+          if (o && c) g = (c.views || 0) - (o.views || 0);
+        }
+        growthByChannel.set(idStr, g);
+      }
+
+      row2 = {};
+      row3 = {};
+      for (const b of BUCKETS) {
+        const inBucket = channelsByBucket[b].map((ch) => ({
+          channelId: ch._id,
+          title: ch.title || 'Unknown',
+          thumbnailUrl: ch.thumbnailUrl || '',
+          viewsGrowth: growthByChannel.get(ch._id.toString()) || 0,
+        }));
+        inBucket.sort((a, b) => b.viewsGrowth - a.viewsGrowth);
+        row2[b] = inBucket.slice(0, 10);
+        row3[b] = inBucket.reduce((s, x) => s + x.viewsGrowth, 0);
+      }
+    }
+
+    res.json({ row1, row2, row3 });
+  } catch (err) {
+    next(err);
+  }
+}
+
 export async function getLayout(req, res, next) {
   try {
     const doc = await DashboardLayout.findOne();
