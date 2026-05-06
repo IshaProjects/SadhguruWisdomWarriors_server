@@ -117,15 +117,20 @@ export async function getSummary(req, res, next) {
       ]);
       prevSubscribers = oldChannelSnapshots.reduce((s, x) => s + (x.firstSubscribers || 0), 0);
 
-      const ihiPrevViewsAgg = await VideoSnapshot.aggregate([
-        { $match: { channelId: { $in: channelIds }, date: { $gte: start, $lte: end } } },
-        { $lookup: { from: 'videos', localField: 'videoId', foreignField: '_id', as: 'video' } },
-        { $unwind: '$video' },
-        { $match: { 'video.classification': 'sadhguru' } },
-        { $sort: { date: 1 } },
-        { $group: { _id: '$videoId', firstViews: { $first: '$views' } } },
-        { $group: { _id: null, total: { $sum: '$firstViews' } } },
-      ]);
+      const sadhguruVideoIds = await Video.distinct('_id', {
+        channelId: { $in: channelIds },
+        classification: 'sadhguru',
+        deletedAt: null,
+      });
+      const ihiPrevViewsAgg = await VideoSnapshot.aggregate(
+        [
+          { $match: { videoId: { $in: sadhguruVideoIds }, date: { $gte: start, $lte: end } } },
+          { $sort: { videoId: 1, date: 1 } },
+          { $group: { _id: '$videoId', firstViews: { $first: '$views' } } },
+          { $group: { _id: null, total: { $sum: '$firstViews' } } },
+        ],
+        { allowDiskUse: true }
+      );
       prevViews = ihiPrevViewsAgg[0]?.total ?? 0;
     } else {
       const oldSnapshots = await ChannelSnapshot.aggregate([
@@ -209,19 +214,24 @@ export async function getGrowthData(req, res, next) {
     let snapshots;
     if (group === 'ihi') {
       // IHI: views = sum of VideoSnapshot.views for sadhguru videos per day
-      const ihiSnapshots = await VideoSnapshot.aggregate([
-        { $match: { channelId: { $in: channelIds }, date: { $gte: start, $lte: end } } },
-        { $lookup: { from: 'videos', localField: 'videoId', foreignField: '_id', as: 'video' } },
-        { $unwind: '$video' },
-        { $match: { 'video.classification': 'sadhguru' } },
-        {
-          $group: {
-            _id: { $dateToString: { format: '%Y-%m-%d', date: '$date' } },
-            totalViews: { $sum: '$views' },
+      const sadhguruVideoIds = await Video.distinct('_id', {
+        channelId: { $in: channelIds },
+        classification: 'sadhguru',
+        deletedAt: null,
+      });
+      const ihiSnapshots = await VideoSnapshot.aggregate(
+        [
+          { $match: { videoId: { $in: sadhguruVideoIds }, date: { $gte: start, $lte: end } } },
+          {
+            $group: {
+              _id: { $dateToString: { format: '%Y-%m-%d', date: '$date' } },
+              totalViews: { $sum: '$views' },
+            },
           },
-        },
-        { $sort: { _id: 1 } },
-      ]);
+          { $sort: { _id: 1 } },
+        ],
+        { allowDiskUse: true }
+      );
       const channelSnapshots = await ChannelSnapshot.aggregate([
         { $match: { channelId: { $in: channelIds }, date: { $gte: start, $lte: end } } },
         {
