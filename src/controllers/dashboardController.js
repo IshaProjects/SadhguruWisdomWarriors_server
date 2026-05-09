@@ -806,8 +806,8 @@ export async function getGradeGrid(req, res, next) {
         return res.json({ row1, row2, row3 });
       }
 
-      // Split channel ids by source-of-views (IHI uses sadhguru videos,
-      // Dedicated uses channel snapshots). A channel is one or the other.
+      // Split channel ids so IHI gets a sadhguru-only video filter and
+      // Dedicated counts every video on the channel.
       const ihiChannelIds = [];
       const dedChannelIds = [];
       for (const ch of channels) {
@@ -815,28 +815,22 @@ export async function getGradeGrid(req, res, next) {
         else dedChannelIds.push(ch._id);
       }
 
-      const [openClose, ihiTotalsMap] = await Promise.all([
-        aggregateChannelOpeningAndClosingMaps(dedChannelIds, start, end),
-        getVideoSnapshotPeriodViewsByChannel(
-          ihiChannelIds,
-          start,
-          end,
-          'sadhguru',
-        ),
+      // Both Dedicated and IHI now use VideoSnapshot deltas so this matches
+      // the Channel Report and Category Report. IHI is still narrowed to
+      // sadhguru-classified videos (per the IHI definition); Dedicated counts
+      // all videos (channel-wide) since dedicated channels classify every
+      // video as sadhguru anyway.
+      const [dedTotalsMap, ihiTotalsMap] = await Promise.all([
+        getVideoSnapshotPeriodViewsByChannel(dedChannelIds, start, end, null),
+        getVideoSnapshotPeriodViewsByChannel(ihiChannelIds, start, end, 'sadhguru'),
       ]);
 
-      // Build a single Map<channelIdStr, viewsGrowth> covering both sources.
       const growthByChannel = new Map();
       for (const ch of channels) {
         const idStr = ch._id.toString();
-        let g = 0;
-        if (isIhi(ch.category)) {
-          g = ihiTotalsMap.get(idStr) || 0;
-        } else {
-          const o = openClose.openingMap.get(idStr);
-          const c = openClose.closingMap.get(idStr);
-          if (o && c) g = (c.views || 0) - (o.views || 0);
-        }
+        const g = isIhi(ch.category)
+          ? ihiTotalsMap.get(idStr) || 0
+          : dedTotalsMap.get(idStr) || 0;
         growthByChannel.set(idStr, g);
       }
 
