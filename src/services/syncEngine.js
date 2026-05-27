@@ -3,6 +3,7 @@ import ChannelSnapshot from '../models/ChannelSnapshot.js';
 import Video from '../models/Video.js';
 import VideoSnapshot from '../models/VideoSnapshot.js';
 import SyncLog from '../models/SyncLog.js';
+import SyncConfig from '../models/SyncConfig.js';
 import {
   fetchChannelsBatch,
   fetchPlaylistItems,
@@ -130,6 +131,14 @@ export async function syncChannelStats(channelIds = null, type = 'manual') {
       }
     }
 
+    // Recompute Active/Inactive: auto-archive dormant channels and reactivate
+    // those that have posted again. Isolated so a failure can't fail the sync.
+    try {
+      await updateChannelActivityStatuses(type);
+    } catch (err) {
+      logger.error(`[Channel Sync] Activity-status update failed: ${err.message}`);
+    }
+
     syncLog.quotaUsed    = quotaUsed;
     syncLog.status       = syncLog.errors.length > 0 ? 'partial' : 'success';
     syncLog.completedAt  = new Date();
@@ -149,6 +158,69 @@ export async function syncChannelStats(channelIds = null, type = 'manual') {
   }
 
   return syncLog;
+}
+
+// ---------------------------------------------------------------------------
+// Activity status — auto-archive channels with no qualifying recent posts, and
+// reactivate auto-archived channels that have posted again. Runs as the final
+// step of the daily channel sync. Reuses the `archived` status (already hidden
+// by every status filter) plus the hidden `autoArchivedForInactivity` flag to
+// tell automatic archives apart from deliberate manual ones.
+//
+// "Qualifying post" depends on channel group:
+//   IHI             → only sadhguru-classified videos count
+//   Dedicated/other → any upload counts
+// ---------------------------------------------------------------------------
+export async function updateChannelActivityStatuses(type = 'auto') {
+  const config = await SyncConfig.getSingleton();
+  const days = config.inactivityThresholdDays ?? 14;
+  const cutoff = new Date(Date.now() - days * MS_24H);
+
+  const hasQualifyingRecentPost = (channel) => {
+    const q = {
+      channelId: channel._id,
+      deletedAt: null,
+      publishedAt: { $gte: cutoff },
+    };
+    if (isIhiChannel(channel)) q.classification = 'sadhguru';
+    return Video.exists(q);
+  };
+
+  let archived = 0;
+  let reactivated = 0;
+
+  // Detection: active channels that have gone quiet → archive for inactivity.
+  const activeChannels = await Channel.find({ status: 'active' });
+  for (const channel of activeChannels) {
+    // Don't archive a freshly-added channel before ingest has had time to
+    // populate its videos.
+    if (channel.createdAt && channel.createdAt > cutoff) continue;
+    if (await hasQualifyingRecentPost(channel)) continue;
+    channel.status = 'archived';
+    channel.autoArchivedForInactivity = true;
+    await channel.save();
+    archived += 1;
+  }
+
+  // Reactivation: auto-archived channels that posted again → back to active.
+  const dormantChannels = await Channel.find({
+    status: 'archived',
+    autoArchivedForInactivity: true,
+  });
+  for (const channel of dormantChannels) {
+    if (!(await hasQualifyingRecentPost(channel))) continue;
+    channel.status = 'active';
+    channel.autoArchivedForInactivity = false;
+    await channel.save();
+    reactivated += 1;
+  }
+
+  logger.info(
+    `[Activity Status] ${archived} channel(s) archived for inactivity, ` +
+      `${reactivated} reactivated (window: ${days}d, ${type})`
+  );
+
+  return { archived, reactivated, thresholdDays: days };
 }
 
 // ---------------------------------------------------------------------------
@@ -298,7 +370,11 @@ export async function syncIhiIngestLast24h(channelIds = null, type = 'manual') {
   });
 
   try {
-    const query = { status: { $ne: 'archived' } };
+    // Include inactivity-archived channels so new uploads keep being ingested
+    // (and classified) — this is what lets the daily sync reactivate them.
+    const query = {
+      $or: [{ status: { $ne: 'archived' } }, { autoArchivedForInactivity: true }],
+    };
     if (channelIds) query._id = { $in: channelIds };
     const channels = (await Channel.find(query)).filter(isIhiChannel);
 
@@ -483,7 +559,11 @@ export async function syncDedicatedIngestLast24h(channelIds = null, type = 'manu
   });
 
   try {
-    const query = { status: { $ne: 'archived' } };
+    // Include inactivity-archived channels so new uploads keep being ingested
+    // — this is what lets the daily sync reactivate them.
+    const query = {
+      $or: [{ status: { $ne: 'archived' } }, { autoArchivedForInactivity: true }],
+    };
     if (channelIds) query._id = { $in: channelIds };
     const channels = (await Channel.find(query)).filter(isDedicatedChannel);
 

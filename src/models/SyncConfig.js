@@ -32,6 +32,10 @@ const syncConfigSchema = new mongoose.Schema(
     dedicatedIngestEnabled:      { type: Boolean, default: true },
     ihiIngestEnabled:           { type: Boolean, default: true },
     ihiSadhguruStatsEnabled:    { type: Boolean, default: true },
+
+    // A channel with no qualifying post within this many days is archived for
+    // inactivity by the daily channel sync (and reactivated once it posts again).
+    inactivityThresholdDays: { type: Number, default: 14 },
   },
   { timestamps: true }
 );

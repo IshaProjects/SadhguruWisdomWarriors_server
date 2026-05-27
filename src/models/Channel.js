@@ -42,6 +42,13 @@ const channelSchema = new mongoose.Schema(
 
     lastSyncedAt: { type: Date },
     allVideosPulled: { type: Boolean, default: false },
+
+    // Set by the daily sync when a channel is archived for inactivity (no
+    // qualifying posts in the inactivity window). Distinguishes an automatic
+    // archive from a manual one so the sync can auto-reactivate it later.
+    // Never surfaced or editable in the UI.
+    autoArchivedForInactivity: { type: Boolean, default: false },
+
     deletedAt: { type: Date, default: null, index: true },
   },
   { timestamps: true }
@@ -50,5 +57,6 @@ const channelSchema = new mongoose.Schema(
 channelSchema.index({ title: 'text', description: 'text' });
 channelSchema.index({ 'currentStats.subscribers': -1 });
 channelSchema.index({ 'currentStats.views': -1 });
+channelSchema.index({ status: 1, autoArchivedForInactivity: 1 });
 
 export default mongoose.model('Channel', channelSchema);

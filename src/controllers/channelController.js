@@ -323,7 +323,12 @@ export async function updateChannel(req, res, next) {
     if (category !== undefined) update.category = category;
     if (tags !== undefined) update.tags = tags;
     if (assignedTo !== undefined) update.assignedTo = assignedTo || null;
-    if (status !== undefined) update.status = status;
+    if (status !== undefined) {
+      update.status = status;
+      // A manual status change hands control back to the human: clear the
+      // auto-archive flag so the inactivity sync stops owning this channel.
+      update.autoArchivedForInactivity = false;
+    }
     if (notes !== undefined) update.notes = notes;
 
     const channel = await Channel.findByIdAndUpdate(req.params.id, update, {

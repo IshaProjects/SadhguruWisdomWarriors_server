@@ -29,7 +29,9 @@ export async function softDeleteChannels(channelIds) {
   // 1. Archive the channels themselves
   const { modifiedCount } = await Channel.updateMany(
     { _id: { $in: ids } },
-    { $set: { status: 'archived', deletedAt: now } }
+    // autoArchivedForInactivity:false marks this as a deliberate human archive
+    // so the inactivity sync never auto-reactivates it.
+    { $set: { status: 'archived', deletedAt: now, autoArchivedForInactivity: false } }
   );
 
   // 2. Soft-delete all videos belonging to these channels
