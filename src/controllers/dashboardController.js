@@ -111,7 +111,7 @@ export async function getSummary(req, res, next) {
     if (group === 'ihi') {
       // IHI: prevViews = sum of first VideoSnapshot views in period for sadhguru videos
       const oldChannelSnapshots = await ChannelSnapshot.aggregate([
-        { $match: { channelId: { $in: channelIds }, date: { $gte: start, $lte: end } } },
+        { $match: { channelId: { $in: channelIds }, deletedAt: null, date: { $gte: start, $lte: end } } },
         { $sort: { date: 1 } },
         { $group: { _id: '$channelId', firstSubscribers: { $first: '$subscribers' } } },
       ]);
@@ -124,7 +124,7 @@ export async function getSummary(req, res, next) {
       });
       const ihiPrevViewsAgg = await VideoSnapshot.aggregate(
         [
-          { $match: { videoId: { $in: sadhguruVideoIds }, date: { $gte: start, $lte: end } } },
+          { $match: { videoId: { $in: sadhguruVideoIds }, deletedAt: null, date: { $gte: start, $lte: end } } },
           { $sort: { videoId: 1, date: 1 } },
           { $group: { _id: '$videoId', firstViews: { $first: '$views' } } },
           { $group: { _id: null, total: { $sum: '$firstViews' } } },
@@ -137,6 +137,7 @@ export async function getSummary(req, res, next) {
         {
           $match: {
             channelId: { $in: channelIds },
+            deletedAt: null,
             date: { $gte: start, $lte: end },
           },
         },
@@ -221,7 +222,7 @@ export async function getGrowthData(req, res, next) {
       });
       const ihiSnapshots = await VideoSnapshot.aggregate(
         [
-          { $match: { videoId: { $in: sadhguruVideoIds }, date: { $gte: start, $lte: end } } },
+          { $match: { videoId: { $in: sadhguruVideoIds }, deletedAt: null, date: { $gte: start, $lte: end } } },
           {
             $group: {
               _id: { $dateToString: { format: '%Y-%m-%d', date: '$date' } },
@@ -233,7 +234,7 @@ export async function getGrowthData(req, res, next) {
         { allowDiskUse: true }
       );
       const channelSnapshots = await ChannelSnapshot.aggregate([
-        { $match: { channelId: { $in: channelIds }, date: { $gte: start, $lte: end } } },
+        { $match: { channelId: { $in: channelIds }, deletedAt: null, date: { $gte: start, $lte: end } } },
         {
           $group: {
             _id: { $dateToString: { format: '%Y-%m-%d', date: '$date' } },
@@ -253,6 +254,7 @@ export async function getGrowthData(req, res, next) {
         {
           $match: {
             channelId: { $in: channelIds },
+            deletedAt: null,
             date: { $gte: start, $lte: end },
           },
         },
@@ -295,6 +297,7 @@ export async function getTopChannels(req, res, next) {
       {
         $match: {
           channelId: { $in: channelIds },
+          deletedAt: null,
           date: { $gte: start, $lte: end },
         },
       },
@@ -644,6 +647,7 @@ export async function getChannelMetrics(req, res, next) {
       {
         $match: {
           channelId: { $in: channelIds },
+          deletedAt: null,
           date: { $lte: sevenDaysAgo },
         },
       },

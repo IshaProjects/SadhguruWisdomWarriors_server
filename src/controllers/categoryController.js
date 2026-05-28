@@ -15,8 +15,9 @@ export async function listCategories(req, res, next) {
   try {
     await seedUncategorized();
 
-    // Get channel counts per category
+    // Get channel counts per category (exclude archived to match list/dashboard semantics).
     const counts = await Channel.aggregate([
+      { $match: { deletedAt: null, status: { $ne: 'archived' } } },
       { $group: { _id: '$category', count: { $sum: 1 } } },
     ]);
     const countMap = {};

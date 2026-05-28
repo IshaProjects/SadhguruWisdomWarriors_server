@@ -17,7 +17,9 @@ import { getVideoSnapshotPeriodViewsByChannel } from '../utils/videoSnapshotPeri
 
 function buildChannelFilter(query) {
   const { search, category, status, tags, minSubs, maxSubs, minViews, maxViews, country, startDate, endDate } = query;
-  const filter = {};
+  // Default: exclude archived channels (matches dashboard + listChannels behavior).
+  // Caller can opt back in by passing ?status=archived explicitly.
+  const filter = { status: { $ne: 'archived' } };
 
   if (search) {
     filter.$or = [
@@ -58,7 +60,9 @@ function buildChannelFilter(query) {
 
 function buildVideoFilter(query) {
   const { search, channelId, category, tags, status, classification, minViews, maxViews, startDate, endDate, hashtags } = query;
-  const channelFilter = {};
+  // Default: video reports exclude videos whose channel is archived.
+  // Caller can opt back in by passing ?status=archived explicitly.
+  const channelFilter = { status: { $ne: 'archived' } };
   const videoFilter   = {};
 
   if (category) channelFilter.category = category;
