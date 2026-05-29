@@ -798,9 +798,9 @@ describe('POST /api/channels/reclassify-bulk (bulkReclassifyChannelVideos)', () 
     expect(res.body.channelsRequested).toBe(2);
     expect(res.body.channelsProcessed).toBe(2);
     expect(res.body.totalVideos).toBe(4);
-    // PRE-EXISTING SOURCE BUG PRESERVED — controller reads `result.sadhguruCount`
-    // while classifyVideosForChannel returns `sadguruCount`. Result: NaN → JSON null.
-    expect(res.body.totalSadguru).toBeNull();
+    // Dedicated channel auto-classifies both videos as sadhguru (2). IHI channel
+    // gets iv1 classified via the AI mock (1) and iv2 unmapped (failed). 2 + 1 = 3.
+    expect(res.body.totalSadguru).toBe(3);
     expect(res.body.totalNonSadguru).toBe(0);
     expect(res.body.totalFailed).toBe(1);
     expect(res.body.errors).toBeUndefined();

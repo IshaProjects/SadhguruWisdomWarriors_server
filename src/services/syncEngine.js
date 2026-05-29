@@ -1220,16 +1220,11 @@ export async function pullAllChannelsVideos() {
     orderBy: { title: 'asc' },
   });
 
-  const channelsWithPlaylist = channels.filter(
-    (ch) => ch.uploadsPlaylistId || ch.youtubeChannelId
-  );
-
-  if (channelsWithPlaylist.length === 0) {
+  if (channels.length === 0) {
     return {
       channelsProcessed: 0,
-      channelsSkipped: 0,
       totalVideosPulled: 0,
-      message: 'No channels need video pull (all already pulled or no uploads playlist)',
+      message: 'No channels need video pull (all already pulled)',
     };
   }
 
@@ -1237,7 +1232,7 @@ export async function pullAllChannelsVideos() {
   let totalVideosPulled = 0;
   const errors = [];
 
-  for (const channel of channelsWithPlaylist) {
+  for (const channel of channels) {
     const quota = getQuotaUsage();
     if (quota.remaining < 10) {
       logger.warn('[Pull All Channels] Approaching quota limit, stopping');
@@ -1258,14 +1253,12 @@ export async function pullAllChannelsVideos() {
     }
   }
 
-  const channelsSkipped = channels.length - channelsWithPlaylist.length;
   logger.info(
     `[Pull All Channels] Done: ${channelsProcessed} channels, ${totalVideosPulled} videos pulled`
   );
 
   return {
     channelsProcessed,
-    channelsSkipped,
     totalVideosPulled,
     errors: errors.length > 0 ? errors : undefined,
   };

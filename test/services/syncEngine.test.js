@@ -1767,7 +1767,7 @@ describe('pullAllChannelsVideos', () => {
   it('returns "no channels need pull" when nothing to do', async () => {
     const result = await pullAllChannelsVideos();
     expect(result.channelsProcessed).toBe(0);
-    expect(result.channelsSkipped).toBe(0);
+    expect(result.totalVideosPulled).toBe(0);
     expect(result.message).toMatch(/No channels need video pull/);
   });
 
@@ -1790,19 +1790,6 @@ describe('pullAllChannelsVideos', () => {
     });
     const result = await pullAllChannelsVideos();
     expect(result.channelsProcessed).toBe(0);
-  });
-
-  it('skips channels with no uploadsPlaylistId and no youtubeChannelId via filter (channelsSkipped counted)', async () => {
-    await prisma.channel.create({
-      data: {
-        youtubeChannelId: 'UC_x',
-        uploadsPlaylistId: 'UU_x',
-        category: 'Dedicated Sadhguru',
-      },
-    });
-    fetchAllPlaylistItemIds.mockResolvedValue([]);
-    const result = await pullAllChannelsVideos();
-    expect(result.channelsSkipped).toBe(0);
   });
 
   it('processes each channel and accumulates totalVideosPulled', async () => {

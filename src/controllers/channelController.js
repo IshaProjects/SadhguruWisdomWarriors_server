@@ -549,9 +549,7 @@ export async function bulkReclassifyChannelVideos(req, res, next) {
         channelsProcessed++;
         totalVideos += result.totalVideos;
         totalNewlyClassified += result.newlyClassified;
-        // NOTE: pre-existing source bug preserved — reads `sadhguruCount` but
-        // classifyVideosForChannel returns `sadguruCount`. Result: NaN → JSON null.
-        totalSadguru += result.sadhguruCount;
+        totalSadguru += result.sadguruCount;
         totalNonSadguru += result.nonSadguruCount;
         totalFailed += result.failed;
       } catch (err) {
@@ -885,9 +883,7 @@ export async function classifyAllChannelsVideos(req, res, next) {
         channelsProcessed++;
         totalVideos += result.totalVideos;
         totalNewlyClassified += result.newlyClassified;
-        // NOTE: pre-existing source bug preserved — reads `sadhguruCount` but
-        // classifyVideosForChannel returns `sadguruCount`. Result: NaN → JSON null.
-        totalSadguru += result.sadhguruCount;
+        totalSadguru += result.sadguruCount;
         totalNonSadguru += result.nonSadguruCount;
         totalFailed += result.failed;
       } catch (err) {
