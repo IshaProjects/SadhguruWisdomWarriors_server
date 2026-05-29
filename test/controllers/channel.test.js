@@ -1170,8 +1170,8 @@ describe('POST /api/channels/:id/classify-videos (classifyChannelVideos)', () =>
       totalVideos: 0,
       newlyClassified: 0,
       failed: 0,
-      sadguruCount: 0,
-      nonSadguruCount: 0,
+      sadhguruCount: 0,
+      nonSadhguruCount: 0,
       isSadhguruChannel: false,
     });
   });
@@ -1210,8 +1210,8 @@ describe('POST /api/channels/:id/classify-videos (classifyChannelVideos)', () =>
     expect(res.status).toBe(200);
     expect(res.body.totalVideos).toBe(4);
     expect(res.body.failed).toBe(1);
-    expect(res.body.sadguruCount).toBe(1);
-    expect(res.body.nonSadguruCount).toBe(1);
+    expect(res.body.sadhguruCount).toBe(1);
+    expect(res.body.nonSadhguruCount).toBe(1);
     expect(res.body.newlyClassified).toBe(2);
     expect(res.body.alreadyClassified).toBe(1);
 

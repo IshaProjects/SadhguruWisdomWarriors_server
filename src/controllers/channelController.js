@@ -549,8 +549,8 @@ export async function bulkReclassifyChannelVideos(req, res, next) {
         channelsProcessed++;
         totalVideos += result.totalVideos;
         totalNewlyClassified += result.newlyClassified;
-        totalSadguru += result.sadguruCount;
-        totalNonSadguru += result.nonSadguruCount;
+        totalSadguru += result.sadhguruCount;
+        totalNonSadguru += result.nonSadhguruCount;
         totalFailed += result.failed;
       } catch (err) {
         errors.push({ channelId: channel.id, title: channel.title, message: err.message });
@@ -740,8 +740,8 @@ async function classifyVideosForChannel(channel) {
       alreadyClassified: 0,
       newlyClassified: 0,
       failed: 0,
-      sadguruCount: 0,
-      nonSadguruCount: 0,
+      sadhguruCount: 0,
+      nonSadhguruCount: 0,
       isSadhguruChannel: false,
     };
   }
@@ -776,8 +776,8 @@ async function classifyVideosForChannel(channel) {
       alreadyClassified: videos.length - newlyClassified,
       newlyClassified,
       failed: 0,
-      sadguruCount: newlyClassified,
-      nonSadguruCount: 0,
+      sadhguruCount: newlyClassified,
+      nonSadhguruCount: 0,
       isSadhguruChannel: true,
     };
   }
@@ -785,12 +785,12 @@ async function classifyVideosForChannel(channel) {
   const toClassify = videos.filter(isEmpty);
   let failed = 0;
   const classificationMap = await classifySadguruVideoBatch(toClassify);
-  let sadguruCount = 0;
+  let sadhguruCount = 0;
   for (const video of toClassify) {
     const value = classificationMap.get(String(video.id));
     if (value) {
       await prisma.video.update({ where: { id: video.id }, data: { classification: value } });
-      if (value === 'sadhguru') sadguruCount++;
+      if (value === 'sadhguru') sadhguruCount++;
     } else {
       failed++;
     }
@@ -801,8 +801,8 @@ async function classifyVideosForChannel(channel) {
     alreadyClassified: videos.length - toClassify.length,
     newlyClassified,
     failed,
-    sadguruCount,
-    nonSadguruCount: newlyClassified - sadguruCount,
+    sadhguruCount,
+    nonSadhguruCount: newlyClassified - sadhguruCount,
     isSadhguruChannel: false,
   };
 }
@@ -883,8 +883,8 @@ export async function classifyAllChannelsVideos(req, res, next) {
         channelsProcessed++;
         totalVideos += result.totalVideos;
         totalNewlyClassified += result.newlyClassified;
-        totalSadguru += result.sadguruCount;
-        totalNonSadguru += result.nonSadguruCount;
+        totalSadguru += result.sadhguruCount;
+        totalNonSadguru += result.nonSadhguruCount;
         totalFailed += result.failed;
       } catch (err) {
         errors.push({ channelId: channel.id, title: channel.title, message: err.message });
