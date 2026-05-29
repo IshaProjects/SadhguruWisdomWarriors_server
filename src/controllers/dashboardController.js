@@ -1,9 +1,5 @@
-import Channel from '../models/Channel.js';
-import ChannelSnapshot from '../models/ChannelSnapshot.js';
-import Video from '../models/Video.js';
-import VideoSnapshot from '../models/VideoSnapshot.js';
-import MicroUnit from '../models/MicroUnit.js';
-import DashboardLayout from '../models/DashboardLayout.js';
+import { Prisma } from '@prisma/client';
+import { prisma } from '../config/prisma.js';
 import {
   parseYmdToUtcEnd,
   parseYmdToUtcStart,
@@ -43,65 +39,85 @@ function getDateRange(period, query = {}) {
   return { start: utcStartOfDay(start), end };
 }
 
+/**
+ * Build the Prisma `where` filter that mirrors the legacy Mongo buildChannelFilter.
+ * - status defaults to "not archived" unless explicitly overridden.
+ * - group=dedicated → category startsWith "Dedicated" (case-insensitive).
+ * - group=ihi      → category contains "IHI"        (case-insensitive).
+ * - tags=csv,list  → tags has-some of the parsed list.
+ * - startDate/endDate (only when wanted) → lastSyncedAt window.
+ */
 function buildChannelFilter(query) {
-  const filter = { status: { $ne: 'archived' } };
-  if (query.assignedTo) filter.assignedTo = query.assignedTo;
-  if (query.status)     filter.status     = query.status;
+  const where = {};
+  if (query.status) {
+    where.status = query.status;
+  } else {
+    where.status = { not: 'archived' };
+  }
+  if (query.assignedTo) where.assignedToId = query.assignedTo;
   if (query.tags && query.tags.trim()) {
     const tagList = query.tags.split(',').map((t) => t.trim()).filter(Boolean);
-    if (tagList.length) filter.tags = { $in: tagList };
+    if (tagList.length) where.tags = { hasSome: tagList };
   }
-  // Group filter: 'dedicated' = category starts with "Dedicated", 'ihi' = category contains "IHI"
   if (query.group === 'dedicated') {
-    filter.category = { $regex: /^Dedicated/i };
+    where.category = { startsWith: 'Dedicated', mode: 'insensitive' };
   } else if (query.group === 'ihi') {
-    filter.category = { $regex: /IHI/i };
+    where.category = { contains: 'IHI', mode: 'insensitive' };
   } else if (query.category) {
-    filter.category = query.category;
+    where.category = query.category;
   }
   if (query.startDate || query.endDate) {
-    filter.lastSyncedAt = {};
-    if (query.startDate) filter.lastSyncedAt.$gte = parseYmdToUtcStart(query.startDate);
-    if (query.endDate)   filter.lastSyncedAt.$lte = parseYmdToUtcEnd(query.endDate);
+    where.lastSyncedAt = {};
+    if (query.startDate) where.lastSyncedAt.gte = parseYmdToUtcStart(query.startDate);
+    if (query.endDate) where.lastSyncedAt.lte = parseYmdToUtcEnd(query.endDate);
   }
-  return filter;
+  // Soft-delete safety on every read path.
+  where.deletedAt = null;
+  return where;
+}
+
+/** Convert a BigInt-or-number to a JS Number (we never sum > 2^53 in these APIs). */
+function n(v) {
+  if (v == null) return 0;
+  if (typeof v === 'bigint') return Number(v);
+  return v;
 }
 
 export async function getSummary(req, res, next) {
   try {
     const channelFilter = buildChannelFilter(req.query);
-    const channels = await Channel.find(channelFilter);
-    const channelIds = channels.map((c) => c._id);
+    const channels = await prisma.channel.findMany({ where: channelFilter });
+    const channelIds = channels.map((c) => c.id);
     const group = req.query.group;
 
     const totalChannels = channels.length;
     const totalSubscribers = channels.reduce(
-      (sum, c) => sum + (c.currentStats?.subscribers || 0),
-      0
+      (sum, c) => sum + (c.currentSubscribers || 0),
+      0,
     );
 
-    // Dedicated: totalViews = sum of channel views. IHI: totalViews = sum of sadhguru video views (MongoDB aggregation)
+    // Dedicated/default: totalViews = sum of channel views.
+    // IHI: totalViews = sum of sadhguru video views.
     let totalViews;
     if (group === 'ihi') {
-      const ihiViewsAgg = await Video.aggregate([
-        {
-          $match: {
-            channelId: { $in: channelIds },
+      if (channelIds.length === 0) {
+        totalViews = 0;
+      } else {
+        const ihiAgg = await prisma.video.aggregate({
+          where: {
+            channelId: { in: channelIds },
             classification: 'sadhguru',
             deletedAt: null,
           },
-        },
-        { $group: { _id: null, total: { $sum: '$views' } } },
-      ]);
-      totalViews = ihiViewsAgg[0]?.total ?? 0;
+          _sum: { views: true },
+        });
+        totalViews = n(ihiAgg._sum.views);
+      }
     } else {
-      totalViews = channels.reduce(
-        (sum, c) => sum + (c.currentStats?.views || 0),
-        0
-      );
+      totalViews = channels.reduce((sum, c) => sum + n(c.currentViews), 0);
     }
 
-    // Get period comparison data
+    // Period comparison ----------------------------------------------------
     const { period = '30d' } = req.query;
     const { start, end } = getDateRange(period, req.query);
 
@@ -109,49 +125,65 @@ export async function getSummary(req, res, next) {
     let prevViews = 0;
 
     if (group === 'ihi') {
-      // IHI: prevViews = sum of first VideoSnapshot views in period for sadhguru videos
-      const oldChannelSnapshots = await ChannelSnapshot.aggregate([
-        { $match: { channelId: { $in: channelIds }, deletedAt: null, date: { $gte: start, $lte: end } } },
-        { $sort: { date: 1 } },
-        { $group: { _id: '$channelId', firstSubscribers: { $first: '$subscribers' } } },
-      ]);
-      prevSubscribers = oldChannelSnapshots.reduce((s, x) => s + (x.firstSubscribers || 0), 0);
+      if (channelIds.length > 0) {
+        // Subscribers: first channel snapshot per channel in [start, end].
+        const oldChannelSnapshots = await prisma.$queryRaw(Prisma.sql`
+          SELECT DISTINCT ON (channel_id) channel_id, subscribers
+          FROM channel_snapshots
+          WHERE channel_id IN (${Prisma.join(channelIds)})
+            AND deleted_at IS NULL
+            AND date >= ${start}
+            AND date <= ${end}
+          ORDER BY channel_id, date ASC
+        `);
+        prevSubscribers = oldChannelSnapshots.reduce(
+          (s, r) => s + (r.subscribers || 0),
+          0,
+        );
 
-      const sadhguruVideoIds = await Video.distinct('_id', {
-        channelId: { $in: channelIds },
-        classification: 'sadhguru',
-        deletedAt: null,
-      });
-      const ihiPrevViewsAgg = await VideoSnapshot.aggregate(
-        [
-          { $match: { videoId: { $in: sadhguruVideoIds }, deletedAt: null, date: { $gte: start, $lte: end } } },
-          { $sort: { videoId: 1, date: 1 } },
-          { $group: { _id: '$videoId', firstViews: { $first: '$views' } } },
-          { $group: { _id: null, total: { $sum: '$firstViews' } } },
-        ],
-        { allowDiskUse: true }
-      );
-      prevViews = ihiPrevViewsAgg[0]?.total ?? 0;
-    } else {
-      const oldSnapshots = await ChannelSnapshot.aggregate([
-        {
-          $match: {
-            channelId: { $in: channelIds },
+        // Views: per-video first VideoSnapshot in [start, end], summed.
+        const sadhguruVideos = await prisma.video.findMany({
+          where: {
+            channelId: { in: channelIds },
+            classification: 'sadhguru',
             deletedAt: null,
-            date: { $gte: start, $lte: end },
           },
-        },
-        { $sort: { date: 1 } },
-        {
-          $group: {
-            _id: '$channelId',
-            firstSubscribers: { $first: '$subscribers' },
-            firstViews: { $first: '$views' },
-          },
-        },
-      ]);
-      prevSubscribers = oldSnapshots.reduce((sum, s) => sum + (s.firstSubscribers || 0), 0);
-      prevViews = oldSnapshots.reduce((sum, s) => sum + (s.firstViews || 0), 0);
+          select: { id: true },
+        });
+        const sadhguruVideoIds = sadhguruVideos.map((v) => v.id);
+        if (sadhguruVideoIds.length > 0) {
+          const ihiPrev = await prisma.$queryRaw(Prisma.sql`
+            SELECT COALESCE(SUM(first_views), 0)::bigint AS total
+            FROM (
+              SELECT DISTINCT ON (video_id) video_id, views AS first_views
+              FROM video_snapshots
+              WHERE video_id IN (${Prisma.join(sadhguruVideoIds)})
+                AND deleted_at IS NULL
+                AND date >= ${start}
+                AND date <= ${end}
+              ORDER BY video_id, date ASC
+            ) firsts
+          `);
+          prevViews = n(ihiPrev[0]?.total);
+        }
+      }
+    } else if (channelIds.length > 0) {
+      // Default group: per-channel first snapshot in [start, end].
+      const oldSnapshots = await prisma.$queryRaw(Prisma.sql`
+        SELECT DISTINCT ON (channel_id)
+               channel_id, subscribers, views
+        FROM channel_snapshots
+        WHERE channel_id IN (${Prisma.join(channelIds)})
+          AND deleted_at IS NULL
+          AND date >= ${start}
+          AND date <= ${end}
+        ORDER BY channel_id, date ASC
+      `);
+      prevSubscribers = oldSnapshots.reduce(
+        (sum, s) => sum + (s.subscribers || 0),
+        0,
+      );
+      prevViews = oldSnapshots.reduce((sum, s) => sum + n(s.views), 0);
     }
 
     const subsChange = prevSubscribers
@@ -161,31 +193,38 @@ export async function getSummary(req, res, next) {
       ? ((totalViews - prevViews) / prevViews) * 100
       : 0;
 
-    // Videos published this period
-    const videosMatch = { channelId: { $in: channelIds }, publishedAt: { $gte: start, $lte: end } };
-    if (group === 'ihi') {
-      videosMatch.classification = 'sadhguru';
+    // Videos published this period -----------------------------------------
+    let videosThisPeriod = 0;
+    if (channelIds.length > 0) {
+      const videosWhere = {
+        channelId: { in: channelIds },
+        publishedAt: { gte: start, lte: end },
+      };
+      if (group === 'ihi') videosWhere.classification = 'sadhguru';
+      videosThisPeriod = await prisma.video.count({ where: videosWhere });
     }
-    const videosThisPeriod = await Video.countDocuments(videosMatch);
 
-    // Average engagement rate (from recent videos)
-    const recentVideosMatch = {
-      channelId: { $in: channelIds },
-      publishedAt: { $gte: start, $lte: end },
-      views: { $gt: 0 },
-      deletedAt: null,
-    };
-    if (group === 'ihi') {
-      recentVideosMatch.classification = 'sadhguru';
-    }
-    const recentVideos = await Video.find(recentVideosMatch).select('views likes comments');
-
+    // Average engagement rate (from recent videos) -------------------------
     let avgEngagement = 0;
-    if (recentVideos.length > 0) {
-      const totalEngagement = recentVideos.reduce((sum, v) => {
-        return sum + ((v.likes + v.comments) / v.views) * 100;
-      }, 0);
-      avgEngagement = totalEngagement / recentVideos.length;
+    if (channelIds.length > 0) {
+      const recentWhere = {
+        channelId: { in: channelIds },
+        publishedAt: { gte: start, lte: end },
+        views: { gt: 0 },
+        deletedAt: null,
+      };
+      if (group === 'ihi') recentWhere.classification = 'sadhguru';
+      const recentVideos = await prisma.video.findMany({
+        where: recentWhere,
+        select: { views: true, likes: true, comments: true },
+      });
+      if (recentVideos.length > 0) {
+        const totalEngagement = recentVideos.reduce((sum, v) => {
+          const views = n(v.views);
+          return sum + ((v.likes + v.comments) / views) * 100;
+        }, 0);
+        avgEngagement = totalEngagement / recentVideos.length;
+      }
     }
 
     res.json({
@@ -206,68 +245,86 @@ export async function getGrowthData(req, res, next) {
   try {
     const { period = '30d' } = req.query;
     const channelFilter = buildChannelFilter(req.query);
-    const channels = await Channel.find(channelFilter).select('_id');
-    const channelIds = channels.map((c) => c._id);
+    const channels = await prisma.channel.findMany({
+      where: channelFilter,
+      select: { id: true },
+    });
+    const channelIds = channels.map((c) => c.id);
     const group = req.query.group;
 
     const { start, end } = getDateRange(period, req.query);
 
     let snapshots;
+    if (channelIds.length === 0) {
+      return res.json([]);
+    }
+
     if (group === 'ihi') {
-      // IHI: views = sum of VideoSnapshot.views for sadhguru videos per day
-      const sadhguruVideoIds = await Video.distinct('_id', {
-        channelId: { $in: channelIds },
-        classification: 'sadhguru',
-        deletedAt: null,
-      });
-      const ihiSnapshots = await VideoSnapshot.aggregate(
-        [
-          { $match: { videoId: { $in: sadhguruVideoIds }, deletedAt: null, date: { $gte: start, $lte: end } } },
-          {
-            $group: {
-              _id: { $dateToString: { format: '%Y-%m-%d', date: '$date' } },
-              totalViews: { $sum: '$views' },
-            },
-          },
-          { $sort: { _id: 1 } },
-        ],
-        { allowDiskUse: true }
-      );
-      const channelSnapshots = await ChannelSnapshot.aggregate([
-        { $match: { channelId: { $in: channelIds }, deletedAt: null, date: { $gte: start, $lte: end } } },
-        {
-          $group: {
-            _id: { $dateToString: { format: '%Y-%m-%d', date: '$date' } },
-            totalSubscribers: { $sum: '$subscribers' },
-            totalVideos: { $sum: '$videoCount' },
-          },
+      // IHI: daily views from VideoSnapshot for sadhguru videos.
+      const sadhguruVideos = await prisma.video.findMany({
+        where: {
+          channelId: { in: channelIds },
+          classification: 'sadhguru',
+          deletedAt: null,
         },
-        { $sort: { _id: 1 } },
-      ]);
-      const ihiMap = new Map(ihiSnapshots.map((s) => [s._id, s.totalViews]));
+        select: { id: true },
+      });
+      const sadhguruVideoIds = sadhguruVideos.map((v) => v.id);
+
+      const ihiSnapshots = sadhguruVideoIds.length
+        ? await prisma.$queryRaw(Prisma.sql`
+            SELECT TO_CHAR(date AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS day,
+                   COALESCE(SUM(views), 0)::bigint AS total_views
+            FROM video_snapshots
+            WHERE video_id IN (${Prisma.join(sadhguruVideoIds)})
+              AND deleted_at IS NULL
+              AND date >= ${start}
+              AND date <= ${end}
+            GROUP BY day
+            ORDER BY day ASC
+          `)
+        : [];
+
+      const channelSnapshots = await prisma.$queryRaw(Prisma.sql`
+        SELECT TO_CHAR(date AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS day,
+               COALESCE(SUM(subscribers), 0)::bigint AS total_subscribers,
+               COALESCE(SUM(video_count), 0)::bigint AS total_videos
+        FROM channel_snapshots
+        WHERE channel_id IN (${Prisma.join(channelIds)})
+          AND deleted_at IS NULL
+          AND date >= ${start}
+          AND date <= ${end}
+        GROUP BY day
+        ORDER BY day ASC
+      `);
+
+      const ihiMap = new Map(ihiSnapshots.map((s) => [s.day, n(s.total_views)]));
       snapshots = channelSnapshots.map((s) => ({
-        ...s,
-        totalViews: ihiMap.get(s._id) ?? 0,
+        _id: s.day,
+        totalSubscribers: n(s.total_subscribers),
+        totalViews: ihiMap.get(s.day) ?? 0,
+        totalVideos: n(s.total_videos),
       }));
     } else {
-      snapshots = await ChannelSnapshot.aggregate([
-        {
-          $match: {
-            channelId: { $in: channelIds },
-            deletedAt: null,
-            date: { $gte: start, $lte: end },
-          },
-        },
-        {
-          $group: {
-            _id: { $dateToString: { format: '%Y-%m-%d', date: '$date' } },
-            totalSubscribers: { $sum: '$subscribers' },
-            totalViews: { $sum: '$views' },
-            totalVideos: { $sum: '$videoCount' },
-          },
-        },
-        { $sort: { _id: 1 } },
-      ]);
+      const rows = await prisma.$queryRaw(Prisma.sql`
+        SELECT TO_CHAR(date AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS day,
+               COALESCE(SUM(subscribers), 0)::bigint AS total_subscribers,
+               COALESCE(SUM(views), 0)::bigint AS total_views,
+               COALESCE(SUM(video_count), 0)::bigint AS total_videos
+        FROM channel_snapshots
+        WHERE channel_id IN (${Prisma.join(channelIds)})
+          AND deleted_at IS NULL
+          AND date >= ${start}
+          AND date <= ${end}
+        GROUP BY day
+        ORDER BY day ASC
+      `);
+      snapshots = rows.map((s) => ({
+        _id: s.day,
+        totalSubscribers: n(s.total_subscribers),
+        totalViews: n(s.total_views),
+        totalVideos: n(s.total_videos),
+      }));
     }
 
     res.json(
@@ -276,7 +333,7 @@ export async function getGrowthData(req, res, next) {
         subscribers: s.totalSubscribers,
         views: s.totalViews,
         videoCount: s.totalVideos,
-      }))
+      })),
     );
   } catch (err) {
     next(err);
@@ -287,50 +344,61 @@ export async function getTopChannels(req, res, next) {
   try {
     const { period = '30d', metric = 'subscribers', limit = 10 } = req.query;
     const channelFilter = buildChannelFilter(req.query);
-    const channels = await Channel.find(channelFilter);
-    const channelIds = channels.map((c) => c._id);
+    const channels = await prisma.channel.findMany({ where: channelFilter });
+    const channelIds = channels.map((c) => c.id);
 
     const { start, end } = getDateRange(period, req.query);
 
-    // Get first and latest snapshot for each channel
-    const growthData = await ChannelSnapshot.aggregate([
-      {
-        $match: {
-          channelId: { $in: channelIds },
-          deletedAt: null,
-          date: { $gte: start, $lte: end },
-        },
-      },
-      {
-        $sort: { date: 1 },
-      },
-      {
-        $group: {
-          _id: '$channelId',
-          firstSubs: { $first: '$subscribers' },
-          lastSubs: { $last: '$subscribers' },
-          firstViews: { $first: '$views' },
-          lastViews: { $last: '$views' },
-        },
-      },
-      {
-        $addFields: {
-          subsGrowth: { $subtract: ['$lastSubs', '$firstSubs'] },
-          viewsGrowth: { $subtract: ['$lastViews', '$firstViews'] },
-        },
-      },
-      {
-        $sort: metric === 'views' ? { viewsGrowth: -1 } : { subsGrowth: -1 },
-      },
-      { $limit: parseInt(limit) },
-    ]);
+    let growthData = [];
+    if (channelIds.length > 0) {
+      // For each channel, get first and last snapshot (subs + views) in the window.
+      const firsts = await prisma.$queryRaw(Prisma.sql`
+        SELECT DISTINCT ON (channel_id)
+               channel_id, subscribers, views
+        FROM channel_snapshots
+        WHERE channel_id IN (${Prisma.join(channelIds)})
+          AND deleted_at IS NULL
+          AND date >= ${start}
+          AND date <= ${end}
+        ORDER BY channel_id, date ASC
+      `);
+      const lasts = await prisma.$queryRaw(Prisma.sql`
+        SELECT DISTINCT ON (channel_id)
+               channel_id, subscribers, views
+        FROM channel_snapshots
+        WHERE channel_id IN (${Prisma.join(channelIds)})
+          AND deleted_at IS NULL
+          AND date >= ${start}
+          AND date <= ${end}
+        ORDER BY channel_id, date DESC
+      `);
+      const lastMap = new Map(lasts.map((r) => [r.channel_id, r]));
 
-    // Map channel info
-    const channelMap = new Map();
-    channels.forEach((c) => channelMap.set(c._id.toString(), c));
+      growthData = firsts.map((f) => {
+        const l = lastMap.get(f.channel_id) || f;
+        const firstSubs = f.subscribers ?? 0;
+        const lastSubs = l.subscribers ?? 0;
+        const firstViews = n(f.views);
+        const lastViews = n(l.views);
+        return {
+          _id: f.channel_id,
+          firstSubs,
+          lastSubs,
+          firstViews,
+          lastViews,
+          subsGrowth: lastSubs - firstSubs,
+          viewsGrowth: lastViews - firstViews,
+        };
+      });
+      const sortKey = metric === 'views' ? 'viewsGrowth' : 'subsGrowth';
+      growthData.sort((a, b) => b[sortKey] - a[sortKey]);
+      growthData = growthData.slice(0, parseInt(limit));
+    }
+
+    const channelMap = new Map(channels.map((c) => [c.id, c]));
 
     const result = growthData.map((g) => {
-      const ch = channelMap.get(g._id.toString());
+      const ch = channelMap.get(g._id);
       return {
         channelId: g._id,
         title: ch?.title || 'Unknown',
@@ -352,26 +420,43 @@ export async function getTopVideos(req, res, next) {
   try {
     const { period = '30d', limit = 10 } = req.query;
     const channelFilter = buildChannelFilter(req.query);
-    const channels = await Channel.find(channelFilter).select('_id title');
-    const channelIds = channels.map((c) => c._id);
+    const channels = await prisma.channel.findMany({
+      where: channelFilter,
+      select: { id: true, title: true },
+    });
+    const channelIds = channels.map((c) => c.id);
     const group = req.query.group;
 
     const { start, end } = getDateRange(period, req.query);
 
-    const videosMatch = {
-      channelId: { $in: channelIds },
-      publishedAt: { $gte: start, $lte: end },
+    if (channelIds.length === 0) return res.json([]);
+
+    const videosWhere = {
+      channelId: { in: channelIds },
+      publishedAt: { gte: start, lte: end },
       deletedAt: null,
     };
-    if (group === 'ihi') {
-      videosMatch.classification = 'sadhguru';
-    }
-    const videos = await Video.find(videosMatch)
-      .sort({ views: -1 })
-      .limit(parseInt(limit))
-      .populate('channelId', 'title thumbnailUrl');
+    if (group === 'ihi') videosWhere.classification = 'sadhguru';
+    const videos = await prisma.video.findMany({
+      where: videosWhere,
+      orderBy: { views: 'desc' },
+      take: parseInt(limit),
+      include: { channel: { select: { id: true, title: true, thumbnailUrl: true } } },
+    });
 
-    res.json(videos);
+    // Mirror the legacy Mongoose response shape: `channelId` is a populated
+    // object with `{ _id?, title, thumbnailUrl }` (callers read .title).
+    const shaped = videos.map((v) => ({
+      ...v,
+      // BigInt → Number for the JSON layer.
+      views: n(v.views),
+      channelId: v.channel
+        ? { _id: v.channel.id, title: v.channel.title, thumbnailUrl: v.channel.thumbnailUrl }
+        : null,
+      channel: undefined,
+    }));
+
+    res.json(shaped);
   } catch (err) {
     next(err);
   }
@@ -388,19 +473,25 @@ export async function getCategoryBreakdown(req, res, next) {
     }
     if (classification === 'sadhguru' || classification === 'non_sadhguru') {
       const cls = classification === 'sadhguru' ? 'sadhguru' : 'non sadhguru';
-      const ids = await Video.distinct('channelId', { classification: cls, deletedAt: null });
-      channelFilter._id = { $in: ids };
+      const idRows = await prisma.video.findMany({
+        where: { classification: cls, deletedAt: null },
+        select: { channelId: true },
+        distinct: ['channelId'],
+      });
+      const ids = idRows.map((r) => r.channelId);
+      channelFilter.id = { in: ids };
     }
 
-    const channels = await Channel.find(channelFilter)
-      .select('_id category')
-      .lean();
+    const channels = await prisma.channel.findMany({
+      where: channelFilter,
+      select: { id: true, category: true },
+    });
 
     if (channels.length === 0) {
       return res.json([]);
     }
 
-    const channelIds = channels.map((c) => c._id);
+    const channelIds = channels.map((c) => c.id);
 
     if (isPeriodMode) {
       const startDateObj = parseYmdToUtcStart(startDate);
@@ -415,7 +506,7 @@ export async function getCategoryBreakdown(req, res, next) {
       ]);
 
       const channelPeriodData = channels.map((c) => {
-        const sid = c._id.toString();
+        const sid = c.id;
         const opening = openingMap.get(sid);
         const closing = closingMap.get(sid) || opening;
         if (!closing || !opening) {
@@ -451,25 +542,31 @@ export async function getCategoryBreakdown(req, res, next) {
       return res.json(result);
     }
 
-    const result = await Channel.aggregate([
-      { $match: channelFilter },
-      {
-        $group: {
-          _id: '$category',
-          count:      { $sum: 1 },
-          totalSubs:  { $sum: '$currentStats.subscribers' },
-          totalViews: { $sum: '$currentStats.views' },
-        },
-      },
-      { $sort: { totalViews: -1 } },
-    ]);
+    // Current-mode: groupBy(category) on the already-filtered channel set.
+    // Aggregating in JS keeps the channelFilter semantics intact (groupBy
+    // would need to repeat them server-side) and avoids the BigInt sum hop.
+    const byCategory = new Map();
+    // Pull currentStats in a second query so we don't bloat the channels payload above.
+    const fullChannels = await prisma.channel.findMany({
+      where: channelFilter,
+      select: { id: true, category: true, currentSubscribers: true, currentViews: true },
+    });
+    for (const c of fullChannels) {
+      const cat = c.category || 'Uncategorized';
+      if (!byCategory.has(cat)) {
+        byCategory.set(cat, { count: 0, totalSubs: 0, totalViews: 0 });
+      }
+      const acc = byCategory.get(cat);
+      acc.count += 1;
+      acc.totalSubs += c.currentSubscribers || 0;
+      acc.totalViews += n(c.currentViews);
+    }
 
-    res.json(result.map((r) => ({
-      category:   r._id || 'Uncategorized',
-      count:      r.count,
-      totalSubs:  r.totalSubs,
-      totalViews: r.totalViews,
-    })));
+    const result = Array.from(byCategory.entries())
+      .map(([category, v]) => ({ category, ...v }))
+      .sort((a, b) => b.totalViews - a.totalViews);
+
+    res.json(result);
   } catch (err) {
     next(err);
   }
@@ -492,13 +589,17 @@ export async function getMicroUnitsReport(req, res, next) {
     let channelIdsWithClassification = null;
     if (classification === 'sadhguru' || classification === 'non_sadhguru') {
       const cls = classification === 'sadhguru' ? 'sadhguru' : 'non sadhguru';
-      const ids = await Video.distinct('channelId', { classification: cls, deletedAt: null });
-      channelIdsWithClassification = new Set(ids.map((i) => i.toString()));
+      const idRows = await prisma.video.findMany({
+        where: { classification: cls, deletedAt: null },
+        select: { channelId: true },
+        distinct: ['channelId'],
+      });
+      channelIdsWithClassification = new Set(idRows.map((r) => r.channelId));
     }
 
-    const microUnits = await MicroUnit.find()
-      .populate('channelIds', 'currentStats')
-      .lean();
+    const microUnits = await prisma.microUnit.findMany({
+      include: { microUnitChannels: { select: { channelId: true } } },
+    });
 
     if (microUnits.length === 0) {
       return res.json([]);
@@ -507,12 +608,10 @@ export async function getMicroUnitsReport(req, res, next) {
     const result = [];
 
     for (const unit of microUnits) {
-      let rawIds = (unit.channelIds || [])
-        .map((c) => (typeof c === 'object' && c?._id ? c._id : c))
-        .filter(Boolean);
+      let rawIds = (unit.microUnitChannels || []).map((mu) => mu.channelId).filter(Boolean);
 
       if (channelIdsWithClassification) {
-        rawIds = rawIds.filter((id) => channelIdsWithClassification.has(id.toString()));
+        rawIds = rawIds.filter((id) => channelIdsWithClassification.has(id));
       }
 
       if (rawIds.length === 0) {
@@ -526,11 +625,11 @@ export async function getMicroUnitsReport(req, res, next) {
         continue;
       }
 
-      const channels = await Channel.find({ _id: { $in: rawIds }, ...channelFilter })
-        .select('_id currentStats')
-        .lean();
-
-      const channelIds = channels.map((c) => c._id);
+      const channels = await prisma.channel.findMany({
+        where: { id: { in: rawIds }, ...channelFilter },
+        select: { id: true, currentSubscribers: true, currentViews: true, currentVideoCount: true },
+      });
+      const channelIds = channels.map((c) => c.id);
 
       if (channelIds.length === 0) {
         result.push({
@@ -558,7 +657,7 @@ export async function getMicroUnitsReport(req, res, next) {
         let totalViews = 0;
         let totalSubs = 0;
         for (const cid of channelIds) {
-          const sid = cid.toString();
+          const sid = cid;
           const opening = openingMap.get(sid);
           const closing = closingMap.get(sid) || opening;
           if (!closing || !opening) continue;
@@ -566,15 +665,15 @@ export async function getMicroUnitsReport(req, res, next) {
           totalSubs += (closing.subscribers ?? 0) - (opening.subscribers ?? 0);
         }
 
-        const videoMatch = {
-          channelId: { $in: channelIds },
+        const videoWhere = {
+          channelId: { in: channelIds },
           deletedAt: null,
-          publishedAt: { $gte: startDateObj, $lte: endDateObj },
+          publishedAt: { gte: startDateObj, lte: endDateObj },
         };
-        if (classification === 'sadhguru') videoMatch.classification = 'sadhguru';
-        else if (classification === 'non_sadhguru') videoMatch.classification = 'non sadhguru';
+        if (classification === 'sadhguru') videoWhere.classification = 'sadhguru';
+        else if (classification === 'non_sadhguru') videoWhere.classification = 'non sadhguru';
 
-        const totalVideos = await Video.countDocuments(videoMatch);
+        const totalVideos = await prisma.video.count({ where: videoWhere });
 
         result.push({
           name: unit.name,
@@ -584,9 +683,9 @@ export async function getMicroUnitsReport(req, res, next) {
           totalVideos,
         });
       } else {
-        const totalSubs = channels.reduce((s, c) => s + (c.currentStats?.subscribers || 0), 0);
-        const totalViews = channels.reduce((s, c) => s + (c.currentStats?.views || 0), 0);
-        const totalVideos = channels.reduce((s, c) => s + (c.currentStats?.videoCount || 0), 0);
+        const totalSubs = channels.reduce((s, c) => s + (c.currentSubscribers || 0), 0);
+        const totalViews = channels.reduce((s, c) => s + n(c.currentViews), 0);
+        const totalVideos = channels.reduce((s, c) => s + (c.currentVideoCount || 0), 0);
 
         result.push({
           name: unit.name,
@@ -617,60 +716,63 @@ export async function getMicroUnitsReport(req, res, next) {
 export async function getChannelMetrics(req, res, next) {
   try {
     const channelFilter = buildChannelFilter(req.query);
-    const channels = await Channel.find(channelFilter)
-      .select('_id title thumbnailUrl currentStats category')
-      .lean();
+    const channels = await prisma.channel.findMany({
+      where: channelFilter,
+      select: {
+        id: true,
+        title: true,
+        thumbnailUrl: true,
+        category: true,
+        currentSubscribers: true,
+        currentViews: true,
+        currentVideoCount: true,
+      },
+    });
 
     if (channels.length === 0) return res.json([]);
 
-    const channelIds = channels.map((c) => c._id);
+    const channelIds = channels.map((c) => c.id);
 
     // --- 1. Video aggregation: engagementEfficiency + loyaltyIndex ---
-    const videoAgg = await Video.aggregate([
-      { $match: { channelId: { $in: channelIds } } },
-      {
-        $group: {
-          _id:           '$channelId',
-          totalViews:    { $sum: '$views'    },
-          totalLikes:    { $sum: '$likes'    },
-          totalComments: { $sum: '$comments' },
+    const videoAgg = await prisma.video.groupBy({
+      by: ['channelId'],
+      where: { channelId: { in: channelIds } },
+      _sum: { views: true, likes: true, comments: true },
+    });
+    const videoMap = new Map(
+      videoAgg.map((v) => [
+        v.channelId,
+        {
+          totalViews: n(v._sum.views),
+          totalLikes: v._sum.likes ?? 0,
+          totalComments: v._sum.comments ?? 0,
         },
-      },
-    ]);
-    const videoMap = new Map(videoAgg.map((v) => [v._id.toString(), v]));
+      ]),
+    );
 
     // --- 2. ChannelSnapshot: subscriber velocity (7-day lookback) ---
     const sevenDaysAgo = utcStartOfDay(Date.now() - 7 * 24 * 60 * 60 * 1000);
 
-    // For each channel get the most recent snapshot on or before 7 days ago
-    const snapAgg = await ChannelSnapshot.aggregate([
-      {
-        $match: {
-          channelId: { $in: channelIds },
-          deletedAt: null,
-          date: { $lte: sevenDaysAgo },
-        },
-      },
-      { $sort: { date: -1 } },
-      {
-        $group: {
-          _id:        '$channelId',
-          subscribers: { $first: '$subscribers' },
-        },
-      },
-    ]);
-    const snapMap = new Map(snapAgg.map((s) => [s._id.toString(), s.subscribers]));
+    // Latest snapshot per channel on or before 7 days ago.
+    const snapRows = await prisma.$queryRaw(Prisma.sql`
+      SELECT DISTINCT ON (channel_id) channel_id, subscribers
+      FROM channel_snapshots
+      WHERE channel_id IN (${Prisma.join(channelIds)})
+        AND deleted_at IS NULL
+        AND date <= ${sevenDaysAgo}
+      ORDER BY channel_id, date DESC
+    `);
+    const snapMap = new Map(snapRows.map((s) => [s.channel_id, s.subscribers]));
 
-    // --- 3. Compose result ---
     const result = channels.map((ch) => {
-      const vid = videoMap.get(ch._id.toString());
-      const subs7dAgo = snapMap.get(ch._id.toString()) ?? null;
-      const currentSubs = ch.currentStats?.subscribers ?? 0;
-      const currentViews = ch.currentStats?.views ?? 0;
-      const videoCount = ch.currentStats?.videoCount ?? 0;
+      const vid = videoMap.get(ch.id);
+      const subs7dAgo = snapMap.get(ch.id) ?? null;
+      const currentSubs = ch.currentSubscribers ?? 0;
+      const currentViews = n(ch.currentViews);
+      const videoCount = ch.currentVideoCount ?? 0;
 
-      const totalViews    = vid?.totalViews    ?? 0;
-      const totalLikes    = vid?.totalLikes    ?? 0;
+      const totalViews = vid?.totalViews ?? 0;
+      const totalLikes = vid?.totalLikes ?? 0;
       const totalComments = vid?.totalComments ?? 0;
 
       const engagementEfficiency =
@@ -681,18 +783,15 @@ export async function getChannelMetrics(req, res, next) {
           ? ((currentSubs - subs7dAgo) / subs7dAgo) * 100
           : null;
 
-      const contentImpact =
-        videoCount > 0 ? currentViews / videoCount : null;
-
-      const loyaltyIndex =
-        totalViews > 0 ? totalComments / totalViews : null;
+      const contentImpact = videoCount > 0 ? currentViews / videoCount : null;
+      const loyaltyIndex = totalViews > 0 ? totalComments / totalViews : null;
 
       return {
-        channelId:            ch._id,
-        title:                ch.title,
-        thumbnailUrl:         ch.thumbnailUrl,
-        category:             ch.category,
-        subscribers:          currentSubs,
+        channelId: ch.id,
+        title: ch.title,
+        thumbnailUrl: ch.thumbnailUrl,
+        category: ch.category,
+        subscribers: currentSubs,
         engagementEfficiency,
         subscriberVelocity,
         contentImpact,
@@ -710,30 +809,28 @@ export async function getPublishingFrequency(req, res, next) {
   try {
     const { period = '30d' } = req.query;
     const channelFilter = buildChannelFilter(req.query);
-    const channels = await Channel.find(channelFilter).select('_id');
-    const channelIds = channels.map((c) => c._id);
+    const channels = await prisma.channel.findMany({
+      where: channelFilter,
+      select: { id: true },
+    });
+    const channelIds = channels.map((c) => c.id);
 
     const { start, end } = getDateRange(period, req.query);
 
-    const data = await Video.aggregate([
-      {
-        $match: {
-          channelId: { $in: channelIds },
-          publishedAt: { $gte: start, $lte: end },
-        },
-      },
-      {
-        $group: {
-          _id: {
-            $dateToString: { format: '%Y-%m-%d', date: '$publishedAt' },
-          },
-          count: { $sum: 1 },
-        },
-      },
-      { $sort: { _id: 1 } },
-    ]);
+    if (channelIds.length === 0) return res.json([]);
 
-    res.json(data.map((d) => ({ date: d._id, count: d.count })));
+    const rows = await prisma.$queryRaw(Prisma.sql`
+      SELECT TO_CHAR(published_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS day,
+             COUNT(*)::bigint AS count
+      FROM videos
+      WHERE channel_id IN (${Prisma.join(channelIds)})
+        AND published_at >= ${start}
+        AND published_at <= ${end}
+      GROUP BY day
+      ORDER BY day ASC
+    `);
+
+    res.json(rows.map((d) => ({ date: d.day, count: n(d.count) })));
   } catch (err) {
     next(err);
   }
@@ -744,11 +841,6 @@ export async function getPublishingFrequency(req, res, next) {
  * Returns counts and (optionally) views growth + top-10 channels per grade
  * bucket (A, B, C, D, E, Inactive), scoped by group (ihi | dedicated | both).
  *
- * Query params:
- *   group     '' | 'ihi' | 'dedicated'  — default '' = combine both
- *   startDate YYYY-MM-DD                — both required for rows 2 & 3
- *   endDate   YYYY-MM-DD
- *
  * Spec: docs/superpowers/specs/2026-05-06-grade-grid-dashboard-design.md
  */
 export async function getGradeGrid(req, res, next) {
@@ -756,23 +848,28 @@ export async function getGradeGrid(req, res, next) {
     const { group = '', startDate, endDate } = req.query;
 
     // ---- 1. Resolve channel set scoped by group ----
-    const channelFilter = { status: { $ne: 'archived' } };
+    const channelFilter = { status: { not: 'archived' }, deletedAt: null };
     if (group === 'dedicated') {
-      channelFilter.category = { $regex: /^Dedicated/i };
+      channelFilter.category = { startsWith: 'Dedicated', mode: 'insensitive' };
     } else if (group === 'ihi') {
-      // Mirrors the existing /^IHI/i style in dashboardController.js.
-      // Current data only has "IHI - …" and "Dedicated - …" categories, so
-      // /IHI/i never matches a Dedicated row. The JS-side `isIhi(cat)` below
-      // performs the formal "contains IHI AND not Dedicated" disambiguation
-      // when bucketing, so the Mongo filter doesn't need to.
-      channelFilter.category = { $regex: /IHI/i };
+      // /IHI/i — the JS-side isIhi() below performs the formal disambiguation.
+      channelFilter.category = { contains: 'IHI', mode: 'insensitive' };
     } else {
-      channelFilter.category = { $regex: /^(Dedicated|IHI)\s*-/i };
+      // Default: matches /^(Dedicated|IHI)\s*-/i — Prisma has no regex, so we
+      // OR two startsWith filters with a literal " -" suffix check in the
+      // bucket loop. Postgres' StringFilter supports startsWith, so we accept
+      // any channel whose category starts with "Dedicated" or "IHI" and rely
+      // on bucketOf to reject ones without the proper " - …" suffix.
+      channelFilter.OR = [
+        { category: { startsWith: 'Dedicated', mode: 'insensitive' } },
+        { category: { startsWith: 'IHI', mode: 'insensitive' } },
+      ];
     }
 
-    const channels = await Channel.find(channelFilter).select(
-      '_id title thumbnailUrl category'
-    );
+    const channels = await prisma.channel.findMany({
+      where: channelFilter,
+      select: { id: true, title: true, thumbnailUrl: true, category: true },
+    });
 
     // ---- 2. Bucket each channel by category suffix ----
     const BUCKETS = ['A', 'B', 'C', 'D', 'E', 'Inactive'];
@@ -806,24 +903,16 @@ export async function getGradeGrid(req, res, next) {
       const end = parseYmdToUtcEnd(endDate);
 
       if (start > end) {
-        // Invalid range: leave rows 2 & 3 as null (matches spec).
         return res.json({ row1, row2, row3 });
       }
 
-      // Split channel ids so IHI gets a sadhguru-only video filter and
-      // Dedicated counts every video on the channel.
       const ihiChannelIds = [];
       const dedChannelIds = [];
       for (const ch of channels) {
-        if (isIhi(ch.category)) ihiChannelIds.push(ch._id);
-        else dedChannelIds.push(ch._id);
+        if (isIhi(ch.category)) ihiChannelIds.push(ch.id);
+        else dedChannelIds.push(ch.id);
       }
 
-      // Both Dedicated and IHI now use VideoSnapshot deltas so this matches
-      // the Channel Report and Category Report. IHI is still narrowed to
-      // sadhguru-classified videos (per the IHI definition); Dedicated counts
-      // all videos (channel-wide) since dedicated channels classify every
-      // video as sadhguru anyway.
       const [dedTotalsMap, ihiTotalsMap] = await Promise.all([
         getVideoSnapshotPeriodViewsByChannel(dedChannelIds, start, end, null),
         getVideoSnapshotPeriodViewsByChannel(ihiChannelIds, start, end, 'sadhguru'),
@@ -831,21 +920,20 @@ export async function getGradeGrid(req, res, next) {
 
       const growthByChannel = new Map();
       for (const ch of channels) {
-        const idStr = ch._id.toString();
         const g = isIhi(ch.category)
-          ? ihiTotalsMap.get(idStr) || 0
-          : dedTotalsMap.get(idStr) || 0;
-        growthByChannel.set(idStr, g);
+          ? ihiTotalsMap.get(ch.id) || 0
+          : dedTotalsMap.get(ch.id) || 0;
+        growthByChannel.set(ch.id, g);
       }
 
       row2 = {};
       row3 = {};
       for (const b of BUCKETS) {
         const inBucket = channelsByBucket[b].map((ch) => ({
-          channelId: ch._id,
+          channelId: ch.id,
           title: ch.title || 'Unknown',
           thumbnailUrl: ch.thumbnailUrl || '',
-          viewsGrowth: growthByChannel.get(ch._id.toString()) || 0,
+          viewsGrowth: growthByChannel.get(ch.id) || 0,
         }));
         inBucket.sort((a, b) => b.viewsGrowth - a.viewsGrowth);
         row2[b] = inBucket.slice(0, 10);
@@ -861,7 +949,7 @@ export async function getGradeGrid(req, res, next) {
 
 export async function getLayout(req, res, next) {
   try {
-    const doc = await DashboardLayout.findOne();
+    const doc = await prisma.dashboardLayout.findFirst();
     res.json(doc ? { layouts: doc.layouts, updatedBy: doc.updatedBy } : { layouts: {}, updatedBy: '' });
   } catch (err) {
     next(err);
@@ -874,11 +962,14 @@ export async function saveLayout(req, res, next) {
     if (!layouts || typeof layouts !== 'object') {
       return res.status(400).json({ message: 'layouts object is required' });
     }
-    const doc = await DashboardLayout.findOneAndUpdate(
-      {},
-      { layouts, updatedBy: req.user.username || req.user.email || 'unknown' },
-      { upsert: true, new: true }
-    );
+    // No `username` on the Prisma User; the legacy fallback chain reduces to
+    // `email || 'unknown'` here.
+    const updatedBy = req.user?.username || req.user?.email || 'unknown';
+    const doc = await prisma.dashboardLayout.upsert({
+      where: { id: 'layout' },
+      update: { layouts, updatedBy },
+      create: { id: 'layout', layouts, updatedBy },
+    });
     res.json({ layouts: doc.layouts, updatedBy: doc.updatedBy });
   } catch (err) {
     next(err);

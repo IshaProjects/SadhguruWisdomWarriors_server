@@ -1,4 +1,4 @@
-import RbacConfig from '../models/RbacConfig.js';
+import { prisma } from '../config/prisma.js';
 
 /**
  * Default RBAC seed – used when no config exists yet.
@@ -32,39 +32,40 @@ const DEFAULT_ACTIONS = [
   { key: 'queue.process',       label: 'Process Ingest Queue',     roles: { admin: true, manager: false, viewer: false } },
 ];
 
+const SINGLETON_ID = 'rbac';
+
 /**
  * GET  /api/rbac
  * Returns the current RBAC config. Creates a default one if none exists.
  */
 export async function getRbacConfig(req, res, next) {
   try {
-    let config = await RbacConfig.findOne({ _singletonKey: 'rbac' });
+    let config = await prisma.rbacConfig.findUnique({ where: { id: SINGLETON_ID } });
 
     if (!config) {
-      config = await RbacConfig.create({
-        _singletonKey: 'rbac',
-        pages: DEFAULT_PAGES,
-        actions: DEFAULT_ACTIONS,
+      config = await prisma.rbacConfig.create({
+        data: {
+          id: SINGLETON_ID,
+          pages: DEFAULT_PAGES,
+          actions: DEFAULT_ACTIONS,
+        },
       });
     } else {
       // Merge any new default keys that don't exist in the stored config yet
-      const existingPageKeys   = new Set(config.pages.map((p) => p.key));
-      const existingActionKeys = new Set(config.actions.map((a) => a.key));
+      const existingPageKeys   = new Set((config.pages   || []).map((p) => p.key));
+      const existingActionKeys = new Set((config.actions || []).map((a) => a.key));
 
       const missingPages   = DEFAULT_PAGES.filter((p) => !existingPageKeys.has(p.key));
       const missingActions = DEFAULT_ACTIONS.filter((a) => !existingActionKeys.has(a.key));
 
       if (missingPages.length || missingActions.length) {
-        config = await RbacConfig.findOneAndUpdate(
-          { _singletonKey: 'rbac' },
-          {
-            $push: {
-              ...(missingPages.length   && { pages:   { $each: missingPages   } }),
-              ...(missingActions.length && { actions: { $each: missingActions } }),
-            },
+        config = await prisma.rbacConfig.update({
+          where: { id: SINGLETON_ID },
+          data: {
+            pages:   [...(config.pages   || []), ...missingPages],
+            actions: [...(config.actions || []), ...missingActions],
           },
-          { new: true }
-        );
+        });
       }
     }
 
@@ -103,11 +104,14 @@ export async function updateRbacConfig(req, res, next) {
         roles: { ...entry.roles, admin: true },
       }));
 
-    const config = await RbacConfig.findOneAndUpdate(
-      { _singletonKey: 'rbac' },
-      { pages: ensureAdmin(pages), actions: ensureAdmin(actions) },
-      { new: true, upsert: true }
-    );
+    const safePages = ensureAdmin(pages);
+    const safeActions = ensureAdmin(actions);
+
+    const config = await prisma.rbacConfig.upsert({
+      where: { id: SINGLETON_ID },
+      update: { pages: safePages, actions: safeActions },
+      create: { id: SINGLETON_ID, pages: safePages, actions: safeActions },
+    });
 
     res.json({ pages: config.pages, actions: config.actions, updatedAt: config.updatedAt });
   } catch (err) {

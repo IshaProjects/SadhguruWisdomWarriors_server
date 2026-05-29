@@ -1,6 +1,5 @@
-import mongoose from 'mongoose';
-import VideoSnapshot from '../models/VideoSnapshot.js';
-import Video from '../models/Video.js';
+import { Prisma } from '@prisma/client';
+import { prisma } from '../config/prisma.js';
 import {
   parseYmdToUtcEnd,
   parseYmdToUtcStart,
@@ -24,15 +23,18 @@ export async function getVideoSnapshots(req, res, next) {
       ? parseYmdToUtcStart(startDate)
       : utcStartOfDay(Date.now() - 90 * 24 * 60 * 60 * 1000);
 
-    const snapshots = await VideoSnapshot.find({
-      videoId,
-      date: { $gte: start, $lte: end },
-      deletedAt: null,
-    })
-      .sort({ date: 1 })
-      .lean();
+    const snapshots = await prisma.videoSnapshot.findMany({
+      where: {
+        videoId,
+        date: { gte: start, lte: end },
+        deletedAt: null,
+      },
+      orderBy: { date: 'asc' },
+    });
 
-    res.json(snapshots);
+    // BigInt views serialise as plain numbers (Mongo used plain Number) so
+    // the wire shape matches the legacy JSON.
+    res.json(snapshots.map(serialiseSnapshot));
   } catch (err) {
     next(err);
   }
@@ -54,81 +56,119 @@ export async function getChannelVideoTrends(req, res, next) {
       ? parseYmdToUtcStart(startDate)
       : utcStartOfDay(Date.now() - 30 * 24 * 60 * 60 * 1000);
 
-    // 1. Daily aggregated trend across all videos in the channel
-    const dailyTrend = await VideoSnapshot.aggregate([
-      {
-        $match: {
-          channelId: new mongoose.Types.ObjectId(channelId),
-          date: { $gte: start, $lte: end },
-          deletedAt: null,
-        },
-      },
-      {
-        $group: {
-          _id: { $dateToString: { format: '%Y-%m-%d', date: '$date' } },
-          totalViews:    { $sum: '$views' },
-          totalLikes:    { $sum: '$likes' },
-          totalComments: { $sum: '$comments' },
-          videoCount:    { $sum: 1 },
-        },
-      },
-      { $sort: { _id: 1 } },
-    ]);
+    // 1. Daily aggregated trend across all videos in the channel.
+    //    Mongo's $dateToString('%Y-%m-%d', $date) is replicated with
+    //    to_char(date, 'YYYY-MM-DD') in Postgres.
+    const dailyRows = await prisma.$queryRaw(Prisma.sql`
+      SELECT
+        to_char(date AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS date,
+        COALESCE(SUM(views), 0)::bigint    AS total_views,
+        COALESCE(SUM(likes), 0)::bigint    AS total_likes,
+        COALESCE(SUM(comments), 0)::bigint AS total_comments,
+        COUNT(*)::bigint                   AS video_count
+      FROM video_snapshots
+      WHERE channel_id = ${channelId}
+        AND date >= ${start}
+        AND date <= ${end}
+        AND deleted_at IS NULL
+      GROUP BY 1
+      ORDER BY 1 ASC
+    `);
 
-    // 2. Top videos by total views in the period (with trend per video)
-    const videoTrends = await VideoSnapshot.aggregate([
-      {
-        $match: {
-          channelId: new mongoose.Types.ObjectId(channelId),
-          date: { $gte: start, $lte: end },
-          deletedAt: null,
-        },
-      },
-      {
-        $group: {
-          _id: '$videoId',
-          totalViews:    { $sum: '$views' },
-          totalLikes:    { $sum: '$likes' },
-          totalComments: { $sum: '$comments' },
-          firstViews:    { $first: '$views' },
-          lastViews:     { $last: '$views' },
-          dataPoints:    { $push: { date: '$date', views: '$views', likes: '$likes', comments: '$comments' } },
-        },
-      },
-      { $sort: { totalViews: -1 } },
-      { $limit: 10 },
-    ]);
+    const dailyTrend = dailyRows.map((r) => ({
+      date: r.date,
+      views: Number(r.total_views),
+      likes: Number(r.total_likes),
+      comments: Number(r.total_comments),
+      videoCount: Number(r.video_count),
+    }));
 
-    // Populate video metadata
-    const videoIds = videoTrends.map((v) => v._id);
-    const videos = await Video.find({ _id: { $in: videoIds }, deletedAt: null }).select('title thumbnailUrl youtubeVideoId publishedAt');
-    const videoMap = new Map(videos.map((v) => [v._id.toString(), v]));
+    // 2. Top videos by total views in the period, with raw data points to
+    //    rebuild the trend client-side. Mongo's $first/$last on an unsorted
+    //    $group is implementation-defined; here we compute first/last
+    //    against the *date* ordering explicitly so the result is stable.
+    const videoIdRows = await prisma.$queryRaw(Prisma.sql`
+      SELECT
+        video_id,
+        COALESCE(SUM(views), 0)::bigint    AS total_views,
+        COALESCE(SUM(likes), 0)::bigint    AS total_likes,
+        COALESCE(SUM(comments), 0)::bigint AS total_comments
+      FROM video_snapshots
+      WHERE channel_id = ${channelId}
+        AND date >= ${start}
+        AND date <= ${end}
+        AND deleted_at IS NULL
+      GROUP BY video_id
+      ORDER BY total_views DESC
+      LIMIT 10
+    `);
 
-    const enriched = videoTrends.map((v) => ({
-      ...v,
-      video: videoMap.get(v._id.toString()) || null,
-      viewsGrowth: v.lastViews - v.firstViews,
-      dataPoints: v.dataPoints
-        .sort((a, b) => new Date(a.date) - new Date(b.date))
-        .map((d) => ({
+    const topVideoIds = videoIdRows.map((r) => r.video_id);
+
+    // Empty-fast-path: nothing in range.
+    if (topVideoIds.length === 0) {
+      return res.json({ dailyTrend, topVideos: [] });
+    }
+
+    // Pull all snapshots for the top videos (so dataPoints can be ordered &
+    // first/last views computed in JS — mirrors $push of an unordered array
+    // that the legacy code then sorted in JS).
+    const snapshotRows = await prisma.videoSnapshot.findMany({
+      where: {
+        videoId: { in: topVideoIds },
+        date: { gte: start, lte: end },
+        deletedAt: null,
+      },
+      orderBy: { date: 'asc' },
+      select: { videoId: true, date: true, views: true, likes: true, comments: true },
+    });
+
+    const byVideo = new Map();
+    for (const id of topVideoIds) byVideo.set(id, []);
+    for (const s of snapshotRows) {
+      byVideo.get(s.videoId)?.push(s);
+    }
+
+    // Video metadata (soft-deleted videos surface as null per the original).
+    const videos = await prisma.video.findMany({
+      where: { id: { in: topVideoIds }, deletedAt: null },
+      select: { id: true, title: true, thumbnailUrl: true, youtubeVideoId: true, publishedAt: true },
+    });
+    const videoMap = new Map(videos.map((v) => [v.id, { ...v, _id: v.id }]));
+
+    const enriched = videoIdRows.map((r) => {
+      const points = byVideo.get(r.video_id) || [];
+      const firstViews = points.length ? Number(points[0].views) : 0;
+      const lastViews  = points.length ? Number(points[points.length - 1].views) : 0;
+      return {
+        _id: r.video_id,
+        totalViews: Number(r.total_views),
+        totalLikes: Number(r.total_likes),
+        totalComments: Number(r.total_comments),
+        firstViews,
+        lastViews,
+        video: videoMap.get(r.video_id) || null,
+        viewsGrowth: lastViews - firstViews,
+        dataPoints: points.map((d) => ({
           date: utcDateString(d.date),
-          views: d.views,
+          views: Number(d.views),
           likes: d.likes,
           comments: d.comments,
         })),
-    }));
-
-    res.json({
-      dailyTrend: dailyTrend.map((d) => ({
-        date:          d._id,
-        views:         d.totalViews,
-        likes:         d.totalLikes,
-        comments:      d.totalComments,
-        videoCount:    d.videoCount,
-      })),
-      topVideos: enriched,
+      };
     });
+
+    res.json({ dailyTrend, topVideos: enriched });
   } catch (err) {
     next(err);
   }
+}
+
+/** Convert BigInt fields on a snapshot to plain numbers for JSON. */
+function serialiseSnapshot(s) {
+  return {
+    ...s,
+    _id: s.id,
+    views: typeof s.views === 'bigint' ? Number(s.views) : s.views,
+  };
 }

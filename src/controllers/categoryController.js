@@ -1,13 +1,12 @@
-import Category from '../models/Category.js';
-import Channel from '../models/Channel.js';
+import { prisma } from '../config/prisma.js';
 
 /** Ensure the built-in 'Uncategorized' entry always exists */
 async function seedUncategorized() {
-  await Category.updateOne(
-    { name: 'Uncategorized' },
-    { $setOnInsert: { name: 'Uncategorized' } },
-    { upsert: true }
-  );
+  await prisma.category.upsert({
+    where: { name: 'Uncategorized' },
+    update: {},
+    create: { name: 'Uncategorized' },
+  });
 }
 
 /** GET /api/categories — return all categories with channel counts */
@@ -15,27 +14,31 @@ export async function listCategories(req, res, next) {
   try {
     await seedUncategorized();
 
-    // Get channel counts per category (exclude archived to match list/dashboard semantics).
-    const counts = await Channel.aggregate([
-      { $match: { deletedAt: null, status: { $ne: 'archived' } } },
-      { $group: { _id: '$category', count: { $sum: 1 } } },
-    ]);
+    // Channel counts per category (exclude archived to match list/dashboard semantics).
+    const counts = await prisma.channel.groupBy({
+      by: ['category'],
+      where: { deletedAt: null, status: { not: 'archived' } },
+      _count: { _all: true },
+    });
     const countMap = {};
-    counts.forEach((c) => { countMap[c._id] = c.count; });
+    for (const c of counts) countMap[c.category] = c._count._all;
 
-    const cats = await Category.find().sort({ name: 1 });
+    const cats = await prisma.category.findMany({ orderBy: { name: 'asc' } });
 
-    // Any category used by channels but not in the Category collection → auto-register it
+    // Any category used by channels but not in the categories table → auto-register it.
     const existingNames = new Set(cats.map((c) => c.name));
     const missing = counts
-      .map((c) => c._id)
+      .map((c) => c.category)
       .filter((n) => n && !existingNames.has(n));
     if (missing.length) {
-      await Category.insertMany(missing.map((n) => ({ name: n })), { ordered: false }).catch(() => {});
-      missing.forEach((n) => existingNames.add(n));
+      await prisma.category.createMany({
+        data: missing.map((n) => ({ name: n })),
+        skipDuplicates: true,
+      });
+      for (const n of missing) existingNames.add(n);
     }
 
-    const allCats = await Category.find().sort({ name: 1 });
+    const allCats = await prisma.category.findMany({ orderBy: { name: 'asc' } });
     res.json(allCats.map((c) => ({ name: c.name, count: countMap[c.name] || 0 })));
   } catch (err) {
     next(err);
@@ -49,13 +52,13 @@ export async function createCategory(req, res, next) {
     if (!name?.trim()) return res.status(400).json({ message: 'Category name is required' });
     const trimmed = name.trim();
 
-    const existing = await Category.findOne({ name: trimmed });
+    const existing = await prisma.category.findUnique({ where: { name: trimmed } });
     if (existing) return res.status(409).json({ message: 'Category already exists' });
 
-    const cat = await Category.create({ name: trimmed });
+    const cat = await prisma.category.create({ data: { name: trimmed } });
     res.status(201).json({ name: cat.name, count: 0 });
   } catch (err) {
-    if (err.code === 11000) {
+    if (err.code === 'P2002') {
       return res.status(409).json({ message: 'Category already exists' });
     }
     next(err);
@@ -72,19 +75,20 @@ export async function renameCategory(req, res, next) {
 
     if (oldName === trimmed) return res.status(400).json({ message: 'New name must differ from current name' });
 
-    // Update the Category document
-    const cat = await Category.findOneAndUpdate({ name: oldName }, { name: trimmed }, { new: true });
-    if (!cat) return res.status(404).json({ message: 'Category not found' });
+    // Update the Category row (404 if missing).
+    const existing = await prisma.category.findUnique({ where: { name: oldName } });
+    if (!existing) return res.status(404).json({ message: 'Category not found' });
+    await prisma.category.update({ where: { name: oldName }, data: { name: trimmed } });
 
-    // Bulk-update all channels using the old name
-    const { modifiedCount } = await Channel.updateMany(
-      { category: oldName },
-      { $set: { category: trimmed } }
-    );
+    // Bulk-rebind every channel that referenced the old name.
+    const { count } = await prisma.channel.updateMany({
+      where: { category: oldName },
+      data: { category: trimmed },
+    });
 
-    res.json({ oldName, newName: trimmed, channelsUpdated: modifiedCount });
+    res.json({ oldName, newName: trimmed, channelsUpdated: count });
   } catch (err) {
-    if (err.code === 11000) {
+    if (err.code === 'P2002') {
       return res.status(409).json({ message: 'A category with that name already exists' });
     }
     next(err);
@@ -99,15 +103,16 @@ export async function deleteCategory(req, res, next) {
       return res.status(400).json({ message: 'Cannot delete the Uncategorized category' });
     }
 
-    const cat = await Category.findOneAndDelete({ name });
-    if (!cat) return res.status(404).json({ message: 'Category not found' });
+    const existing = await prisma.category.findUnique({ where: { name } });
+    if (!existing) return res.status(404).json({ message: 'Category not found' });
+    await prisma.category.delete({ where: { name } });
 
-    const { modifiedCount } = await Channel.updateMany(
-      { category: name },
-      { $set: { category: 'Uncategorized' } }
-    );
+    const { count } = await prisma.channel.updateMany({
+      where: { category: name },
+      data: { category: 'Uncategorized' },
+    });
 
-    res.json({ deleted: name, channelsReassigned: modifiedCount });
+    res.json({ deleted: name, channelsReassigned: count });
   } catch (err) {
     next(err);
   }

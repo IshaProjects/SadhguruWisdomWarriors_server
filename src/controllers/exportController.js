@@ -1,8 +1,7 @@
 import { Parser } from '@json2csv/plainjs';
 import ExcelJS from 'exceljs';
-import mongoose from 'mongoose';
-import Channel from '../models/Channel.js';
-import Video from '../models/Video.js';
+import { Prisma } from '@prisma/client';
+import { prisma } from '../config/prisma.js';
 import {
   parseYmdToUtcEnd,
   parseYmdToUtcStart,
@@ -15,143 +14,181 @@ import { getVideoSnapshotPeriodViewsByChannel } from '../utils/videoSnapshotPeri
    Helpers
 ───────────────────────────────────────────────────────────────────── */
 
+/** BigInt-safe coercion to plain JS number. */
+function asNumber(value) {
+  if (value === null || value === undefined) return 0;
+  if (typeof value === 'bigint') return Number(value);
+  return Number(value) || 0;
+}
+
 function buildChannelFilter(query) {
-  const { search, category, status, tags, minSubs, maxSubs, minViews, maxViews, country, startDate, endDate } = query;
+  const {
+    search,
+    category,
+    status,
+    tags,
+    minSubs,
+    maxSubs,
+    minViews,
+    maxViews,
+    country,
+    startDate,
+    endDate,
+  } = query;
+
   // Default: exclude archived channels (matches dashboard + listChannels behavior).
   // Caller can opt back in by passing ?status=archived explicitly.
-  const filter = { status: { $ne: 'archived' } };
+  // Also exclude soft-deleted rows.
+  const where = { deletedAt: null, status: { not: 'archived' } };
 
   if (search) {
-    filter.$or = [
-      { title: { $regex: search, $options: 'i' } },
-      { youtubeChannelId: { $regex: search, $options: 'i' } },
-      { customUrl: { $regex: search, $options: 'i' } },
+    where.OR = [
+      { title:            { contains: search, mode: 'insensitive' } },
+      { youtubeChannelId: { contains: search, mode: 'insensitive' } },
+      { customUrl:        { contains: search, mode: 'insensitive' } },
     ];
   }
-  if (category) filter.category = category;
-  if (status)   filter.status   = status;
-  if (country)  filter.country  = { $regex: country, $options: 'i' };
+  if (category) where.category = category;
+  if (status)   where.status   = status;
+  if (country)  where.country  = { contains: country, mode: 'insensitive' };
 
   if (tags && tags.trim()) {
     const tagList = tags.split(',').map((t) => t.trim()).filter(Boolean);
-    if (tagList.length) filter.tags = { $in: tagList };
+    if (tagList.length) where.tags = { hasSome: tagList };
   }
   if (minSubs || maxSubs) {
-    filter['currentStats.subscribers'] = {};
-    if (minSubs) filter['currentStats.subscribers'].$gte = parseInt(minSubs);
-    if (maxSubs) filter['currentStats.subscribers'].$lte = parseInt(maxSubs);
+    where.currentSubscribers = {};
+    if (minSubs) where.currentSubscribers.gte = parseInt(minSubs);
+    if (maxSubs) where.currentSubscribers.lte = parseInt(maxSubs);
   }
   if (minViews || maxViews) {
-    filter['currentStats.views'] = {};
-    if (minViews) filter['currentStats.views'].$gte = parseInt(minViews);
-    if (maxViews) filter['currentStats.views'].$lte = parseInt(maxViews);
+    where.currentViews = {};
+    if (minViews) where.currentViews.gte = BigInt(parseInt(minViews));
+    if (maxViews) where.currentViews.lte = BigInt(parseInt(maxViews));
   }
   // Date range: when BOTH dates provided → period metrics mode (no lastSyncedAt filter).
   // When only one date → filter by lastSyncedAt.
   if (startDate && endDate) {
     // Period mode: dates used for snapshot delta, not for filtering
   } else if (startDate || endDate) {
-    filter.lastSyncedAt = {};
-    if (startDate) filter.lastSyncedAt.$gte = parseYmdToUtcStart(startDate);
-    if (endDate)   filter.lastSyncedAt.$lte = parseYmdToUtcEnd(endDate);
+    where.lastSyncedAt = {};
+    if (startDate) where.lastSyncedAt.gte = parseYmdToUtcStart(startDate);
+    if (endDate)   where.lastSyncedAt.lte = parseYmdToUtcEnd(endDate);
   }
-  return filter;
+  return where;
 }
 
 function buildVideoFilter(query) {
-  const { search, channelId, category, tags, status, classification, minViews, maxViews, startDate, endDate, hashtags } = query;
+  const {
+    search,
+    channelId,
+    category,
+    tags,
+    status,
+    classification,
+    minViews,
+    maxViews,
+    startDate,
+    endDate,
+    hashtags,
+  } = query;
+
   // Default: video reports exclude videos whose channel is archived.
   // Caller can opt back in by passing ?status=archived explicitly.
-  const channelFilter = { status: { $ne: 'archived' } };
-  const videoFilter   = {};
+  // Channel-level filters resolve to a channelId list later.
+  const channelWhere = { deletedAt: null, status: { not: 'archived' } };
+  const videoWhere   = {};
 
-  if (category) channelFilter.category = category;
-  if (status)   channelFilter.status   = status;
+  if (category) channelWhere.category = category;
+  if (status)   channelWhere.status   = status;
   if (classification) {
-    if (classification === 'sadhguru') videoFilter.classification = 'sadhguru';
-    else if (classification === 'non_sadhguru') videoFilter.classification = 'non sadhguru';
+    if (classification === 'sadhguru') videoWhere.classification = 'sadhguru';
+    else if (classification === 'non_sadhguru') videoWhere.classification = 'non sadhguru';
   }
   if (tags && tags.trim()) {
     const tagList = tags.split(',').map((t) => t.trim()).filter(Boolean);
-    if (tagList.length) channelFilter.tags = { $in: tagList };
+    if (tagList.length) channelWhere.tags = { hasSome: tagList };
   }
 
   if (channelId) {
-    videoFilter.channelId = mongoose.isValidObjectId(channelId)
-      ? mongoose.Types.ObjectId.createFromHexString(channelId)
-      : channelId;
+    // Prisma channelId is a plain string FK — pass through verbatim.
+    videoWhere.channelId = channelId;
   }
 
   const orConditions = [];
-
   if (search) {
     orConditions.push(
-      { title:          { $regex: search, $options: 'i' } },
-      { youtubeVideoId: { $regex: search, $options: 'i' } },
+      { title:          { contains: search, mode: 'insensitive' } },
+      { youtubeVideoId: { contains: search, mode: 'insensitive' } },
     );
   }
 
   if (hashtags && hashtags.trim()) {
-    const keywords = hashtags.split(',').map((k) => k.trim().replace(/^#/, '')).filter(Boolean);
+    const keywords = hashtags
+      .split(',')
+      .map((k) => k.trim().replace(/^#/, ''))
+      .filter(Boolean);
     if (keywords.length) {
-      const hashtagPatterns = keywords.map((kw) => {
-        const escaped = kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        return { $regex: `#${escaped}`, $options: 'i' };
-      });
       const hashtagOr = [];
-      for (const pattern of hashtagPatterns) {
-        hashtagOr.push({ title: pattern }, { description: pattern });
+      for (const kw of keywords) {
+        const needle = `#${kw}`;
+        hashtagOr.push(
+          { title:       { contains: needle, mode: 'insensitive' } },
+          { description: { contains: needle, mode: 'insensitive' } },
+        );
       }
       if (search) {
-        videoFilter.$and = [
-          { $or: orConditions },
-          { $or: hashtagOr },
+        videoWhere.AND = [
+          { OR: orConditions },
+          { OR: hashtagOr },
         ];
       } else {
-        videoFilter.$or = hashtagOr;
+        videoWhere.OR = hashtagOr;
       }
     } else if (orConditions.length) {
-      videoFilter.$or = orConditions;
+      videoWhere.OR = orConditions;
     }
   } else if (orConditions.length) {
-    videoFilter.$or = orConditions;
+    videoWhere.OR = orConditions;
   }
 
   if (minViews || maxViews) {
-    videoFilter.views = {};
-    if (minViews) videoFilter.views.$gte = parseInt(minViews);
-    if (maxViews) videoFilter.views.$lte = parseInt(maxViews);
+    videoWhere.views = {};
+    if (minViews) videoWhere.views.gte = BigInt(parseInt(minViews));
+    if (maxViews) videoWhere.views.lte = BigInt(parseInt(maxViews));
   }
   if (startDate || endDate) {
-    videoFilter.publishedAt = {};
-    if (startDate) videoFilter.publishedAt.$gte = parseYmdToUtcStart(startDate);
-    if (endDate)   videoFilter.publishedAt.$lte = parseYmdToUtcEnd(endDate);
+    videoWhere.publishedAt = {};
+    if (startDate) videoWhere.publishedAt.gte = parseYmdToUtcStart(startDate);
+    if (endDate)   videoWhere.publishedAt.lte = parseYmdToUtcEnd(endDate);
   }
 
-  return { channelFilter, videoFilter };
+  return { channelWhere, videoWhere };
 }
 
 async function getClassificationCountsByChannel(channelIds, options = {}) {
   if (!channelIds?.length) return new Map();
   const { startDate, endDate } = options;
-  const match = { channelId: { $in: channelIds }, deletedAt: null };
+  // Group by (channelId, classification) → count.
+  const where = { channelId: { in: channelIds }, deletedAt: null };
   if (startDate && endDate) {
-    match.publishedAt = {
-      $gte: parseYmdToUtcStart(startDate),
-      $lte: parseYmdToUtcEnd(endDate),
+    where.publishedAt = {
+      gte: parseYmdToUtcStart(startDate),
+      lte: parseYmdToUtcEnd(endDate),
     };
   }
-  const agg = await Video.aggregate([
-    { $match: match },
-    { $group: { _id: { channelId: '$channelId', classification: '$classification' }, count: { $sum: 1 } } },
-  ]);
+  const rows = await prisma.video.groupBy({
+    by: ['channelId', 'classification'],
+    where,
+    _count: { _all: true },
+  });
   const map = new Map();
-  for (const x of agg) {
-    const cid = x._id.channelId?.toString();
+  for (const row of rows) {
+    const cid = row.channelId;
     if (!cid) continue;
     if (!map.has(cid)) map.set(cid, {});
-    const cls = x._id.classification || '';
-    map.get(cid)[cls] = x.count;
+    const cls = row.classification || '';
+    map.get(cid)[cls] = row._count._all;
   }
   return map;
 }
@@ -159,30 +196,29 @@ async function getClassificationCountsByChannel(channelIds, options = {}) {
 async function getPublishedVideoCountsByChannel(channelIds, options = {}) {
   if (!channelIds?.length) return new Map();
   const { startDate, endDate } = options;
-  const match = { channelId: { $in: channelIds }, deletedAt: null };
+  const where = { channelId: { in: channelIds }, deletedAt: null };
   if (startDate && endDate) {
-    match.publishedAt = {
-      $gte: parseYmdToUtcStart(startDate),
-      $lte: parseYmdToUtcEnd(endDate),
+    where.publishedAt = {
+      gte: parseYmdToUtcStart(startDate),
+      lte: parseYmdToUtcEnd(endDate),
     };
   }
-
-  const agg = await Video.aggregate([
-    { $match: match },
-    { $group: { _id: '$channelId', count: { $sum: 1 } } },
-  ]);
-
+  const rows = await prisma.video.groupBy({
+    by: ['channelId'],
+    where,
+    _count: { _all: true },
+  });
   const map = new Map();
-  for (const row of agg) {
-    map.set(row._id.toString(), row.count);
+  for (const row of rows) {
+    if (row.channelId) map.set(row.channelId, row._count._all);
   }
   return map;
 }
 
 function mapChannel(c, periodMetrics = null, classificationCounts = null) {
-  const subs   = c.currentStats?.subscribers ?? 0;
-  const views  = c.currentStats?.views       ?? 0;
-  const videos = c.currentStats?.videoCount  ?? 0;
+  const subs   = asNumber(c.currentSubscribers);
+  const views  = asNumber(c.currentViews);
+  const videos = asNumber(c.currentVideoCount);
   const avgViewsPerVideo = videos > 0 ? Math.round(views / videos) : 0;
   const sadhguru = classificationCounts?.sadhguru ?? 0;
   const row = {
@@ -218,23 +254,24 @@ function parseVideoSort(sortStr) {
   return { key, dir: desc ? -1 : 1 };
 }
 
-/** Map UI/API sort keys to Mongo fields on Video for .find().sort() */
-function mapVideoSortForFind(sortStr) {
+/** Map UI/API sort keys to Prisma orderBy. */
+function mapVideoOrderByForFind(sortStr) {
   const { key, dir } = parseVideoSort(sortStr);
   const alias = {
     published_at: 'publishedAt',
     last_synced: 'lastSyncedAt',
     youtube_video_id: 'youtubeVideoId',
   };
-  const mongoKey = alias[key] || key;
+  const prismaKey = alias[key] || key;
   const allowed = new Set([
     'title', 'views', 'likes', 'comments', 'classification', 'duration',
     'publishedAt', 'lastSyncedAt', 'youtubeVideoId',
   ]);
-  if (!allowed.has(mongoKey)) {
-    return { views: dir };
+  const dirStr = dir === -1 ? 'desc' : 'asc';
+  if (!allowed.has(prismaKey)) {
+    return { views: dirStr };
   }
-  return { [mongoKey]: dir };
+  return { [prismaKey]: dirStr };
 }
 
 function needsAggregateVideoSort(sortStr) {
@@ -244,94 +281,94 @@ function needsAggregateVideoSort(sortStr) {
 
 /**
  * Fetch videos with correct ordering. Channel / category / engagement / outlier
- * require $lookup + computed fields; published_at etc. map to Video schema fields.
+ * require a join + computed expressions; published_at etc. map directly to
+ * Video columns.
  */
-async function fetchVideosForReportSorted(videoFilter, sortStr, skip, limit, isExport) {
+async function fetchVideosForReportSorted(videoWhere, sortStr, skip, limit, isExport) {
   const { key, dir } = parseVideoSort(sortStr);
-  const channelColl = Channel.collection.collectionName;
 
   if (needsAggregateVideoSort(sortStr)) {
+    // Compute globalAvg for outlier_score in the same shape as the Mongo path.
     let globalAvg = 1;
     if (key === 'outlier_score') {
-      const avgAgg = await Video.aggregate([
-        { $match: videoFilter },
-        { $group: { _id: null, avg: { $avg: '$views' } } },
-      ]);
-      globalAvg = avgAgg[0]?.avg || 1;
+      const matched = await prisma.video.findMany({
+        where: videoWhere,
+        select: { views: true },
+      });
+      if (matched.length) {
+        const sum = matched.reduce((acc, v) => acc + asNumber(v.views), 0);
+        const avg = sum / matched.length;
+        globalAvg = avg || 1;
+      }
     }
 
-    const pipeline = [
-      { $match: videoFilter },
-      { $lookup: { from: channelColl, localField: 'channelId', foreignField: '_id', as: 'ch' } },
-      { $unwind: { path: '$ch', preserveNullAndEmptyArrays: true } },
-      {
-        $addFields: {
-          _engagementRate: {
-            $cond: [
-              { $gt: [{ $ifNull: ['$views', 0] }, 0] },
-              {
-                $multiply: [
-                  {
-                    $divide: [
-                      { $add: [{ $ifNull: ['$likes', 0] }, { $ifNull: ['$comments', 0] }] },
-                      '$views',
-                    ],
-                  },
-                  100,
-                ],
-              },
-              0,
-            ],
-          },
-          _outlierScore: {
-            $divide: [{ $ifNull: ['$views', 0] }, { $literal: globalAvg || 1 }],
-          },
-        },
-      },
-    ];
+    // Pull all videos plus their channel; sort in JS so we can compute
+    // engagement_rate / outlier_score and read channel.title / channel.category.
+    const all = await prisma.video.findMany({
+      where: videoWhere,
+      include: { channel: { select: { id: true, title: true, category: true } } },
+    });
+
+    const withScores = all.map((v) => {
+      const views = asNumber(v.views);
+      const likes = asNumber(v.likes);
+      const comments = asNumber(v.comments);
+      const engagementRate = views > 0 ? ((likes + comments) / views) * 100 : 0;
+      const outlierScore = views / (globalAvg || 1);
+      return { v, engagementRate, outlierScore };
+    });
 
     const sortFieldMap = {
-      channel: 'ch.title',
-      category: 'ch.category',
-      engagement_rate: '_engagementRate',
-      outlier_score: '_outlierScore',
+      channel:         (x) => (x.v.channel?.title    ?? ''),
+      category:        (x) => (x.v.channel?.category ?? ''),
+      engagement_rate: (x) => x.engagementRate,
+      outlier_score:   (x) => x.outlierScore,
     };
-    const sortField = sortFieldMap[key] || 'views';
-    pipeline.push({ $sort: { [sortField]: dir } });
+    const getKey = sortFieldMap[key] || ((x) => asNumber(x.v.views));
+    withScores.sort((a, b) => {
+      const ak = getKey(a);
+      const bk = getKey(b);
+      if (typeof ak === 'string' || typeof bk === 'string') {
+        return dir * String(ak).localeCompare(String(bk));
+      }
+      return dir * (ak - bk);
+    });
+
+    let sliced = withScores;
     if (!isExport) {
-      pipeline.push({ $skip: skip });
-      if (limit > 0) pipeline.push({ $limit: limit });
+      const end = limit > 0 ? skip + limit : undefined;
+      sliced = withScores.slice(skip, end);
     }
 
-    const docs = await Video.aggregate(pipeline);
     const channelMap = {};
-    const videos = docs.map((doc) => {
-      if (doc.ch && doc.channelId) {
-        channelMap[doc.channelId.toString()] = doc.ch;
-      }
-      const { ch, _engagementRate, _outlierScore, ...rest } = doc;
+    const videos = sliced.map(({ v }) => {
+      if (v.channel && v.channelId) channelMap[v.channelId] = v.channel;
+      const { channel: _channel, ...rest } = v;
       return rest;
     });
     return { videos, channelMap };
   }
 
-  const sortObj = mapVideoSortForFind(sortStr);
-  let q = Video.find(videoFilter).sort(sortObj);
+  const orderBy = mapVideoOrderByForFind(sortStr);
+  const findArgs = { where: videoWhere, orderBy };
   if (!isExport) {
-    q = q.skip(skip);
-    if (limit > 0) q = q.limit(limit);
+    findArgs.skip = skip;
+    if (limit > 0) findArgs.take = limit;
   }
-  const videos = await q.lean();
+  const videos = await prisma.video.findMany(findArgs);
   return { videos, channelMap: null };
 }
 
 function mapVideo(v, channelMap, avgViews) {
-  const ch = channelMap[v.channelId?.toString()] || {};
-  const engagement = v.views > 0
-    ? (((v.likes + v.comments) / v.views) * 100).toFixed(2)
+  const ch = channelMap[v.channelId] || {};
+  const views = asNumber(v.views);
+  const likes = asNumber(v.likes);
+  const comments = asNumber(v.comments);
+  const engagement = views > 0
+    ? (((likes + comments) / views) * 100).toFixed(2)
     : '0.00';
   const outlierScore = avgViews > 0
-    ? parseFloat((v.views / avgViews).toFixed(2))
+    ? parseFloat((views / avgViews).toFixed(2))
     : 0;
   return {
     title:            v.title,
@@ -340,14 +377,33 @@ function mapVideo(v, channelMap, avgViews) {
     category:         ch.category || '',
     classification: v.classification === 'non sadhguru' ? '-' : (v.classification || '—'),
     published_at:     v.publishedAt ? utcDateString(v.publishedAt) : '',
-    views:            v.views    ?? 0,
-    likes:            v.likes    ?? 0,
-    comments:         v.comments ?? 0,
+    views,
+    likes,
+    comments,
     engagement_rate:  parseFloat(engagement),
     outlier_score:    outlierScore,
     duration:         v.duration || '',
     last_synced:      v.lastSyncedAt ? utcDateString(v.lastSyncedAt) : '',
   };
+}
+
+/** Map the API sort string to a Prisma orderBy clause for the channel report. */
+function mapChannelOrderBy(sortStr) {
+  const s = String(sortStr || '-currentSubscribers');
+  const dir = s.startsWith('-') ? 'desc' : 'asc';
+  const raw = s.replace(/^[-+]/, '');
+  const alias = {
+    'currentStats.subscribers': 'currentSubscribers',
+    'currentStats.views':       'currentViews',
+    'currentStats.videoCount':  'currentVideoCount',
+  };
+  const key = alias[raw] || raw;
+  const allowed = new Set([
+    'title', 'country', 'category', 'status', 'lastSyncedAt', 'createdAt',
+    'currentSubscribers', 'currentViews', 'currentVideoCount',
+  ]);
+  if (!allowed.has(key)) return { currentSubscribers: 'desc' };
+  return { [key]: dir };
 }
 
 /* ─────────────────────────────────────────────────────────────────────
@@ -366,32 +422,36 @@ export async function reportChannels(req, res, next) {
       endDate,
     } = req.query;
 
-    const filter = buildChannelFilter(req.query);
+    const where = buildChannelFilter(req.query);
 
     if (req.query.classification) {
       const cls = req.query.classification === 'sadhguru' ? 'sadhguru' : 'non sadhguru';
-      const ids = await Video.distinct('channelId', { classification: cls, deletedAt: null });
-      filter._id = { $in: ids };
+      const distinctRows = await prisma.video.findMany({
+        where: { classification: cls, deletedAt: null },
+        distinct: ['channelId'],
+        select: { channelId: true },
+      });
+      const ids = distinctRows.map((r) => r.channelId);
+      where.id = { in: ids };
     }
 
     const isPeriodMode = !!(startDate && endDate);
-
     const isExport = format === 'csv' || format === 'excel';
-    const lim      = isExport ? 0 : parseInt(limit); // 0 = no limit for exports
 
     let channels;
     let total;
     let summary = null;
-
     let rows;
+
     if (isPeriodMode) {
       // Fetch all matching channels (no skip/limit yet — we need to compute period metrics and sort)
-      channels = await Channel.find(filter)
-        .populate('assignedTo', 'name email')
-        .lean();
+      channels = await prisma.channel.findMany({
+        where,
+        include: { assignedTo: { select: { name: true, email: true } } },
+      });
       total = channels.length;
 
-      const channelIds = channels.map((c) => c._id);
+      const channelIds = channels.map((c) => c.id);
       const startDateObj = parseYmdToUtcStart(startDate);
       const endDateObj   = parseYmdToUtcEnd(endDate);
 
@@ -414,7 +474,7 @@ export async function reportChannels(req, res, next) {
         ]);
 
       rows = channels.map((c) => {
-        const sid = c._id.toString();
+        const sid = c.id;
         const opening = openingMap.get(sid);
         const closing = closingMap.get(sid) || opening;
         if (!closing || !opening) {
@@ -422,7 +482,7 @@ export async function reportChannels(req, res, next) {
             viewsInPeriod: 0,
             subscribersInPeriod: 0,
             videosInPeriod: 0,
-          }, classMap.get(c._id.toString()));
+          }, classMap.get(sid));
         }
         const endSubs   = closing.subscribers   ?? 0;
         const startSubs = opening.subscribers ?? 0;
@@ -431,12 +491,12 @@ export async function reportChannels(req, res, next) {
           subscribersInPeriod: endSubs - startSubs,
           videosInPeriod:      publishedVideoCountMap.get(sid) ?? 0,
         };
-        return mapChannel(c, periodMetrics, classMap.get(c._id.toString()));
+        return mapChannel(c, periodMetrics, classMap.get(sid));
       });
 
       // Sort by requested field (support period fields)
-      const rawKey = sort.replace(/^[-+]/, '');
-      const sortDir = sort.startsWith('-') ? -1 : 1;
+      const rawKey = String(sort).replace(/^[-+]/, '');
+      const sortDir = String(sort).startsWith('-') ? -1 : 1;
       const sortKey = rawKey
         .replace('currentStats.subscribers', 'subscribers')
         .replace('currentStats.views', 'total_views')
@@ -456,12 +516,12 @@ export async function reportChannels(req, res, next) {
         };
         const sums = rows.reduce(
           (acc, r) => ({
-            totalSubscribers: acc.totalSubscribers + z(r.subscribers),
-            totalViews: acc.totalViews + z(r.total_views),
-            totalVideos: acc.totalVideos + z(r.video_count),
-            totalViewsInPeriod: acc.totalViewsInPeriod + z(r.views_in_period),
+            totalSubscribers:        acc.totalSubscribers        + z(r.subscribers),
+            totalViews:              acc.totalViews              + z(r.total_views),
+            totalVideos:             acc.totalVideos             + z(r.video_count),
+            totalViewsInPeriod:      acc.totalViewsInPeriod      + z(r.views_in_period),
             totalSubscribersInPeriod: acc.totalSubscribersInPeriod + z(r.subscribers_in_period),
-            totalVideosInPeriod: acc.totalVideosInPeriod + z(r.videos_in_period),
+            totalVideosInPeriod:     acc.totalVideosInPeriod     + z(r.videos_in_period),
           }),
           {
             totalSubscribers: 0,
@@ -478,43 +538,51 @@ export async function reportChannels(req, res, next) {
         };
       }
 
-      const skip = isExport ? 0 : (parseInt(page) - 1) * parseInt(limit);
-      if (!isExport) rows = rows.slice(skip, skip + parseInt(limit));
+      if (!isExport) {
+        const skip = (parseInt(page) - 1) * parseInt(limit);
+        rows = rows.slice(skip, skip + parseInt(limit));
+      }
     } else {
       const skip = isExport ? 0 : (parseInt(page) - 1) * parseInt(limit);
-      const query = Channel.find(filter)
-        .populate('assignedTo', 'name email')
-        .sort(sort);
+      const take = isExport ? undefined : parseInt(limit);
+      const orderBy = mapChannelOrderBy(sort);
 
-      if (!isExport) query.skip(skip).limit(lim);
+      const findArgs = {
+        where,
+        include: { assignedTo: { select: { name: true, email: true } } },
+        orderBy,
+      };
+      if (!isExport) {
+        findArgs.skip = skip;
+        findArgs.take = take;
+      }
 
       [channels, total] = await Promise.all([
-        query,
-        Channel.countDocuments(filter),
+        prisma.channel.findMany(findArgs),
+        prisma.channel.count({ where }),
       ]);
-      const channelIds = channels.map((c) => c._id);
+      const channelIds = channels.map((c) => c.id);
       const classMap = await getClassificationCountsByChannel(channelIds);
-      rows = channels.map((c) => mapChannel(c, null, classMap.get(c._id.toString())));
+      rows = channels.map((c) => mapChannel(c, null, classMap.get(c.id)));
     }
 
     /* ── Summary (for JSON, non-period mode) ── */
     if (format === 'json' && !summary) {
-      const agg = await Channel.aggregate([
-        { $match: filter },
-        { $group: {
-          _id: null,
-          totalChannels:   { $sum: 1 },
-          totalSubscribers: { $sum: { $ifNull: ['$currentStats.subscribers', 0] } },
-          totalViews:      { $sum: { $ifNull: ['$currentStats.views', 0] } },
-          totalVideos:     { $sum: { $ifNull: ['$currentStats.videoCount', 0] } },
-        }},
-      ]);
-      summary = agg[0] ? {
-        totalChannels:    agg[0].totalChannels,
-        totalSubscribers: agg[0].totalSubscribers,
-        totalViews:       agg[0].totalViews,
-        totalVideos:      agg[0].totalVideos,
-      } : { totalChannels: 0, totalSubscribers: 0, totalViews: 0, totalVideos: 0 };
+      const agg = await prisma.channel.aggregate({
+        where,
+        _count: { _all: true },
+        _sum: {
+          currentSubscribers: true,
+          currentViews: true,
+          currentVideoCount: true,
+        },
+      });
+      summary = {
+        totalChannels:    agg._count?._all ?? 0,
+        totalSubscribers: asNumber(agg._sum?.currentSubscribers),
+        totalViews:       asNumber(agg._sum?.currentViews),
+        totalVideos:      asNumber(agg._sum?.currentVideoCount),
+      };
     }
 
     /* ── JSON preview ── */
@@ -555,13 +623,13 @@ export async function reportChannels(req, res, next) {
         { header: 'Country',             key: 'country',             width: 10 },
         { header: 'Category',            key: 'category',            width: 18 },
         { header: 'Status',              key: 'status',              width: 10 },
-        { header: 'Sadhguru Videos',     key: 'sadhguru_count',     width: 16 },
+        { header: 'Sadhguru Videos',     key: 'sadhguru_count',      width: 16 },
         { header: 'Tags',                key: 'tags',                width: 24 },
         { header: 'Subscribers',         key: 'subscribers',         width: 16 },
         { header: 'Total Views',         key: 'total_views',         width: 16 },
         ...(isPeriodMode
           ? [
-              { header: 'Views (Period)',      key: 'views_in_period',       width: 16 },
+              { header: 'Views (Period)',       key: 'views_in_period',       width: 16 },
               { header: 'Subscribers (Period)', key: 'subscribers_in_period', width: 18 },
               { header: 'Videos (Period)',      key: 'videos_in_period',      width: 16 },
             ]
@@ -612,69 +680,70 @@ export async function reportVideos(req, res, next) {
       limit  = 50,
     } = req.query;
 
-    const { channelFilter, videoFilter } = buildVideoFilter(req.query);
+    const { channelWhere, videoWhere } = buildVideoFilter(req.query);
 
     // Resolve channel IDs from channel-level filters
-    if (Object.keys(channelFilter).length > 0) {
-      const matchedChannels = await Channel.find(channelFilter).select('_id');
-      const ids = matchedChannels.map((c) => c._id);
-      // Merge with any explicit channelId filter
-      videoFilter.channelId = videoFilter.channelId
-        ? videoFilter.channelId  // already filtered above
-        : { $in: ids };
+    if (Object.keys(channelWhere).length > 0) {
+      const matched = await prisma.channel.findMany({
+        where: channelWhere,
+        select: { id: true },
+      });
+      const ids = matched.map((c) => c.id);
+      // If an explicit channelId was set, keep it; else restrict to resolved ids.
+      if (!videoWhere.channelId) {
+        videoWhere.channelId = { in: ids };
+      }
     }
 
     const isExport = format === 'csv' || format === 'excel';
     const skip     = isExport ? 0 : (parseInt(page) - 1) * parseInt(limit);
     const lim      = isExport ? 0 : parseInt(limit);
 
-    videoFilter.deletedAt = null;
+    videoWhere.deletedAt = null;
 
-    const summaryPipeline = format === 'json'
-      ? Video.aggregate([
-          { $match: videoFilter },
-          {
-            $group: {
-              _id: null,
-              totalVideos: { $sum: 1 },
-              totalViews: { $sum: { $ifNull: ['$views', 0] } },
-              totalLikes: { $sum: { $ifNull: ['$likes', 0] } },
-              totalComments: { $sum: { $ifNull: ['$comments', 0] } },
-            },
-          },
-        ])
+    const summaryPromise = format === 'json'
+      ? prisma.video.aggregate({
+          where: videoWhere,
+          _count: { _all: true },
+          _sum: { views: true, likes: true, comments: true },
+        })
       : Promise.resolve(null);
 
     const [sortedResult, total, summaryAgg] = await Promise.all([
-      fetchVideosForReportSorted(videoFilter, sort, skip, lim, isExport),
-      Video.countDocuments(videoFilter),
-      summaryPipeline,
+      fetchVideosForReportSorted(videoWhere, sort, skip, lim, isExport),
+      prisma.video.count({ where: videoWhere }),
+      summaryPromise,
     ]);
 
     const { videos, channelMap: aggChannelMap } = sortedResult;
 
     const summary = format === 'json'
-      ? (summaryAgg?.[0]
-        ? {
-            totalVideos: summaryAgg[0].totalVideos,
-            totalViews: summaryAgg[0].totalViews,
-            totalLikes: summaryAgg[0].totalLikes,
-            totalComments: summaryAgg[0].totalComments,
-          }
-        : { totalVideos: 0, totalViews: 0, totalLikes: 0, totalComments: 0 })
+      ? {
+          totalVideos:   summaryAgg?._count?._all ?? 0,
+          totalViews:    asNumber(summaryAgg?._sum?.views),
+          totalLikes:    asNumber(summaryAgg?._sum?.likes),
+          totalComments: asNumber(summaryAgg?._sum?.comments),
+        }
       : undefined;
 
     // Build channel map for joined fields (aggregate path may have pre-filled)
     let channelMap = aggChannelMap;
     if (!channelMap) {
-      const channelIds = [...new Set(videos.map((v) => v.channelId?.toString()).filter(Boolean))];
-      const channelDocs = await Channel.find({ _id: { $in: channelIds } }).select('title category');
-      channelMap = {};
-      channelDocs.forEach((c) => { channelMap[c._id.toString()] = c; });
+      const channelIds = [...new Set(videos.map((v) => v.channelId).filter(Boolean))];
+      if (channelIds.length) {
+        const channelDocs = await prisma.channel.findMany({
+          where: { id: { in: channelIds } },
+          select: { id: true, title: true, category: true },
+        });
+        channelMap = {};
+        for (const c of channelDocs) channelMap[c.id] = c;
+      } else {
+        channelMap = {};
+      }
     }
 
     const avgViews = videos.length
-      ? videos.reduce((s, v) => s + (v.views ?? 0), 0) / videos.length
+      ? videos.reduce((s, v) => s + asNumber(v.views), 0) / videos.length
       : 0;
 
     const rows = videos.map((v) => mapVideo(v, channelMap, avgViews));
@@ -714,8 +783,8 @@ export async function reportVideos(req, res, next) {
         { header: 'Title',            key: 'title',            width: 50 },
         { header: 'YouTube Video ID', key: 'youtube_video_id', width: 20 },
         { header: 'Channel',          key: 'channel',          width: 30 },
-        { header: 'Category',        key: 'category',         width: 18 },
-        { header: 'Classification',  key: 'classification',   width: 16 },
+        { header: 'Category',         key: 'category',         width: 18 },
+        { header: 'Classification',   key: 'classification',   width: 16 },
         { header: 'Published At',     key: 'published_at',     width: 14 },
         { header: 'Views',            key: 'views',            width: 14 },
         { header: 'Likes',            key: 'likes',            width: 12 },

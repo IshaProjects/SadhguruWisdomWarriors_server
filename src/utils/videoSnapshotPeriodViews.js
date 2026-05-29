@@ -1,5 +1,5 @@
-import Video from '../models/Video.js';
-import VideoSnapshot from '../models/VideoSnapshot.js';
+import { Prisma } from '@prisma/client';
+import { prisma } from '../config/prisma.js';
 
 /**
  * Per-video view growth in [startDateObj, endDateObj], summed per channel.
@@ -37,6 +37,7 @@ import VideoSnapshot from '../models/VideoSnapshot.js';
  * classificationKey: null = all videos; otherwise 'sadhguru' | 'non_sadhguru'.
  */
 const FRESH_TRACKING_GRACE_DAYS = 2;
+
 export async function getVideoSnapshotPeriodViewsByChannel(
   channelIds,
   startDateObj,
@@ -45,134 +46,118 @@ export async function getVideoSnapshotPeriodViewsByChannel(
 ) {
   if (!channelIds?.length) return new Map();
 
-  let videoIdFilter = null;
-  if (classificationKey === 'sadhguru' || classificationKey === 'non_sadhguru') {
-    const cls = classificationKey === 'sadhguru' ? 'sadhguru' : 'non sadhguru';
-    videoIdFilter = await Video.distinct('_id', {
-      classification: cls,
-      channelId: { $in: channelIds },
-      deletedAt: null,
-    });
-    if (!videoIdFilter.length) return new Map();
-  }
+  // Optional classification filter narrows the universe of videos. The
+  // grace-day comparison runs against this same set so a freshly-tracked
+  // video that doesn't match the classification is correctly excluded.
+  const classificationValue =
+    classificationKey === 'sadhguru'
+      ? 'sadhguru'
+      : classificationKey === 'non_sadhguru'
+        ? 'non sadhguru'
+        : null;
 
-  const match = {
-    channelId: { $in: channelIds },
-    deletedAt: null,
-    date: { $lte: endDateObj },
-  };
-  if (videoIdFilter) match.videoId = { $in: videoIdFilter };
-
-  // Build the set of "freshly tracked" video IDs — those where the first-ever
-  // snapshot landed within FRESH_TRACKING_GRACE_DAYS of publishedAt. This is a
-  // property of the video, not the query window, so the same video gets the
-  // same `opening` treatment regardless of [start, end]. That's what makes
-  // period totals additive (sum of slices == total of union).
-  const firstSnapAgg = await VideoSnapshot.aggregate([
-    {
-      $match: {
-        channelId: { $in: channelIds },
-        deletedAt: null,
-        ...(videoIdFilter ? { videoId: { $in: videoIdFilter } } : {}),
-      },
-    },
-    { $group: { _id: '$videoId', firstDate: { $min: '$date' } } },
-  ]);
-  const firstSnapByVideo = new Map(firstSnapAgg.map((r) => [r._id.toString(), r.firstDate]));
-  const candidateVideoIds = Array.from(firstSnapByVideo.keys());
-  const videos = candidateVideoIds.length
-    ? await Video.find({ _id: { $in: candidateVideoIds } }).select('_id publishedAt').lean()
-    : [];
+  // SQL strategy — one query, three CTEs:
+  //
+  // 1. `target_videos` — every live video in the channel set, optionally
+  //    filtered by classification. Carries published_at for the grace calc.
+  // 2. `per_video` — for each target video, compute four anchors via
+  //    correlated subqueries on video_snapshots (each filtered to
+  //    deleted_at IS NULL):
+  //      • first_snap_date       : min(date) — used for the grace check.
+  //      • opening_views         : latest pre-start snapshot, else NULL.
+  //      • first_in_range_views  : earliest in-window snapshot, else NULL.
+  //      • closing_views         : latest snapshot ≤ end, else NULL.
+  // 3. `per_video_delta` — apply the opening rule (preStart >
+  //    freshlyTracked=0 > firstInRange) then GREATEST(0, closing - opening).
+  //    Videos with no live snapshot ≤ end are dropped here, which in turn
+  //    drops a channel from the result if all its videos are dropped — the
+  //    soft-deleted-snapshots test asserts that absence explicitly.
   const GRACE_MS = FRESH_TRACKING_GRACE_DAYS * 24 * 60 * 60 * 1000;
-  const freshlyTrackedIds = [];
-  for (const v of videos) {
-    const first = firstSnapByVideo.get(v._id.toString());
-    if (!first || !v.publishedAt) continue;
-    if (first.getTime() - new Date(v.publishedAt).getTime() <= GRACE_MS) {
-      freshlyTrackedIds.push(v._id);
-    }
-  }
 
-  const result = await VideoSnapshot.aggregate([
-    { $match: match },
-    { $sort: { videoId: 1, date: 1 } },
-    {
-      $group: {
-        _id: '$videoId',
-        channelId: { $first: '$channelId' },
-        snapshots: { $push: { date: '$date', views: '$views' } },
-      },
-    },
-    {
-      $project: {
-        channelId: 1,
-        delta: {
-          $let: {
-            vars: {
-              preStart: {
-                $filter: {
-                  input: '$snapshots',
-                  cond: { $lt: ['$$this.date', startDateObj] },
-                },
-              },
-              inRange: {
-                $filter: {
-                  input: '$snapshots',
-                  cond: { $gte: ['$$this.date', startDateObj] },
-                },
-              },
-              closing: { $arrayElemAt: ['$snapshots', -1] },
-              isFreshlyTracked: { $in: ['$_id', freshlyTrackedIds] },
-            },
-            in: {
-              $let: {
-                vars: {
-                  // opening:
-                  //   - last preStart snapshot's views if any preStart exists
-                  //   - else 0 if the video was freshly tracked (first snapshot
-                  //     within grace of publishedAt — we observed it near 0)
-                  //   - else first inRange snapshot's views (opaque baseline)
-                  // Branch choice depends only on the video, not the query.
-                  openingViews: {
-                    $cond: [
-                      { $gt: [{ $size: '$$preStart' }, 0] },
-                      { $ifNull: [{ $getField: { field: 'views', input: { $arrayElemAt: ['$$preStart', -1] } } }, 0] },
-                      {
-                        $cond: [
-                          '$$isFreshlyTracked',
-                          0,
-                          { $ifNull: [{ $getField: { field: 'views', input: { $arrayElemAt: ['$$inRange', 0] } } }, 0] },
-                        ],
-                      },
-                    ],
-                  },
-                  closingViews: { $ifNull: [{ $getField: { field: 'views', input: '$$closing' } }, 0] },
-                  hasObservation: {
-                    $or: [
-                      { $gt: [{ $size: '$$preStart' }, 0] },
-                      { $gt: [{ $size: '$$inRange' }, 0] },
-                    ],
-                  },
-                },
-                in: {
-                  $cond: [
-                    { $not: '$$hasObservation' },
-                    0,
-                    { $max: [0, { $subtract: ['$$closingViews', '$$openingViews'] }] },
-                  ],
-                },
-              },
-            },
-          },
-        },
-      },
-    },
-    { $group: { _id: '$channelId', total: { $sum: '$delta' } } },
-  ]);
+  const rows = await prisma.$queryRaw(Prisma.sql`
+    WITH target_videos AS (
+      SELECT v.id AS video_id, v.channel_id, v.published_at
+      FROM videos v
+      WHERE v.channel_id IN (${Prisma.join(channelIds)})
+        AND v.deleted_at IS NULL
+        ${
+          classificationValue
+            ? Prisma.sql`AND v.classification = ${classificationValue}`
+            : Prisma.empty
+        }
+    ),
+    per_video AS (
+      SELECT
+        tv.video_id,
+        tv.channel_id,
+        tv.published_at,
+        (
+          SELECT MIN(s.date) FROM video_snapshots s
+          WHERE s.video_id = tv.video_id
+            AND s.deleted_at IS NULL
+        ) AS first_snap_date,
+        (
+          SELECT s.views FROM video_snapshots s
+          WHERE s.video_id = tv.video_id
+            AND s.deleted_at IS NULL
+            AND s.date < ${startDateObj}
+          ORDER BY s.date DESC
+          LIMIT 1
+        ) AS opening_views,
+        (
+          SELECT s.views FROM video_snapshots s
+          WHERE s.video_id = tv.video_id
+            AND s.deleted_at IS NULL
+            AND s.date >= ${startDateObj}
+            AND s.date <= ${endDateObj}
+          ORDER BY s.date ASC
+          LIMIT 1
+        ) AS first_in_range_views,
+        (
+          SELECT s.views FROM video_snapshots s
+          WHERE s.video_id = tv.video_id
+            AND s.deleted_at IS NULL
+            AND s.date <= ${endDateObj}
+          ORDER BY s.date DESC
+          LIMIT 1
+        ) AS closing_views
+      FROM target_videos tv
+    ),
+    per_video_delta AS (
+      -- Only videos with at least one live snapshot ≤ end contribute a row
+      -- here. This mirrors the Mongoose pipeline's $match (date ≤ end +
+      -- deletedAt null) which drops a video entirely when no snapshot
+      -- qualifies — and in turn drops a channel from the final result if
+      -- ALL its videos are filtered out. The tests assert this (a channel
+      -- with only soft-deleted snapshots is ABSENT from the returned map).
+      SELECT
+        channel_id,
+        GREATEST(
+          0::bigint,
+          closing_views
+          - CASE
+              -- preStart wins outright.
+              WHEN opening_views IS NOT NULL THEN opening_views
+              -- Freshly tracked: first snapshot within grace of publishedAt → opening 0.
+              WHEN published_at IS NOT NULL
+                   AND first_snap_date IS NOT NULL
+                   AND (EXTRACT(EPOCH FROM (first_snap_date - published_at)) * 1000) <= ${GRACE_MS}
+                THEN 0::bigint
+              -- Else: first in-range snapshot as opaque baseline.
+              ELSE COALESCE(first_in_range_views, 0::bigint)
+            END
+        ) AS delta
+      FROM per_video
+      WHERE closing_views IS NOT NULL
+    )
+    SELECT channel_id, SUM(delta) AS total
+    FROM per_video_delta
+    GROUP BY channel_id
+  `);
 
   const totals = new Map();
-  for (const row of result) {
-    if (row._id) totals.set(row._id.toString(), row.total);
+  for (const row of rows) {
+    if (row.channel_id) totals.set(row.channel_id, Number(row.total));
   }
   return totals;
 }

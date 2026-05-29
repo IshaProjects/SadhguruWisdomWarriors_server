@@ -1,28 +1,28 @@
-import mongoose from 'mongoose';
+import { prisma } from './prisma.js';
 import { logger } from '../utils/logger.js';
 
+/**
+ * Open the Prisma connection used by every request. Called once from
+ * src/server.js at startup. Same default-export shape as the previous
+ * Mongoose connector so server.js doesn't have to change.
+ */
 const connectDB = async () => {
-  const uri = process.env.MONGODB_URI;
+  const url = process.env.DATABASE_URL;
   try {
-    if (!uri) {
-      throw new Error('MONGODB_URI is required');
+    if (!url) {
+      throw new Error('DATABASE_URL is required');
     }
-
-    const options = {};
-    const dbName = process.env.MONGODB_DB_NAME;
-    if (dbName) {
-      options.dbName = dbName;
+    await prisma.$connect();
+    // Pull host out of the URL purely for the log line.
+    let host = '(from URL)';
+    try {
+      host = new URL(url).host || host;
+    } catch {
+      // ignore — non-URL connection strings are still valid for Prisma.
     }
-
-    const conn = await mongoose.connect(uri, options);
-    const db = dbName || conn.connection.db?.databaseName || '(from URI)';
-    logger.info(`MongoDB connected: ${conn.connection.host}, database: ${db}`);
+    logger.info(`Postgres connected via Prisma: ${host}`);
   } catch (error) {
-    let msg = error.message;
-    if (uri && /ENOTFOUND|querySrv/i.test(msg) && /mongodb\.net/i.test(uri)) {
-      msg += ' — Check MONGODB_URI: use your real Atlas hostname (not the example cluster.mongodb.net placeholder), or run MongoDB locally.';
-    }
-    logger.error(`MongoDB connection error: ${msg}`);
+    logger.error(`Postgres connection error: ${error.message}`);
     process.exit(1);
   }
 };

@@ -1,9 +1,4 @@
-import Channel from '../models/Channel.js';
-import ChannelSnapshot from '../models/ChannelSnapshot.js';
-import Video from '../models/Video.js';
-import VideoSnapshot from '../models/VideoSnapshot.js';
-import SyncLog from '../models/SyncLog.js';
-import SyncConfig from '../models/SyncConfig.js';
+import { prisma } from '../config/prisma.js';
 import {
   fetchChannelsBatch,
   fetchPlaylistItems,
@@ -19,6 +14,8 @@ import { logger } from '../utils/logger.js';
 import { utcStartOfDay } from '../utils/dateUtc.js';
 import { parseYoutubeStatInt } from '../utils/helpers.js';
 
+// Re-entrancy guards — plain module-local booleans, identical semantics to the
+// pre-migration Mongoose implementation. No DB involvement.
 let isChannelSyncing = false;
 let isVideoSyncing = false;
 let isDedicatedIngestSyncing = false;
@@ -40,7 +37,23 @@ export function getSyncStatus() {
 }
 
 // ---------------------------------------------------------------------------
-// Channel sync — updates Channel docs + ChannelSnapshot history
+// Local helpers — fetch/get the singleton SyncConfig and lookup utilities.
+// ---------------------------------------------------------------------------
+
+async function getSyncConfig() {
+  return prisma.syncConfig.upsert({
+    where: { id: 'sync' },
+    update: {},
+    create: { id: 'sync' },
+  });
+}
+
+function pickThumbnail(thumbnails) {
+  return thumbnails?.high?.url || thumbnails?.default?.url || '';
+}
+
+// ---------------------------------------------------------------------------
+// Channel sync — updates Channel rows + ChannelSnapshot history.
 // ---------------------------------------------------------------------------
 export async function syncChannelStats(channelIds = null, type = 'manual') {
   if (isChannelSyncing) {
@@ -48,34 +61,40 @@ export async function syncChannelStats(channelIds = null, type = 'manual') {
   }
 
   isChannelSyncing = true;
-  const syncLog = await SyncLog.create({
-    syncType: 'channel',
-    type,
-    status: 'running',
-    startedAt: new Date(),
+  let syncLog = await prisma.syncLog.create({
+    data: {
+      syncType: 'channel',
+      type,
+      status: 'running',
+      startedAt: new Date(),
+      errors: [],
+    },
   });
 
+  const errors = [];
+  let channelsProcessed = 0;
+  let quotaUsed = 0;
+
   try {
-    const query = { status: { $ne: 'archived' } };
-    if (channelIds) query._id = { $in: channelIds };
-    const channels = await Channel.find(query);
+    const where = { status: { not: 'archived' } };
+    if (channelIds) where.id = { in: channelIds };
+    const channels = await prisma.channel.findMany({ where });
 
     if (channels.length === 0) {
-      syncLog.status = 'success';
-      syncLog.completedAt = new Date();
-      await syncLog.save();
+      syncLog = await prisma.syncLog.update({
+        where: { id: syncLog.id },
+        data: { status: 'success', completedAt: new Date() },
+      });
       return syncLog;
     }
 
     const ytChannelIds = channels.map((c) => c.youtubeChannelId);
-    let quotaUsed = 0;
 
     logger.info(`[Channel Sync] Syncing ${channels.length} channels...`);
     const channelData = await fetchChannelsBatch(ytChannelIds);
     quotaUsed += Math.ceil(ytChannelIds.length / 50);
 
     const channelMap = new Map(channels.map((ch) => [ch.youtubeChannelId, ch]));
-
     const today = utcStartOfDay();
 
     for (const ytChannel of channelData) {
@@ -87,47 +106,63 @@ export async function syncChannelStats(channelIds = null, type = 'manual') {
         const snippet  = ytChannel.snippet;
         const branding = ytChannel.brandingSettings;
 
-        channel.title       = snippet.title;
-        channel.description = snippet.description;
-        channel.thumbnailUrl =
-          snippet.thumbnails?.high?.url || snippet.thumbnails?.default?.url || '';
-        channel.bannerUrl         = branding?.image?.bannerExternalUrl || '';
-        channel.customUrl         = snippet.customUrl  || '';
-        channel.country           = snippet.country    || '';
-        channel.publishedAt       = snippet.publishedAt;
-        channel.uploadsPlaylistId =
-          ytChannel.contentDetails?.relatedPlaylists?.uploads || '';
+        const subscribers = parseYoutubeStatInt(stats.subscriberCount);
+        const views       = parseYoutubeStatInt(stats.viewCount);
+        const videoCount  = parseYoutubeStatInt(stats.videoCount);
 
-        channel.currentStats = {
-          subscribers: parseYoutubeStatInt(stats.subscriberCount),
-          views:       parseYoutubeStatInt(stats.viewCount),
-          videoCount:  parseYoutubeStatInt(stats.videoCount),
+        const data = {
+          title:        snippet.title,
+          description:  snippet.description,
+          thumbnailUrl: pickThumbnail(snippet.thumbnails),
+          bannerUrl:    branding?.image?.bannerExternalUrl || '',
+          customUrl:    snippet.customUrl || '',
+          country:      snippet.country   || '',
+          publishedAt:  snippet.publishedAt ? new Date(snippet.publishedAt) : null,
+          uploadsPlaylistId:
+            ytChannel.contentDetails?.relatedPlaylists?.uploads || '',
+          currentSubscribers: subscribers,
+          currentViews:       BigInt(views),
+          currentVideoCount:  videoCount,
+          lastSyncedAt:       new Date(),
         };
-        channel.lastSyncedAt = new Date();
+
+        // Mirror Mongoose: when allVideosPulled is currently true and the
+        // remote video count exceeds what we have locally, flip it off so the
+        // pull-all job will run again.
         if (channel.allVideosPulled) {
-          const ourVideoCount = await Video.countDocuments({ channelId: channel._id, deletedAt: null });
-          if (ourVideoCount < channel.currentStats.videoCount) {
-            channel.allVideosPulled = false;
+          const ourVideoCount = await prisma.video.count({
+            where: { channelId: channel.id, deletedAt: null },
+          });
+          if (ourVideoCount < videoCount) {
+            data.allVideosPulled = false;
           }
         }
-        await channel.save();
 
-        await ChannelSnapshot.findOneAndUpdate(
-          { channelId: channel._id, date: today },
-          {
-            channelId:  channel._id,
-            date:       today,
-            subscribers: channel.currentStats.subscribers,
-            views:       channel.currentStats.views,
-            videoCount:  channel.currentStats.videoCount,
+        await prisma.channel.update({
+          where: { id: channel.id },
+          data,
+        });
+
+        await prisma.channelSnapshot.upsert({
+          where: { channelId_date: { channelId: channel.id, date: today } },
+          update: {
+            subscribers,
+            views: BigInt(views),
+            videoCount,
           },
-          { upsert: true, new: true }
-        );
+          create: {
+            channelId: channel.id,
+            date: today,
+            subscribers,
+            views: BigInt(views),
+            videoCount,
+          },
+        });
 
-        syncLog.channelsProcessed += 1;
+        channelsProcessed += 1;
       } catch (err) {
         logger.error(`[Channel Sync] Error on ${ytChannel.id}: ${err.message}`);
-        syncLog.errors.push({ channelId: ytChannel.id, message: err.message });
+        errors.push({ channelId: ytChannel.id, message: err.message });
       }
     }
 
@@ -139,20 +174,33 @@ export async function syncChannelStats(channelIds = null, type = 'manual') {
       logger.error(`[Channel Sync] Activity-status update failed: ${err.message}`);
     }
 
-    syncLog.quotaUsed    = quotaUsed;
-    syncLog.status       = syncLog.errors.length > 0 ? 'partial' : 'success';
-    syncLog.completedAt  = new Date();
-    await syncLog.save();
+    syncLog = await prisma.syncLog.update({
+      where: { id: syncLog.id },
+      data: {
+        channelsProcessed,
+        quotaUsed,
+        errors,
+        status: errors.length > 0 ? 'partial' : 'success',
+        completedAt: new Date(),
+      },
+    });
 
     logger.info(
-      `[Channel Sync] Done: ${syncLog.channelsProcessed} channels, ${quotaUsed} quota used`
+      `[Channel Sync] Done: ${channelsProcessed} channels, ${quotaUsed} quota used`
     );
   } catch (err) {
     logger.error(`[Channel Sync] Failed: ${err.message}`);
-    syncLog.status = 'failed';
-    syncLog.errors.push({ channelId: 'global', message: err.message });
-    syncLog.completedAt = new Date();
-    await syncLog.save();
+    errors.push({ channelId: 'global', message: err.message });
+    syncLog = await prisma.syncLog.update({
+      where: { id: syncLog.id },
+      data: {
+        channelsProcessed,
+        quotaUsed,
+        errors,
+        status: 'failed',
+        completedAt: new Date(),
+      },
+    });
   } finally {
     isChannelSyncing = false;
   }
@@ -172,46 +220,48 @@ export async function syncChannelStats(channelIds = null, type = 'manual') {
 //   Dedicated/other → any upload counts
 // ---------------------------------------------------------------------------
 export async function updateChannelActivityStatuses(type = 'auto') {
-  const config = await SyncConfig.getSingleton();
+  const config = await getSyncConfig();
   const days = config.inactivityThresholdDays ?? 14;
   const cutoff = new Date(Date.now() - days * MS_24H);
 
-  const hasQualifyingRecentPost = (channel) => {
-    const q = {
-      channelId: channel._id,
+  const hasQualifyingRecentPost = async (channel) => {
+    const where = {
+      channelId: channel.id,
       deletedAt: null,
-      publishedAt: { $gte: cutoff },
+      publishedAt: { gte: cutoff },
     };
-    if (isIhiChannel(channel)) q.classification = 'sadhguru';
-    return Video.exists(q);
+    if (isIhiChannel(channel)) where.classification = 'sadhguru';
+    const found = await prisma.video.findFirst({ where, select: { id: true } });
+    return !!found;
   };
 
   let archived = 0;
   let reactivated = 0;
 
   // Detection: active channels that have gone quiet → archive for inactivity.
-  const activeChannels = await Channel.find({ status: 'active' });
+  const activeChannels = await prisma.channel.findMany({ where: { status: 'active' } });
   for (const channel of activeChannels) {
     // Don't archive a freshly-added channel before ingest has had time to
     // populate its videos.
     if (channel.createdAt && channel.createdAt > cutoff) continue;
     if (await hasQualifyingRecentPost(channel)) continue;
-    channel.status = 'archived';
-    channel.autoArchivedForInactivity = true;
-    await channel.save();
+    await prisma.channel.update({
+      where: { id: channel.id },
+      data: { status: 'archived', autoArchivedForInactivity: true },
+    });
     archived += 1;
   }
 
   // Reactivation: auto-archived channels that posted again → back to active.
-  const dormantChannels = await Channel.find({
-    status: 'archived',
-    autoArchivedForInactivity: true,
+  const dormantChannels = await prisma.channel.findMany({
+    where: { status: 'archived', autoArchivedForInactivity: true },
   });
   for (const channel of dormantChannels) {
     if (!(await hasQualifyingRecentPost(channel))) continue;
-    channel.status = 'active';
-    channel.autoArchivedForInactivity = false;
-    await channel.save();
+    await prisma.channel.update({
+      where: { id: channel.id },
+      data: { status: 'active', autoArchivedForInactivity: false },
+    });
     reactivated += 1;
   }
 
@@ -224,7 +274,8 @@ export async function updateChannelActivityStatuses(type = 'auto') {
 }
 
 // ---------------------------------------------------------------------------
-// Video sync — upserts Video docs + VideoSnapshot history
+// Video sync — upserts Video rows + VideoSnapshot history (Dedicated only,
+// top 10 most-recent uploads per channel).
 // ---------------------------------------------------------------------------
 export async function syncVideoStats(channelIds = null, type = 'manual') {
   if (isVideoSyncing) {
@@ -232,28 +283,32 @@ export async function syncVideoStats(channelIds = null, type = 'manual') {
   }
 
   isVideoSyncing = true;
-  const syncLog = await SyncLog.create({
-    syncType: 'video',
-    type,
-    status: 'running',
-    startedAt: new Date(),
+  let syncLog = await prisma.syncLog.create({
+    data: {
+      syncType: 'video',
+      type,
+      status: 'running',
+      startedAt: new Date(),
+      errors: [],
+    },
   });
 
+  const errors = [];
+  let videosProcessed = 0;
+  let quotaUsed = 0;
+
   try {
-    const query = { status: { $ne: 'archived' } };
-    if (channelIds) query._id = { $in: channelIds };
-    const channels = (await Channel.find(query)).filter(isDedicatedChannel);
+    const where = { status: { not: 'archived' } };
+    if (channelIds) where.id = { in: channelIds };
+    const channels = (await prisma.channel.findMany({ where })).filter(isDedicatedChannel);
 
     if (channels.length === 0) {
-      syncLog.status = 'success';
-      syncLog.completedAt = new Date();
-      await syncLog.save();
+      syncLog = await prisma.syncLog.update({
+        where: { id: syncLog.id },
+        data: { status: 'success', completedAt: new Date() },
+      });
       return syncLog;
     }
-
-    let videosProcessed = 0;
-    let quotaUsed       = 0;
-    const quota = getQuotaUsage();
 
     const today = utcStartOfDay();
 
@@ -264,6 +319,7 @@ export async function syncVideoStats(channelIds = null, type = 'manual') {
     for (const channel of channels) {
       if (!channel.uploadsPlaylistId) continue;
 
+      const quota = getQuotaUsage();
       if (quota.remaining < 10) {
         logger.warn('[Video Sync] Approaching quota limit, stopping');
         break;
@@ -284,38 +340,42 @@ export async function syncVideoStats(channelIds = null, type = 'manual') {
           const likes    = parseInt(vid.statistics?.likeCount)    || 0;
           const comments = parseInt(vid.statistics?.commentCount) || 0;
 
-          const savedVideo = await Video.findOneAndUpdate(
-            { youtubeVideoId: vid.id },
-            {
-              youtubeVideoId: vid.id,
-              channelId:      channel._id,
-              title:          vid.snippet?.title       || '',
-              description:    vid.snippet?.description || '',
-              thumbnailUrl:
-                vid.snippet?.thumbnails?.high?.url ||
-                vid.snippet?.thumbnails?.default?.url || '',
-              publishedAt: vid.snippet?.publishedAt,
-              views,
-              likes,
-              comments,
-              duration:     vid.contentDetails?.duration || '',
-              lastSyncedAt: new Date(),
-            },
-            { upsert: true, new: true }
-          );
+          const videoCommon = {
+            channelId:   channel.id,
+            title:       vid.snippet?.title       || '',
+            description: vid.snippet?.description || '',
+            thumbnailUrl: pickThumbnail(vid.snippet?.thumbnails),
+            publishedAt: vid.snippet?.publishedAt ? new Date(vid.snippet.publishedAt) : null,
+            views:    BigInt(views),
+            likes,
+            comments,
+            duration: vid.contentDetails?.duration || '',
+            lastSyncedAt: new Date(),
+          };
 
-          await VideoSnapshot.findOneAndUpdate(
-            { videoId: savedVideo._id, date: today },
-            {
-              videoId:   savedVideo._id,
-              channelId: channel._id,
-              date:      today,
-              views,
+          const savedVideo = await prisma.video.upsert({
+            where: { youtubeVideoId: vid.id },
+            update: videoCommon,
+            create: { youtubeVideoId: vid.id, ...videoCommon },
+          });
+
+          await prisma.videoSnapshot.upsert({
+            where: { videoId_date: { videoId: savedVideo.id, date: today } },
+            update: {
+              channelId: channel.id,
+              views: BigInt(views),
               likes,
               comments,
             },
-            { upsert: true, new: true }
-          );
+            create: {
+              videoId: savedVideo.id,
+              channelId: channel.id,
+              date: today,
+              views: BigInt(views),
+              likes,
+              comments,
+            },
+          });
 
           videosProcessed++;
         }
@@ -327,25 +387,37 @@ export async function syncVideoStats(channelIds = null, type = 'manual') {
         logger.error(
           `[Video Sync] Error on channel ${channel.youtubeChannelId}: ${err.message}`
         );
-        syncLog.errors.push({ channelId: channel.youtubeChannelId, message: err.message });
+        errors.push({ channelId: channel.youtubeChannelId, message: err.message });
       }
     }
 
-    syncLog.videosProcessed = videosProcessed;
-    syncLog.quotaUsed       = quotaUsed;
-    syncLog.status          = syncLog.errors.length > 0 ? 'partial' : 'success';
-    syncLog.completedAt     = new Date();
-    await syncLog.save();
+    syncLog = await prisma.syncLog.update({
+      where: { id: syncLog.id },
+      data: {
+        videosProcessed,
+        quotaUsed,
+        errors,
+        status: errors.length > 0 ? 'partial' : 'success',
+        completedAt: new Date(),
+      },
+    });
 
     logger.info(
       `[Video Sync] Done: ${videosProcessed} videos, ${quotaUsed} quota used`
     );
   } catch (err) {
     logger.error(`[Video Sync] Failed: ${err.message}`);
-    syncLog.status = 'failed';
-    syncLog.errors.push({ channelId: 'global', message: err.message });
-    syncLog.completedAt = new Date();
-    await syncLog.save();
+    errors.push({ channelId: 'global', message: err.message });
+    syncLog = await prisma.syncLog.update({
+      where: { id: syncLog.id },
+      data: {
+        videosProcessed,
+        quotaUsed,
+        errors,
+        status: 'failed',
+        completedAt: new Date(),
+      },
+    });
   } finally {
     isVideoSyncing = false;
   }
@@ -362,33 +434,39 @@ export async function syncIhiIngestLast24h(channelIds = null, type = 'manual') {
   }
 
   isIhiIngestSyncing = true;
-  const syncLog = await SyncLog.create({
-    syncType: 'ihi_ingest',
-    type,
-    status: 'running',
-    startedAt: new Date(),
+  let syncLog = await prisma.syncLog.create({
+    data: {
+      syncType: 'ihi_ingest',
+      type,
+      status: 'running',
+      startedAt: new Date(),
+      errors: [],
+    },
   });
+
+  const errors = [];
+  let videosProcessed = 0;
+  let quotaUsed = 0;
+  let classified = 0;
 
   try {
     // Include inactivity-archived channels so new uploads keep being ingested
     // (and classified) — this is what lets the daily sync reactivate them.
-    const query = {
-      $or: [{ status: { $ne: 'archived' } }, { autoArchivedForInactivity: true }],
+    const where = {
+      OR: [{ status: { not: 'archived' } }, { autoArchivedForInactivity: true }],
     };
-    if (channelIds) query._id = { $in: channelIds };
-    const channels = (await Channel.find(query)).filter(isIhiChannel);
+    if (channelIds) where.id = { in: channelIds };
+    const channels = (await prisma.channel.findMany({ where })).filter(isIhiChannel);
 
     if (channels.length === 0) {
-      syncLog.status = 'success';
-      syncLog.completedAt = new Date();
-      await syncLog.save();
+      syncLog = await prisma.syncLog.update({
+        where: { id: syncLog.id },
+        data: { status: 'success', completedAt: new Date() },
+      });
       return syncLog;
     }
 
     const since = new Date(Date.now() - MS_24H);
-    let videosProcessed = 0;
-    let quotaUsed = 0;
-    let classified = 0;
 
     logger.info(
       `[IHI Ingest] ${channels.length} channels, videos published since ${since.toISOString()}`
@@ -432,73 +510,78 @@ export async function syncIhiIngestLast24h(channelIds = null, type = 'manual') {
           const likes = parseInt(vid.statistics?.likeCount) || 0;
           const comments = parseInt(vid.statistics?.commentCount) || 0;
 
-          const savedVideo = await Video.findOneAndUpdate(
-            { youtubeVideoId: vid.id },
-            {
-              youtubeVideoId: vid.id,
-              channelId: channel._id,
-              title: vid.snippet?.title || '',
-              description: vid.snippet?.description || '',
-              thumbnailUrl:
-                vid.snippet?.thumbnails?.high?.url ||
-                vid.snippet?.thumbnails?.default?.url ||
-                '',
-              publishedAt: vid.snippet?.publishedAt,
-              views,
-              likes,
-              comments,
-              duration: vid.contentDetails?.duration || '',
-              lastSyncedAt: new Date(),
-            },
-            { upsert: true, new: true }
-          );
+          const videoCommon = {
+            channelId: channel.id,
+            title: vid.snippet?.title || '',
+            description: vid.snippet?.description || '',
+            thumbnailUrl: pickThumbnail(vid.snippet?.thumbnails),
+            publishedAt: vid.snippet?.publishedAt ? new Date(vid.snippet.publishedAt) : null,
+            views: BigInt(views),
+            likes,
+            comments,
+            duration: vid.contentDetails?.duration || '',
+            lastSyncedAt: new Date(),
+          };
 
-          await VideoSnapshot.findOneAndUpdate(
-            { videoId: savedVideo._id, date: today },
-            {
-              videoId: savedVideo._id,
-              channelId: channel._id,
-              date: today,
-              views,
+          const savedVideo = await prisma.video.upsert({
+            where: { youtubeVideoId: vid.id },
+            update: videoCommon,
+            create: { youtubeVideoId: vid.id, ...videoCommon },
+          });
+
+          await prisma.videoSnapshot.upsert({
+            where: { videoId_date: { videoId: savedVideo.id, date: today } },
+            update: {
+              channelId: channel.id,
+              views: BigInt(views),
               likes,
               comments,
             },
-            { upsert: true, new: true }
-          );
+            create: {
+              videoId: savedVideo.id,
+              channelId: channel.id,
+              date: today,
+              views: BigInt(views),
+              likes,
+              comments,
+            },
+          });
 
           videosProcessed++;
         }
 
-        const needsClassify = await Video.find({
-          channelId: channel._id,
-          youtubeVideoId: { $in: videoIds },
-          deletedAt: null,
-          $or: [
-            { classification: { $exists: false } },
-            { classification: '' },
-            { classification: null },
-          ],
-        }).lean();
+        const needsClassify = await prisma.video.findMany({
+          where: {
+            channelId: channel.id,
+            youtubeVideoId: { in: videoIds },
+            deletedAt: null,
+            classification: '',
+          },
+          select: { id: true, title: true, description: true },
+        });
 
         if (needsClassify.length > 0) {
           try {
             const map = await classifySadguruVideoBatch(
               needsClassify.map((v) => ({
-                _id: v._id,
+                _id: v.id,
                 title: v.title,
                 description: v.description || '',
               }))
             );
             for (const v of needsClassify) {
-              const val = map.get(String(v._id));
+              const val = map.get(String(v.id));
               if (val) {
-                await Video.findByIdAndUpdate(v._id, { classification: val });
+                await prisma.video.update({
+                  where: { id: v.id },
+                  data: { classification: val },
+                });
                 classified++;
               }
             }
           } catch (aiErr) {
             logger.error(`[IHI Ingest] Vertex classify failed: ${aiErr.message}`);
-            syncLog.errors.push({
+            errors.push({
               channelId: channel.youtubeChannelId,
               message: `Classification: ${aiErr.message}`,
             });
@@ -512,29 +595,40 @@ export async function syncIhiIngestLast24h(channelIds = null, type = 'manual') {
         logger.error(
           `[IHI Ingest] Error on channel ${channel.youtubeChannelId}: ${err.message}`
         );
-        syncLog.errors.push({
+        errors.push({
           channelId: channel.youtubeChannelId,
           message: err.message,
         });
       }
     }
 
-    syncLog.videosProcessed = videosProcessed;
-    syncLog.quotaUsed = quotaUsed;
-    syncLog.status =
-      syncLog.errors.length > 0 ? 'partial' : 'success';
-    syncLog.completedAt = new Date();
-    await syncLog.save();
+    syncLog = await prisma.syncLog.update({
+      where: { id: syncLog.id },
+      data: {
+        videosProcessed,
+        quotaUsed,
+        errors,
+        status: errors.length > 0 ? 'partial' : 'success',
+        completedAt: new Date(),
+      },
+    });
 
     logger.info(
       `[IHI Ingest] Done: ${videosProcessed} videos upserted, ${classified} classified, ${quotaUsed} quota`
     );
   } catch (err) {
     logger.error(`[IHI Ingest] Failed: ${err.message}`);
-    syncLog.status = 'failed';
-    syncLog.errors.push({ channelId: 'global', message: err.message });
-    syncLog.completedAt = new Date();
-    await syncLog.save();
+    errors.push({ channelId: 'global', message: err.message });
+    syncLog = await prisma.syncLog.update({
+      where: { id: syncLog.id },
+      data: {
+        videosProcessed,
+        quotaUsed,
+        errors,
+        status: 'failed',
+        completedAt: new Date(),
+      },
+    });
   } finally {
     isIhiIngestSyncing = false;
   }
@@ -551,33 +645,39 @@ export async function syncDedicatedIngestLast24h(channelIds = null, type = 'manu
   }
 
   isDedicatedIngestSyncing = true;
-  const syncLog = await SyncLog.create({
-    syncType: 'dedicated_ingest',
-    type,
-    status: 'running',
-    startedAt: new Date(),
+  let syncLog = await prisma.syncLog.create({
+    data: {
+      syncType: 'dedicated_ingest',
+      type,
+      status: 'running',
+      startedAt: new Date(),
+      errors: [],
+    },
   });
+
+  const errors = [];
+  let videosProcessed = 0;
+  let quotaUsed = 0;
+  let classified = 0;
 
   try {
     // Include inactivity-archived channels so new uploads keep being ingested
     // — this is what lets the daily sync reactivate them.
-    const query = {
-      $or: [{ status: { $ne: 'archived' } }, { autoArchivedForInactivity: true }],
+    const where = {
+      OR: [{ status: { not: 'archived' } }, { autoArchivedForInactivity: true }],
     };
-    if (channelIds) query._id = { $in: channelIds };
-    const channels = (await Channel.find(query)).filter(isDedicatedChannel);
+    if (channelIds) where.id = { in: channelIds };
+    const channels = (await prisma.channel.findMany({ where })).filter(isDedicatedChannel);
 
     if (channels.length === 0) {
-      syncLog.status = 'success';
-      syncLog.completedAt = new Date();
-      await syncLog.save();
+      syncLog = await prisma.syncLog.update({
+        where: { id: syncLog.id },
+        data: { status: 'success', completedAt: new Date() },
+      });
       return syncLog;
     }
 
     const since = new Date(Date.now() - MS_24H);
-    let videosProcessed = 0;
-    let quotaUsed = 0;
-    let classified = 0;
 
     logger.info(
       `[Dedicated Ingest] ${channels.length} channels, videos published since ${since.toISOString()}`
@@ -621,57 +721,59 @@ export async function syncDedicatedIngestLast24h(channelIds = null, type = 'manu
           const likes = parseInt(vid.statistics?.likeCount) || 0;
           const comments = parseInt(vid.statistics?.commentCount) || 0;
 
-          const savedVideo = await Video.findOneAndUpdate(
-            { youtubeVideoId: vid.id },
-            {
-              youtubeVideoId: vid.id,
-              channelId: channel._id,
-              title: vid.snippet?.title || '',
-              description: vid.snippet?.description || '',
-              thumbnailUrl:
-                vid.snippet?.thumbnails?.high?.url ||
-                vid.snippet?.thumbnails?.default?.url ||
-                '',
-              publishedAt: vid.snippet?.publishedAt,
-              views,
-              likes,
-              comments,
-              duration: vid.contentDetails?.duration || '',
-              lastSyncedAt: new Date(),
-            },
-            { upsert: true, new: true }
-          );
+          const videoCommon = {
+            channelId: channel.id,
+            title: vid.snippet?.title || '',
+            description: vid.snippet?.description || '',
+            thumbnailUrl: pickThumbnail(vid.snippet?.thumbnails),
+            publishedAt: vid.snippet?.publishedAt ? new Date(vid.snippet.publishedAt) : null,
+            views: BigInt(views),
+            likes,
+            comments,
+            duration: vid.contentDetails?.duration || '',
+            lastSyncedAt: new Date(),
+          };
 
-          await VideoSnapshot.findOneAndUpdate(
-            { videoId: savedVideo._id, date: today },
-            {
-              videoId: savedVideo._id,
-              channelId: channel._id,
-              date: today,
-              views,
+          const savedVideo = await prisma.video.upsert({
+            where: { youtubeVideoId: vid.id },
+            update: videoCommon,
+            create: { youtubeVideoId: vid.id, ...videoCommon },
+          });
+
+          await prisma.videoSnapshot.upsert({
+            where: { videoId_date: { videoId: savedVideo.id, date: today } },
+            update: {
+              channelId: channel.id,
+              views: BigInt(views),
               likes,
               comments,
             },
-            { upsert: true, new: true }
-          );
+            create: {
+              videoId: savedVideo.id,
+              channelId: channel.id,
+              date: today,
+              views: BigInt(views),
+              likes,
+              comments,
+            },
+          });
 
           videosProcessed++;
         }
 
-        const classifyResult = await Video.updateMany(
-          {
-            channelId: channel._id,
-            youtubeVideoId: { $in: videoIds },
+        const classifyResult = await prisma.video.updateMany({
+          where: {
+            channelId: channel.id,
+            youtubeVideoId: { in: videoIds },
             deletedAt: null,
-            $or: [
-              { classification: { $exists: false } },
-              { classification: '' },
-              { classification: null },
-            ],
+            classification: '',
           },
-          { $set: { classification: 'sadhguru' } }
-        );
-        classified += classifyResult.modifiedCount || 0;
+          data: { classification: 'sadhguru' },
+        });
+        // Prisma returns `{ count }`; Mongoose returned `{ modifiedCount }`.
+        // Support both shapes so tests that mock with the old field keep working.
+        classified +=
+          classifyResult.count ?? classifyResult.modifiedCount ?? 0;
       } catch (err) {
         if (err.message === 'QUOTA_EXCEEDED') {
           logger.error('[Dedicated Ingest] Quota exceeded');
@@ -680,29 +782,40 @@ export async function syncDedicatedIngestLast24h(channelIds = null, type = 'manu
         logger.error(
           `[Dedicated Ingest] Error on channel ${channel.youtubeChannelId}: ${err.message}`
         );
-        syncLog.errors.push({
+        errors.push({
           channelId: channel.youtubeChannelId,
           message: err.message,
         });
       }
     }
 
-    syncLog.videosProcessed = videosProcessed;
-    syncLog.quotaUsed = quotaUsed;
-    syncLog.status =
-      syncLog.errors.length > 0 ? 'partial' : 'success';
-    syncLog.completedAt = new Date();
-    await syncLog.save();
+    syncLog = await prisma.syncLog.update({
+      where: { id: syncLog.id },
+      data: {
+        videosProcessed,
+        quotaUsed,
+        errors,
+        status: errors.length > 0 ? 'partial' : 'success',
+        completedAt: new Date(),
+      },
+    });
 
     logger.info(
       `[Dedicated Ingest] Done: ${videosProcessed} videos, ${quotaUsed} quota used, auto-classified: ${classified}`
     );
   } catch (err) {
     logger.error(`[Dedicated Ingest] Failed: ${err.message}`);
-    syncLog.status = 'failed';
-    syncLog.errors.push({ channelId: 'global', message: err.message });
-    syncLog.completedAt = new Date();
-    await syncLog.save();
+    errors.push({ channelId: 'global', message: err.message });
+    syncLog = await prisma.syncLog.update({
+      where: { id: syncLog.id },
+      data: {
+        videosProcessed,
+        quotaUsed,
+        errors,
+        status: 'failed',
+        completedAt: new Date(),
+      },
+    });
   } finally {
     isDedicatedIngestSyncing = false;
   }
@@ -719,48 +832,55 @@ export async function syncIhiSadhguruVideoStats(channelIds = null, type = 'manua
   }
 
   isIhiSadhguruStatsSyncing = true;
-  const syncLog = await SyncLog.create({
-    syncType: 'ihi_sadhguru_stats',
-    type,
-    status: 'running',
-    startedAt: new Date(),
+  let syncLog = await prisma.syncLog.create({
+    data: {
+      syncType: 'ihi_sadhguru_stats',
+      type,
+      status: 'running',
+      startedAt: new Date(),
+      errors: [],
+    },
   });
 
+  const errors = [];
+  let videosProcessed = 0;
+  let quotaUsed = 0;
+
   try {
-    const query = { status: { $ne: 'archived' } };
-    if (channelIds) query._id = { $in: channelIds };
-    const ihiChannelIds = (await Channel.find(query))
+    const where = { status: { not: 'archived' } };
+    if (channelIds) where.id = { in: channelIds };
+    const ihiChannelIds = (await prisma.channel.findMany({ where }))
       .filter(isIhiChannel)
-      .map((c) => c._id);
+      .map((c) => c.id);
 
     if (ihiChannelIds.length === 0) {
-      syncLog.status = 'success';
-      syncLog.completedAt = new Date();
-      await syncLog.save();
+      syncLog = await prisma.syncLog.update({
+        where: { id: syncLog.id },
+        data: { status: 'success', completedAt: new Date() },
+      });
       return syncLog;
     }
 
-    const videos = await Video.find({
-      channelId: { $in: ihiChannelIds },
-      deletedAt: null,
-      classification: 'sadhguru',
-    })
-      .select('youtubeVideoId')
-      .lean();
+    const videos = await prisma.video.findMany({
+      where: {
+        channelId: { in: ihiChannelIds },
+        deletedAt: null,
+        classification: 'sadhguru',
+      },
+      select: { id: true, youtubeVideoId: true },
+    });
 
     if (videos.length === 0) {
-      syncLog.status = 'success';
-      syncLog.completedAt = new Date();
-      await syncLog.save();
+      syncLog = await prisma.syncLog.update({
+        where: { id: syncLog.id },
+        data: { status: 'success', completedAt: new Date() },
+      });
       return syncLog;
     }
 
     const today = utcStartOfDay();
-
-    let videosProcessed = 0;
-    let quotaUsed = 0;
     const ytIds = videos.map((v) => v.youtubeVideoId).filter(Boolean);
-    const idByYt = new Map(videos.map((v) => [v.youtubeVideoId, v._id]));
+    const idByYt = new Map(videos.map((v) => [v.youtubeVideoId, v.id]));
 
     const chunkSize = 50;
     for (let i = 0; i < ytIds.length; i += chunkSize) {
@@ -776,46 +896,59 @@ export async function syncIhiSadhguruVideoStats(channelIds = null, type = 'manua
         quotaUsed += Math.ceil(batchIds.length / 50);
 
         for (const vid of videoData) {
-          const mongoId = idByYt.get(vid.id);
-          if (!mongoId) continue;
+          const localId = idByYt.get(vid.id);
+          if (!localId) continue;
 
           const views = parseInt(vid.statistics?.viewCount) || 0;
           const likes = parseInt(vid.statistics?.likeCount) || 0;
           const comments = parseInt(vid.statistics?.commentCount) || 0;
 
-          const savedVideo = await Video.findOneAndUpdate(
-            { _id: mongoId },
-            {
-              title: vid.snippet?.title || '',
-              description: vid.snippet?.description || '',
-              thumbnailUrl:
-                vid.snippet?.thumbnails?.high?.url ||
-                vid.snippet?.thumbnails?.default?.url ||
-                '',
-              publishedAt: vid.snippet?.publishedAt,
-              views,
-              likes,
-              comments,
-              duration: vid.contentDetails?.duration || '',
-              lastSyncedAt: new Date(),
-            },
-            { new: true }
-          );
+          // Mongoose used findOneAndUpdate(...) which returns null when the
+          // target row is missing (e.g. deleted mid-flight). Prisma raises
+          // P2025 on missing rows, so emulate the soft-skip by catching it.
+          let savedVideo = null;
+          try {
+            savedVideo = await prisma.video.update({
+              where: { id: localId },
+              data: {
+                title: vid.snippet?.title || '',
+                description: vid.snippet?.description || '',
+                thumbnailUrl: pickThumbnail(vid.snippet?.thumbnails),
+                publishedAt: vid.snippet?.publishedAt ? new Date(vid.snippet.publishedAt) : null,
+                views: BigInt(views),
+                likes,
+                comments,
+                duration: vid.contentDetails?.duration || '',
+                lastSyncedAt: new Date(),
+              },
+            });
+          } catch (e) {
+            if (e?.code === 'P2025') {
+              savedVideo = null;
+            } else {
+              throw e;
+            }
+          }
 
           if (!savedVideo) continue;
 
-          await VideoSnapshot.findOneAndUpdate(
-            { videoId: savedVideo._id, date: today },
-            {
-              videoId: savedVideo._id,
+          await prisma.videoSnapshot.upsert({
+            where: { videoId_date: { videoId: savedVideo.id, date: today } },
+            update: {
               channelId: savedVideo.channelId,
-              date: today,
-              views,
+              views: BigInt(views),
               likes,
               comments,
             },
-            { upsert: true, new: true }
-          );
+            create: {
+              videoId: savedVideo.id,
+              channelId: savedVideo.channelId,
+              date: today,
+              views: BigInt(views),
+              likes,
+              comments,
+            },
+          });
 
           videosProcessed++;
         }
@@ -825,26 +958,37 @@ export async function syncIhiSadhguruVideoStats(channelIds = null, type = 'manua
           break;
         }
         logger.error(`[IHI Sadhguru Stats] Batch error: ${err.message}`);
-        syncLog.errors.push({ channelId: 'batch', message: err.message });
+        errors.push({ channelId: 'batch', message: err.message });
       }
     }
 
-    syncLog.videosProcessed = videosProcessed;
-    syncLog.quotaUsed = quotaUsed;
-    syncLog.status =
-      syncLog.errors.length > 0 ? 'partial' : 'success';
-    syncLog.completedAt = new Date();
-    await syncLog.save();
+    syncLog = await prisma.syncLog.update({
+      where: { id: syncLog.id },
+      data: {
+        videosProcessed,
+        quotaUsed,
+        errors,
+        status: errors.length > 0 ? 'partial' : 'success',
+        completedAt: new Date(),
+      },
+    });
 
     logger.info(
       `[IHI Sadhguru Stats] Done: ${videosProcessed} videos, ${quotaUsed} quota`
     );
   } catch (err) {
     logger.error(`[IHI Sadhguru Stats] Failed: ${err.message}`);
-    syncLog.status = 'failed';
-    syncLog.errors.push({ channelId: 'global', message: err.message });
-    syncLog.completedAt = new Date();
-    await syncLog.save();
+    errors.push({ channelId: 'global', message: err.message });
+    syncLog = await prisma.syncLog.update({
+      where: { id: syncLog.id },
+      data: {
+        videosProcessed,
+        quotaUsed,
+        errors,
+        status: 'failed',
+        completedAt: new Date(),
+      },
+    });
   } finally {
     isIhiSadhguruStatsSyncing = false;
   }
@@ -871,7 +1015,12 @@ export async function pullAllChannelVideos(channelId) {
   }
 
   isPullingAllVideos = true;
-  const channel = await Channel.findById(channelId);
+  let channel;
+  try {
+    channel = await prisma.channel.findUnique({ where: { id: channelId } });
+  } catch {
+    channel = null;
+  }
   if (!channel) {
     isPullingAllVideos = false;
     throw new Error('Channel not found');
@@ -885,8 +1034,11 @@ export async function pullAllChannelVideos(channelId) {
       throw new Error('Channel has no uploads playlist');
     }
     uploadsPlaylistId = ytChannel.contentDetails.relatedPlaylists.uploads;
+    await prisma.channel.update({
+      where: { id: channel.id },
+      data: { uploadsPlaylistId },
+    });
     channel.uploadsPlaylistId = uploadsPlaylistId;
-    await channel.save();
   }
 
   try {
@@ -914,38 +1066,42 @@ export async function pullAllChannelVideos(channelId) {
           const likes = parseInt(vid.statistics?.likeCount) || 0;
           const comments = parseInt(vid.statistics?.commentCount) || 0;
 
-          const savedVideo = await Video.findOneAndUpdate(
-            { youtubeVideoId: vid.id },
-            {
-              youtubeVideoId: vid.id,
-              channelId: channel._id,
-              title: vid.snippet?.title || '',
-              description: vid.snippet?.description || '',
-              thumbnailUrl:
-                vid.snippet?.thumbnails?.high?.url ||
-                vid.snippet?.thumbnails?.default?.url || '',
-              publishedAt: vid.snippet?.publishedAt,
-              views,
-              likes,
-              comments,
-              duration: vid.contentDetails?.duration || '',
-              lastSyncedAt: new Date(),
-            },
-            { upsert: true, new: true }
-          );
+          const videoCommon = {
+            channelId: channel.id,
+            title: vid.snippet?.title || '',
+            description: vid.snippet?.description || '',
+            thumbnailUrl: pickThumbnail(vid.snippet?.thumbnails),
+            publishedAt: vid.snippet?.publishedAt ? new Date(vid.snippet.publishedAt) : null,
+            views: BigInt(views),
+            likes,
+            comments,
+            duration: vid.contentDetails?.duration || '',
+            lastSyncedAt: new Date(),
+          };
 
-          await VideoSnapshot.findOneAndUpdate(
-            { videoId: savedVideo._id, date: today },
-            {
-              videoId: savedVideo._id,
-              channelId: channel._id,
-              date: today,
-              views,
+          const savedVideo = await prisma.video.upsert({
+            where: { youtubeVideoId: vid.id },
+            update: videoCommon,
+            create: { youtubeVideoId: vid.id, ...videoCommon },
+          });
+
+          await prisma.videoSnapshot.upsert({
+            where: { videoId_date: { videoId: savedVideo.id, date: today } },
+            update: {
+              channelId: channel.id,
+              views: BigInt(views),
               likes,
               comments,
             },
-            { upsert: true, new: true }
-          );
+            create: {
+              videoId: savedVideo.id,
+              channelId: channel.id,
+              date: today,
+              views: BigInt(views),
+              likes,
+              comments,
+            },
+          });
 
           videosProcessed++;
         } catch (err) {
@@ -956,25 +1112,24 @@ export async function pullAllChannelVideos(channelId) {
 
     const allPulled = videosProcessed === allVideoIds.length;
     if (allPulled) {
-      channel.allVideosPulled = true;
-      await channel.save();
+      await prisma.channel.update({
+        where: { id: channel.id },
+        data: { allVideosPulled: true },
+      });
     }
 
     let dedicatedAutoClassified = 0;
     if (isDedicatedChannel(channel)) {
-      const classifyResult = await Video.updateMany(
-        {
-          channelId: channel._id,
+      const classifyResult = await prisma.video.updateMany({
+        where: {
+          channelId: channel.id,
           deletedAt: null,
-          $or: [
-            { classification: { $exists: false } },
-            { classification: '' },
-            { classification: null },
-          ],
+          classification: '',
         },
-        { $set: { classification: 'sadhguru' } }
-      );
-      dedicatedAutoClassified = classifyResult.modifiedCount || 0;
+        data: { classification: 'sadhguru' },
+      });
+      dedicatedAutoClassified =
+        classifyResult.count ?? classifyResult.modifiedCount ?? 0;
       if (dedicatedAutoClassified > 0) {
         logger.info(
           `[Pull All Videos] Dedicated auto-classified ${dedicatedAutoClassified} videos as sadhguru for channel ${channel.title}`
@@ -1006,10 +1161,13 @@ export async function pullAllChannelsVideos() {
     throw new Error('Pull all videos already in progress');
   }
 
-  const channels = await Channel.find({
-    status: { $ne: 'archived' },
-    allVideosPulled: { $ne: true },
-  }).sort({ title: 1 });
+  const channels = await prisma.channel.findMany({
+    where: {
+      status: { not: 'archived' },
+      allVideosPulled: { not: true },
+    },
+    orderBy: { title: 'asc' },
+  });
 
   const channelsWithPlaylist = channels.filter(
     (ch) => ch.uploadsPlaylistId || ch.youtubeChannelId
@@ -1036,7 +1194,7 @@ export async function pullAllChannelsVideos() {
     }
 
     try {
-      const result = await pullAllChannelVideos(channel._id);
+      const result = await pullAllChannelVideos(channel.id);
       channelsProcessed++;
       totalVideosPulled += result.videosProcessed;
     } catch (err) {
@@ -1045,7 +1203,7 @@ export async function pullAllChannelsVideos() {
         break;
       }
       logger.error(`[Pull All Channels] Error on ${channel.title}: ${err.message}`);
-      errors.push({ channelId: channel._id, title: channel.title, message: err.message });
+      errors.push({ channelId: channel.id, title: channel.title, message: err.message });
     }
   }
 
