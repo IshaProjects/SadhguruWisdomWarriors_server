@@ -499,123 +499,136 @@ describe('updateChannelActivityStatuses', () => {
 // ────────────────────────────────────────────────────────────────────────────
 
 describe('syncVideoStats', () => {
-  it('returns a success log when no dedicated channels exist', async () => {
-    await prisma.channel.create({
-      data: { youtubeChannelId: 'UC_x', category: 'Other' },
-    });
-    const log = await syncVideoStats();
-    expect(log.status).toBe('success');
-    expect(fetchPlaylistItems).not.toHaveBeenCalled();
-  });
-
-  it('processes videos for dedicated channels and writes snapshots', async () => {
-    const ch = await prisma.channel.create({
-      data: {
-        youtubeChannelId: 'UC_d',
-        uploadsPlaylistId: 'UU_d',
-        category: 'Dedicated Sadhguru',
-      },
-    });
-    fetchPlaylistItems.mockResolvedValue([makePlaylistItem('v1'), makePlaylistItem('v2')]);
-    fetchVideosBatch.mockResolvedValue([
-      makeYtVideo({ id: 'v1' }),
-      makeYtVideo({ id: 'v2', statistics: { viewCount: '200', likeCount: '20', commentCount: '15' } }),
-    ]);
-    const log = await syncVideoStats([ch.id]);
-    expect(log.status).toBe('success');
-    expect(log.videosProcessed).toBe(2);
-    const v1 = await prisma.video.findUnique({ where: { youtubeVideoId: 'v1' } });
-    expect(v1.title).toBe('Default Video');
-    expect(Number(v1.views)).toBe(100);
-    const v2 = await prisma.video.findUnique({ where: { youtubeVideoId: 'v2' } });
-    expect(Number(v2.views)).toBe(200);
-    const snaps = await prisma.videoSnapshot.findMany({});
-    expect(snaps).toHaveLength(2);
-  });
-
-  it('upsert: second call updates existing video, no duplicate', async () => {
-    const ch = await prisma.channel.create({
-      data: {
-        youtubeChannelId: 'UC_d',
-        uploadsPlaylistId: 'UU_d',
-        category: 'Dedicated Sadhguru',
-      },
-    });
-    fetchPlaylistItems.mockResolvedValue([makePlaylistItem('v1')]);
-    fetchVideosBatch.mockResolvedValue([makeYtVideo({ id: 'v1' })]);
-    await syncVideoStats([ch.id]);
-    fetchVideosBatch.mockResolvedValue([
-      makeYtVideo({ id: 'v1', statistics: { viewCount: '999', likeCount: '99', commentCount: '99' } }),
-    ]);
-    await syncVideoStats([ch.id]);
-    const vids = await prisma.video.findMany({});
-    expect(vids).toHaveLength(1);
-    expect(Number(vids[0].views)).toBe(999);
-  });
-
-  it('skips channels without uploadsPlaylistId', async () => {
-    await prisma.channel.create({
-      data: { youtubeChannelId: 'UC_n', category: 'Dedicated Sadhguru' /* no uploadsPlaylistId */ },
-    });
-    const log = await syncVideoStats();
-    expect(log.status).toBe('success');
-    expect(log.videosProcessed).toBe(0);
-    expect(fetchPlaylistItems).not.toHaveBeenCalled();
-  });
-
-  it('breaks early when quota is low (before any fetch)', async () => {
-    await prisma.channel.create({
-      data: {
-        youtubeChannelId: 'UC_d',
-        uploadsPlaylistId: 'UU_d',
-        category: 'Dedicated Sadhguru',
-      },
-    });
-    getQuotaUsage.mockReturnValue(LOW_QUOTA);
-    const log = await syncVideoStats();
-    expect(log.status).toBe('success');
-    expect(fetchPlaylistItems).not.toHaveBeenCalled();
-  });
-
-  it('skips when playlistItems comes back empty', async () => {
-    await prisma.channel.create({
-      data: {
-        youtubeChannelId: 'UC_d',
-        uploadsPlaylistId: 'UU_d',
-        category: 'Dedicated Sadhguru',
-      },
-    });
-    fetchPlaylistItems.mockResolvedValue([]);
+  it('returns a success log when no channels exist', async () => {
     const log = await syncVideoStats();
     expect(log.status).toBe('success');
     expect(fetchVideosBatch).not.toHaveBeenCalled();
   });
 
-  it('breaks on QUOTA_EXCEEDED from a per-channel call', async () => {
+  it('returns a success log when channels exist but no videos in scope', async () => {
     await prisma.channel.create({
-      data: {
-        youtubeChannelId: 'UC_d',
-        uploadsPlaylistId: 'UU_d',
-        category: 'Dedicated Sadhguru',
-      },
+      data: { youtubeChannelId: 'UC_x', category: 'Dedicated Sadhguru' },
     });
-    fetchPlaylistItems.mockRejectedValue(new Error('QUOTA_EXCEEDED'));
     const log = await syncVideoStats();
     expect(log.status).toBe('success');
+    expect(log.videosProcessed).toBe(0);
+    expect(fetchVideosBatch).not.toHaveBeenCalled();
   });
 
-  it('captures non-quota per-channel errors as partial', async () => {
-    await prisma.channel.create({
-      data: {
-        youtubeChannelId: 'UC_d',
-        uploadsPlaylistId: 'UU_d',
-        category: 'Dedicated Sadhguru',
-      },
+  it('refreshes stats + writes snapshots for every live video across all channel groups', async () => {
+    const ded = await prisma.channel.create({
+      data: { youtubeChannelId: 'UC_d', category: 'Dedicated Sadhguru' },
     });
-    fetchPlaylistItems.mockRejectedValue(new Error('boom'));
+    const ihi = await prisma.channel.create({
+      data: { youtubeChannelId: 'UC_i', category: 'IHI Live' },
+    });
+    const other = await prisma.channel.create({
+      data: { youtubeChannelId: 'UC_o', category: 'Other' },
+    });
+    await prisma.video.create({ data: { youtubeVideoId: 'v_d', channelId: ded.id } });
+    await prisma.video.create({ data: { youtubeVideoId: 'v_i', channelId: ihi.id } });
+    await prisma.video.create({ data: { youtubeVideoId: 'v_o', channelId: other.id } });
+
+    fetchVideosBatch.mockResolvedValueOnce([
+      makeYtVideo({ id: 'v_d' }),
+      makeYtVideo({ id: 'v_i', statistics: { viewCount: '200', likeCount: '20', commentCount: '15' } }),
+      makeYtVideo({ id: 'v_o', statistics: { viewCount: '300', likeCount: '30', commentCount: '25' } }),
+    ]);
+
+    const log = await syncVideoStats();
+    expect(log.status).toBe('success');
+    expect(log.videosProcessed).toBe(3);
+    expect(fetchVideosBatch).toHaveBeenCalledTimes(1);
+    const snaps = await prisma.videoSnapshot.findMany({ orderBy: { views: 'asc' } });
+    expect(snaps).toHaveLength(3);
+    expect(Number(snaps[0].views)).toBe(100);
+    expect(Number(snaps[2].views)).toBe(300);
+  });
+
+  it('upsert: second call updates the same snapshot row, no duplicate', async () => {
+    const ch = await prisma.channel.create({
+      data: { youtubeChannelId: 'UC_d', category: 'Dedicated Sadhguru' },
+    });
+    await prisma.video.create({ data: { youtubeVideoId: 'v1', channelId: ch.id } });
+
+    fetchVideosBatch.mockResolvedValueOnce([makeYtVideo({ id: 'v1' })]);
+    await syncVideoStats([ch.id]);
+
+    fetchVideosBatch.mockResolvedValueOnce([
+      makeYtVideo({ id: 'v1', statistics: { viewCount: '999', likeCount: '99', commentCount: '99' } }),
+    ]);
+    await syncVideoStats([ch.id]);
+
+    const vids = await prisma.video.findMany({});
+    expect(vids).toHaveLength(1);
+    expect(Number(vids[0].views)).toBe(999);
+    const snaps = await prisma.videoSnapshot.findMany({});
+    expect(snaps).toHaveLength(1);
+    expect(Number(snaps[0].views)).toBe(999);
+  });
+
+  it('skips soft-deleted videos', async () => {
+    const ch = await prisma.channel.create({
+      data: { youtubeChannelId: 'UC_d', category: 'Dedicated Sadhguru' },
+    });
+    await prisma.video.create({
+      data: { youtubeVideoId: 'v_live', channelId: ch.id },
+    });
+    await prisma.video.create({
+      data: { youtubeVideoId: 'v_dead', channelId: ch.id, deletedAt: new Date() },
+    });
+
+    fetchVideosBatch.mockResolvedValueOnce([makeYtVideo({ id: 'v_live' })]);
+    const log = await syncVideoStats([ch.id]);
+    expect(log.videosProcessed).toBe(1);
+    const calledWith = fetchVideosBatch.mock.calls[0][0];
+    expect(calledWith).toEqual(['v_live']);
+  });
+
+  it('skips archived channels entirely (channel-level scope filter)', async () => {
+    const arch = await prisma.channel.create({
+      data: { youtubeChannelId: 'UC_arch', category: 'Dedicated Sadhguru', status: 'archived' },
+    });
+    await prisma.video.create({ data: { youtubeVideoId: 'v_arch', channelId: arch.id } });
+
+    const log = await syncVideoStats();
+    expect(log.status).toBe('success');
+    expect(log.videosProcessed).toBe(0);
+    expect(fetchVideosBatch).not.toHaveBeenCalled();
+  });
+
+  it('breaks early when quota is low (before any fetch)', async () => {
+    const ch = await prisma.channel.create({
+      data: { youtubeChannelId: 'UC_d', category: 'Dedicated Sadhguru' },
+    });
+    await prisma.video.create({ data: { youtubeVideoId: 'v1', channelId: ch.id } });
+    getQuotaUsage.mockReturnValue(LOW_QUOTA);
+    const log = await syncVideoStats();
+    expect(log.status).toBe('success');
+    expect(fetchVideosBatch).not.toHaveBeenCalled();
+  });
+
+  it('stops processing on QUOTA_EXCEEDED from a batch fetch', async () => {
+    const ch = await prisma.channel.create({
+      data: { youtubeChannelId: 'UC_d', category: 'Dedicated Sadhguru' },
+    });
+    await prisma.video.create({ data: { youtubeVideoId: 'v1', channelId: ch.id } });
+    fetchVideosBatch.mockRejectedValueOnce(new Error('QUOTA_EXCEEDED'));
+    const log = await syncVideoStats();
+    expect(log.status).toBe('success'); // no errors recorded because quota stop is graceful
+    expect(log.errors).toEqual([]);
+  });
+
+  it('captures non-quota batch errors as partial (attributes channel id of first video in slice)', async () => {
+    const ch = await prisma.channel.create({
+      data: { youtubeChannelId: 'UC_d', category: 'Dedicated Sadhguru' },
+    });
+    await prisma.video.create({ data: { youtubeVideoId: 'v1', channelId: ch.id } });
+    fetchVideosBatch.mockRejectedValueOnce(new Error('boom'));
     const log = await syncVideoStats();
     expect(log.status).toBe('partial');
     expect(log.errors[0].channelId).toBe('UC_d');
+    expect(log.errors[0].message).toBe('boom');
   });
 
   it('global error path → failed', async () => {
@@ -629,15 +642,12 @@ describe('syncVideoStats', () => {
 
   it('re-entrancy: parallel calls → one is rejected', async () => {
     const ch = await prisma.channel.create({
-      data: {
-        youtubeChannelId: 'UC_d',
-        uploadsPlaylistId: 'UU_d',
-        category: 'Dedicated Sadhguru',
-      },
+      data: { youtubeChannelId: 'UC_d', category: 'Dedicated Sadhguru' },
     });
+    await prisma.video.create({ data: { youtubeVideoId: 'v1', channelId: ch.id } });
     let release;
     const blocker = new Promise((r) => { release = r; });
-    fetchPlaylistItems.mockImplementation(async () => { await blocker; return []; });
+    fetchVideosBatch.mockImplementation(async () => { await blocker; return []; });
     const a = syncVideoStats([ch.id]);
     await new Promise((r) => setTimeout(r, 0));
     await expect(syncVideoStats([ch.id])).rejects.toThrow('Video sync already in progress');
@@ -647,14 +657,10 @@ describe('syncVideoStats', () => {
 
   it('handles missing snippet thumbnails / statistics fields (uses defaults)', async () => {
     const ch = await prisma.channel.create({
-      data: {
-        youtubeChannelId: 'UC_d',
-        uploadsPlaylistId: 'UU_d',
-        category: 'Dedicated Sadhguru',
-      },
+      data: { youtubeChannelId: 'UC_d', category: 'Dedicated Sadhguru' },
     });
-    fetchPlaylistItems.mockResolvedValue([makePlaylistItem('v1')]);
-    fetchVideosBatch.mockResolvedValue([{ id: 'v1' }]);
+    await prisma.video.create({ data: { youtubeVideoId: 'v1', channelId: ch.id } });
+    fetchVideosBatch.mockResolvedValueOnce([{ id: 'v1' }]);
     const log = await syncVideoStats([ch.id]);
     expect(log.status).toBe('success');
     const v = await prisma.video.findUnique({ where: { youtubeVideoId: 'v1' } });
@@ -666,14 +672,10 @@ describe('syncVideoStats', () => {
 
   it('falls back to default thumbnail when only default thumbnail present', async () => {
     const ch = await prisma.channel.create({
-      data: {
-        youtubeChannelId: 'UC_d',
-        uploadsPlaylistId: 'UU_d',
-        category: 'Dedicated Sadhguru',
-      },
+      data: { youtubeChannelId: 'UC_d', category: 'Dedicated Sadhguru' },
     });
-    fetchPlaylistItems.mockResolvedValue([makePlaylistItem('v1')]);
-    fetchVideosBatch.mockResolvedValue([
+    await prisma.video.create({ data: { youtubeVideoId: 'v1', channelId: ch.id } });
+    fetchVideosBatch.mockResolvedValueOnce([
       {
         id: 'v1',
         snippet: { title: 'T', thumbnails: { default: { url: 'https://thumb/default.jpg' } } },
@@ -684,6 +686,26 @@ describe('syncVideoStats', () => {
     await syncVideoStats([ch.id]);
     const v = await prisma.video.findUnique({ where: { youtubeVideoId: 'v1' } });
     expect(v.thumbnailUrl).toBe('https://thumb/default.jpg');
+  });
+
+  it('chunks large video lists into 50-batch groups', async () => {
+    const ch = await prisma.channel.create({
+      data: { youtubeChannelId: 'UC_d', category: 'Dedicated Sadhguru' },
+    });
+    // 75 videos → 2 batches (50 + 25)
+    const videos = Array.from({ length: 75 }, (_, i) => ({
+      youtubeVideoId: `v${i}`,
+      channelId: ch.id,
+    }));
+    await prisma.video.createMany({ data: videos });
+    fetchVideosBatch.mockImplementation(async (ids) => ids.map((id) => makeYtVideo({ id })));
+
+    const log = await syncVideoStats([ch.id]);
+    expect(log.status).toBe('success');
+    expect(log.videosProcessed).toBe(75);
+    expect(fetchVideosBatch).toHaveBeenCalledTimes(2);
+    expect(fetchVideosBatch.mock.calls[0][0]).toHaveLength(50);
+    expect(fetchVideosBatch.mock.calls[1][0]).toHaveLength(25);
   });
 });
 

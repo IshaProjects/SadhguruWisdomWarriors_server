@@ -274,9 +274,17 @@ export async function updateChannelActivityStatuses(type = 'auto') {
 }
 
 // ---------------------------------------------------------------------------
-// Video sync — upserts Video rows + VideoSnapshot history (Dedicated only,
-// top 10 most-recent uploads per channel).
+// Video sync — refresh stats + a daily snapshot for every live video across
+// every active channel (Dedicated, IHI, Other). Iterates the stored video
+// table (rather than re-walking each channel's uploads playlist), so the only
+// YouTube quota cost is one `videos.list` batch per 50 videos.
+//
+// At present scale (~37k live videos) that's ~750 quota units for the whole
+// daily pass — ~8% of the 10k daily cap.
 // ---------------------------------------------------------------------------
+const VIDEO_FETCH_BATCH = 50;        // YouTube videos.list cap
+const VIDEO_FETCH_PARALLELISM = 5;   // concurrent batches
+
 export async function syncVideoStats(channelIds = null, type = 'manual') {
   if (isVideoSyncing) {
     throw new Error('Video sync already in progress');
@@ -296,13 +304,32 @@ export async function syncVideoStats(channelIds = null, type = 'manual') {
   const errors = [];
   let videosProcessed = 0;
   let quotaUsed = 0;
+  let quotaExceeded = false;
 
   try {
-    const where = { status: { not: 'archived' } };
-    if (channelIds) where.id = { in: channelIds };
-    const channels = (await prisma.channel.findMany({ where })).filter(isDedicatedChannel);
+    const channelWhere = { status: { not: 'archived' } };
+    if (channelIds) channelWhere.id = { in: channelIds };
+    const channels = await prisma.channel.findMany({
+      where: channelWhere,
+      select: { id: true, youtubeChannelId: true },
+    });
 
     if (channels.length === 0) {
+      syncLog = await prisma.syncLog.update({
+        where: { id: syncLog.id },
+        data: { status: 'success', completedAt: new Date() },
+      });
+      return syncLog;
+    }
+
+    const channelIdSet = channels.map((c) => c.id);
+    const ytChannelById = new Map(channels.map((c) => [c.id, c.youtubeChannelId]));
+    const videos = await prisma.video.findMany({
+      where: { channelId: { in: channelIdSet }, deletedAt: null },
+      select: { id: true, youtubeVideoId: true, channelId: true },
+    });
+
+    if (videos.length === 0) {
       syncLog = await prisma.syncLog.update({
         where: { id: syncLog.id },
         data: { status: 'success', completedAt: new Date() },
@@ -313,81 +340,105 @@ export async function syncVideoStats(channelIds = null, type = 'manual') {
     const today = utcStartOfDay();
 
     logger.info(
-      `[Video Sync] Dedicated channels only — syncing videos for ${channels.length} channels...`
+      `[Video Sync] Syncing ${videos.length} videos across ${channels.length} channels...`
     );
 
-    for (const channel of channels) {
-      if (!channel.uploadsPlaylistId) continue;
+    const localByYt = new Map(videos.map((v) => [v.youtubeVideoId, v]));
+    const batches = [];
+    for (let i = 0; i < videos.length; i += VIDEO_FETCH_BATCH) {
+      batches.push(videos.slice(i, i + VIDEO_FETCH_BATCH));
+    }
 
+    // Run batches in groups of VIDEO_FETCH_PARALLELISM so we trade wall-time
+    // for a bounded burst of concurrent HTTP requests against YouTube. Each
+    // batch is one quota unit regardless of how many parts we ask for.
+    for (let g = 0; g < batches.length; g += VIDEO_FETCH_PARALLELISM) {
+      if (quotaExceeded) break;
       const quota = getQuotaUsage();
-      if (quota.remaining < 10) {
+      if (quota.remaining < VIDEO_FETCH_PARALLELISM + 1) {
         logger.warn('[Video Sync] Approaching quota limit, stopping');
         break;
       }
+      const group = batches.slice(g, g + VIDEO_FETCH_PARALLELISM);
 
-      try {
-        const playlistItems = await fetchPlaylistItems(channel.uploadsPlaylistId, 10);
+      const groupResults = await Promise.allSettled(
+        group.map(async (slice) => {
+          const ytIds = slice.map((v) => v.youtubeVideoId);
+          const videoData = await fetchVideosBatch(ytIds);
+          return videoData;
+        }),
+      );
+
+      for (let r = 0; r < groupResults.length; r += 1) {
+        const result = groupResults[r];
+        const slice = group[r];
+        if (result.status === 'rejected') {
+          const err = result.reason;
+          if (err.message === 'QUOTA_EXCEEDED') {
+            logger.error('[Video Sync] Quota exceeded');
+            quotaExceeded = true;
+            continue;
+          }
+          // Attribute the batch failure to the first channel in the slice for
+          // the syncLog `errors` array (keeps the same shape as legacy logs).
+          const ytChannel = ytChannelById.get(slice[0].channelId) ?? 'unknown';
+          logger.error(`[Video Sync] Batch fetch error: ${err.message}`);
+          errors.push({ channelId: ytChannel, message: err.message });
+          continue;
+        }
         quotaUsed += 1;
-
-        if (playlistItems.length === 0) continue;
-
-        const videoIds = playlistItems.map((item) => item.contentDetails.videoId);
-        const videoData = await fetchVideosBatch(videoIds);
-        quotaUsed += Math.ceil(videoIds.length / 50);
-
-        for (const vid of videoData) {
-          const views    = parseInt(vid.statistics?.viewCount)    || 0;
-          const likes    = parseInt(vid.statistics?.likeCount)    || 0;
+        for (const vid of result.value) {
+          const local = localByYt.get(vid.id);
+          if (!local) continue;
+          const views = parseInt(vid.statistics?.viewCount) || 0;
+          const likes = parseInt(vid.statistics?.likeCount) || 0;
           const comments = parseInt(vid.statistics?.commentCount) || 0;
 
           const videoCommon = {
-            channelId:   channel.id,
-            title:       vid.snippet?.title       || '',
+            channelId: local.channelId,
+            title: vid.snippet?.title || '',
             description: vid.snippet?.description || '',
             thumbnailUrl: pickThumbnail(vid.snippet?.thumbnails),
             publishedAt: vid.snippet?.publishedAt ? new Date(vid.snippet.publishedAt) : null,
-            views:    BigInt(views),
+            views: BigInt(views),
             likes,
             comments,
             duration: vid.contentDetails?.duration || '',
             lastSyncedAt: new Date(),
           };
 
-          const savedVideo = await prisma.video.upsert({
-            where: { youtubeVideoId: vid.id },
-            update: videoCommon,
-            create: { youtubeVideoId: vid.id, ...videoCommon },
-          });
+          try {
+            const savedVideo = await prisma.video.upsert({
+              where: { youtubeVideoId: vid.id },
+              update: videoCommon,
+              create: { youtubeVideoId: vid.id, ...videoCommon },
+            });
 
-          await prisma.videoSnapshot.upsert({
-            where: { videoId_date: { videoId: savedVideo.id, date: today } },
-            update: {
-              channelId: channel.id,
-              views: BigInt(views),
-              likes,
-              comments,
-            },
-            create: {
-              videoId: savedVideo.id,
-              channelId: channel.id,
-              date: today,
-              views: BigInt(views),
-              likes,
-              comments,
-            },
-          });
+            await prisma.videoSnapshot.upsert({
+              where: { videoId_date: { videoId: savedVideo.id, date: today } },
+              update: {
+                channelId: local.channelId,
+                views: BigInt(views),
+                likes,
+                comments,
+              },
+              create: {
+                videoId: savedVideo.id,
+                channelId: local.channelId,
+                date: today,
+                views: BigInt(views),
+                likes,
+                comments,
+              },
+            });
 
-          videosProcessed++;
+            videosProcessed += 1;
+          } catch (err) {
+            const ytChannel = ytChannelById.get(local.channelId) ?? 'unknown';
+            logger.error(`[Video Sync] Upsert failed for ${vid.id}: ${err.message}`);
+            errors.push({ channelId: ytChannel, message: `${vid.id}: ${err.message}` });
+          }
         }
-      } catch (err) {
-        if (err.message === 'QUOTA_EXCEEDED') {
-          logger.error('[Video Sync] Quota exceeded');
-          break;
-        }
-        logger.error(
-          `[Video Sync] Error on channel ${channel.youtubeChannelId}: ${err.message}`
-        );
-        errors.push({ channelId: channel.youtubeChannelId, message: err.message });
       }
     }
 
