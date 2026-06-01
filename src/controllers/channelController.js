@@ -1,8 +1,4 @@
-import Channel from '../models/Channel.js';
-import ChannelSnapshot from '../models/ChannelSnapshot.js';
-import Video from '../models/Video.js';
-import Category from '../models/Category.js';
-import mongoose from 'mongoose';
+import { prisma } from '../config/prisma.js';
 import { fetchSingleChannel, resolveChannelByHandle, fetchChannelByHandle } from '../services/youtubeApi.js';
 import { syncChannels, pullAllChannelVideos, pullAllChannelsVideos } from '../services/syncEngine.js';
 import { classifySadguruVideoBatch } from '../services/vertexAiService.js';
@@ -10,6 +6,108 @@ import { extractChannelId, parseYoutubeStatInt } from '../utils/helpers.js';
 import { softDeleteChannels } from '../utils/softDelete.js';
 import { parse } from 'csv-parse/sync';
 import { utcStartOfDay } from '../utils/dateUtc.js';
+
+// ---------------------------------------------------------------------------
+// Helpers — shape Prisma rows to the legacy (Mongoose) API contract so the
+// existing API consumers (and the parity tests) keep working unchanged.
+// ---------------------------------------------------------------------------
+
+/** Pull a value from either a flattened or nested ("currentStats.x") field */
+function bigIntToNumber(v) {
+  if (v == null) return v;
+  if (typeof v === 'bigint') return Number(v);
+  return v;
+}
+
+/** Reshape a Prisma channel row to the legacy Mongoose JSON shape. */
+function serializeChannel(c) {
+  if (!c) return c;
+  const {
+    id,
+    assignedToId,
+    assignedTo,
+    currentSubscribers,
+    currentViews,
+    currentVideoCount,
+    ...rest
+  } = c;
+
+  // assignedTo: when included, return { _id, name, email }; when absent or
+  // explicitly null, return null. Old API surfaced an ObjectId hex string for
+  // un-populated relations — for parity we collapse to null when no related
+  // user object is present (callers that need the raw id can use assignedToId).
+  let assignedToOut = null;
+  if (assignedTo && typeof assignedTo === 'object') {
+    assignedToOut = { _id: assignedTo.id, name: assignedTo.name, email: assignedTo.email };
+  }
+
+  return {
+    ...rest,
+    _id: id,
+    id,
+    assignedTo: assignedToOut,
+    currentStats: {
+      subscribers: currentSubscribers ?? 0,
+      views: bigIntToNumber(currentViews) ?? 0,
+      videoCount: currentVideoCount ?? 0,
+    },
+  };
+}
+
+function serializeVideo(v) {
+  if (!v) return v;
+  return {
+    ...v,
+    _id: v.id,
+    views: bigIntToNumber(v.views) ?? 0,
+    // likes/comments are Int already — no conversion needed.
+  };
+}
+
+function serializeSnapshot(s) {
+  if (!s) return s;
+  return {
+    ...s,
+    _id: s.id,
+    views: bigIntToNumber(s.views) ?? 0,
+  };
+}
+
+/**
+ * Validate a Prisma channel id. Cuids are reasonably long alphanumeric strings;
+ * anything else (e.g. "not-an-id") triggers a 400 to mirror the Mongoose
+ * CastError → 400 behaviour the old controller relied on.
+ */
+function isValidId(id) {
+  return typeof id === 'string' && /^[a-z0-9]{20,}$/i.test(id);
+}
+
+/** Translate a Mongo-style sort string (e.g. "-currentStats.subscribers") to Prisma orderBy. */
+function parseChannelSort(sort) {
+  const raw = (sort || '-currentStats.subscribers').trim();
+  const desc = raw.startsWith('-');
+  const field = desc ? raw.slice(1) : raw;
+  const dir = desc ? 'desc' : 'asc';
+
+  const fieldMap = {
+    'currentStats.subscribers': 'currentSubscribers',
+    'currentStats.views': 'currentViews',
+    'currentStats.videoCount': 'currentVideoCount',
+    title: 'title',
+    createdAt: 'createdAt',
+    updatedAt: 'updatedAt',
+    lastSyncedAt: 'lastSyncedAt',
+    publishedAt: 'publishedAt',
+    category: 'category',
+    status: 'status',
+  };
+  const prismaField = fieldMap[field] || 'currentSubscribers';
+  return [{ [prismaField]: dir }];
+}
+
+// ---------------------------------------------------------------------------
+// Controllers
+// ---------------------------------------------------------------------------
 
 export async function listChannels(req, res, next) {
   try {
@@ -27,57 +125,66 @@ export async function listChannels(req, res, next) {
       maxSubs,
     } = req.query;
 
-    const filter = {};
+    const where = { deletedAt: null };
 
     if (search) {
-      filter.$or = [
-        { title: { $regex: search, $options: 'i' } },
-        { youtubeChannelId: { $regex: search, $options: 'i' } },
-        { customUrl: { $regex: search, $options: 'i' } },
+      where.OR = [
+        { title: { contains: search, mode: 'insensitive' } },
+        { youtubeChannelId: { contains: search, mode: 'insensitive' } },
+        { customUrl: { contains: search, mode: 'insensitive' } },
       ];
     }
 
     if (group === 'dedicated') {
-      filter.category = { $regex: /^Dedicated/i };
+      where.category = { startsWith: 'Dedicated', mode: 'insensitive' };
     } else if (group === 'ihi') {
-      filter.category = { $regex: /IHI/i };
+      where.category = { contains: 'IHI', mode: 'insensitive' };
     } else if (category) {
-      filter.category = category;
+      where.category = category;
     }
-    if (status) filter.status = status;
-    else filter.status = { $ne: 'archived' };
+
+    if (status) {
+      where.status = status;
+    } else {
+      where.status = { not: 'archived' };
+    }
 
     if (tags && typeof tags === 'string' && tags.trim()) {
       const tagList = tags.split(',').map((t) => t.trim()).filter(Boolean);
-      if (tagList.length) filter.tags = { $in: tagList };
+      if (tagList.length) where.tags = { hasSome: tagList };
     }
 
-    if (assignedTo) filter.assignedTo = assignedTo;
+    if (assignedTo) where.assignedToId = assignedTo;
 
     if (minSubs || maxSubs) {
-      filter['currentStats.subscribers'] = {};
-      if (minSubs) filter['currentStats.subscribers'].$gte = parseInt(minSubs);
-      if (maxSubs) filter['currentStats.subscribers'].$lte = parseInt(maxSubs);
+      where.currentSubscribers = {};
+      if (minSubs) where.currentSubscribers.gte = parseInt(minSubs);
+      if (maxSubs) where.currentSubscribers.lte = parseInt(maxSubs);
     }
 
     const skip = (parseInt(page) - 1) * parseInt(limit);
-    const [channels, total, channelIdsWithUnclassified] = await Promise.all([
-      Channel.find(filter)
-        .populate('assignedTo', 'name email')
-        .sort(sort)
-        .skip(skip)
-        .limit(parseInt(limit)),
-      Channel.countDocuments(filter),
-      Video.distinct('channelId', {
-        deletedAt: null,
-        $or: [{ classification: '' }, { classification: { $exists: false } }],
+    const orderBy = parseChannelSort(sort);
+
+    const [channels, total, unclassifiedRows] = await Promise.all([
+      prisma.channel.findMany({
+        where,
+        orderBy,
+        skip,
+        take: parseInt(limit),
+        include: { assignedTo: { select: { id: true, name: true, email: true } } },
+      }),
+      prisma.channel.count({ where }),
+      prisma.video.findMany({
+        where: { deletedAt: null, classification: '' },
+        distinct: ['channelId'],
+        select: { channelId: true },
       }),
     ]);
 
-    const unclassifiedSet = new Set(channelIdsWithUnclassified.map((id) => String(id)));
+    const unclassifiedSet = new Set(unclassifiedRows.map((r) => String(r.channelId)));
     const channelsWithFlag = channels.map((ch) => ({
-      ...ch.toObject(),
-      classificationDone: !unclassifiedSet.has(String(ch._id)),
+      ...serializeChannel(ch),
+      classificationDone: !unclassifiedSet.has(String(ch.id)),
     }));
 
     res.json({
@@ -104,7 +211,6 @@ export async function addChannel(req, res, next) {
 
     let channelId = extractChannelId(channelInput);
 
-    // If we got a handle, resolve it to a channel ID
     if (channelId && typeof channelId === 'object' && channelId.handle) {
       const resolved = await resolveChannelByHandle(channelId.handle);
       if (!resolved) {
@@ -113,55 +219,56 @@ export async function addChannel(req, res, next) {
       channelId = resolved;
     }
 
-    // Check if channel already exists
-    const existing = await Channel.findOne({ youtubeChannelId: channelId });
+    const existing = await prisma.channel.findFirst({ where: { youtubeChannelId: channelId } });
     if (existing) {
-      return res.status(409).json({ message: 'Channel already tracked', channel: existing });
+      return res
+        .status(409)
+        .json({ message: 'Channel already tracked', channel: serializeChannel(existing) });
     }
 
-    // Fetch channel info from YouTube
     const ytData = await fetchSingleChannel(channelId);
     if (!ytData) {
       return res.status(404).json({ message: 'Channel not found on YouTube' });
     }
 
-    const channel = await Channel.create({
-      youtubeChannelId: channelId,
-      title: ytData.snippet.title,
-      description: ytData.snippet.description,
-      thumbnailUrl:
-        ytData.snippet.thumbnails?.high?.url ||
-        ytData.snippet.thumbnails?.default?.url ||
-        '',
-      bannerUrl: ytData.brandingSettings?.image?.bannerExternalUrl || '',
-      customUrl: ytData.snippet.customUrl || '',
-      country: ytData.snippet.country || '',
-      publishedAt: ytData.snippet.publishedAt,
-      uploadsPlaylistId:
-        ytData.contentDetails?.relatedPlaylists?.uploads || '',
-      category: category || 'Uncategorized',
-      tags: tags || [],
-      notes: notes || '',
-      assignedTo: assignedTo || null,
-      currentStats: {
-        subscribers: parseYoutubeStatInt(ytData.statistics.subscriberCount),
-        views: parseYoutubeStatInt(ytData.statistics.viewCount),
-        videoCount: parseYoutubeStatInt(ytData.statistics.videoCount),
+    const channel = await prisma.channel.create({
+      data: {
+        youtubeChannelId: channelId,
+        title: ytData.snippet.title || '',
+        description: ytData.snippet.description || '',
+        thumbnailUrl:
+          ytData.snippet.thumbnails?.high?.url ||
+          ytData.snippet.thumbnails?.default?.url ||
+          '',
+        bannerUrl: ytData.brandingSettings?.image?.bannerExternalUrl || '',
+        customUrl: ytData.snippet.customUrl || '',
+        country: ytData.snippet.country || '',
+        publishedAt: ytData.snippet.publishedAt ? new Date(ytData.snippet.publishedAt) : null,
+        uploadsPlaylistId:
+          ytData.contentDetails?.relatedPlaylists?.uploads || '',
+        category: category || 'Uncategorized',
+        tags: tags || [],
+        notes: notes || '',
+        assignedToId: assignedTo || null,
+        currentSubscribers: parseYoutubeStatInt(ytData.statistics?.subscriberCount),
+        currentViews: BigInt(parseYoutubeStatInt(ytData.statistics?.viewCount)),
+        currentVideoCount: parseYoutubeStatInt(ytData.statistics?.videoCount),
+        lastSyncedAt: new Date(),
       },
-      lastSyncedAt: new Date(),
     });
 
-    // Create initial snapshot
     const today = utcStartOfDay();
-    await ChannelSnapshot.create({
-      channelId: channel._id,
-      date: today,
-      subscribers: channel.currentStats.subscribers,
-      views: channel.currentStats.views,
-      videoCount: channel.currentStats.videoCount,
+    await prisma.channelSnapshot.create({
+      data: {
+        channelId: channel.id,
+        date: today,
+        subscribers: channel.currentSubscribers,
+        views: channel.currentViews,
+        videoCount: channel.currentVideoCount,
+      },
     });
 
-    res.status(201).json(channel);
+    res.status(201).json(serializeChannel(channel));
   } catch (err) {
     next(err);
   }
@@ -182,7 +289,7 @@ export async function bulkImport(req, res, next) {
 
     const results = { added: 0, skipped: 0, errors: [], addedChannels: [] };
 
-    // Pre-collect and upsert all categories from the CSV into the Category collection
+    // Pre-collect and upsert all categories from the CSV.
     const categoryNames = [
       ...new Set(
         records
@@ -191,7 +298,11 @@ export async function bulkImport(req, res, next) {
       ),
     ];
     for (const name of categoryNames) {
-      await Category.updateOne({ name }, { $setOnInsert: { name } }, { upsert: true });
+      await prisma.category.upsert({
+        where: { name },
+        update: {},
+        create: { name },
+      });
     }
 
     for (const record of records) {
@@ -207,8 +318,8 @@ export async function bulkImport(req, res, next) {
         let ytData = null;
 
         if (typeof parsed === 'string' && /^UC[\w-]{22}$/.test(parsed)) {
-          // Direct channel ID — cheapest lookup (1 quota unit)
-          const existing = await Channel.findOne({ youtubeChannelId: parsed });
+          // Direct channel ID — cheapest lookup
+          const existing = await prisma.channel.findFirst({ where: { youtubeChannelId: parsed } });
           if (existing) {
             results.skipped++;
             continue;
@@ -216,10 +327,10 @@ export async function bulkImport(req, res, next) {
           ytData = await fetchSingleChannel(parsed);
 
         } else if (typeof parsed === 'object' && parsed.handle) {
-          // @handle or legacy custom URL — use forHandle endpoint (1 unit), fall back to search
+          // @handle or legacy custom URL
           ytData = await fetchChannelByHandle(parsed.handle);
           if (ytData) {
-            const existing = await Channel.findOne({ youtubeChannelId: ytData.id });
+            const existing = await prisma.channel.findFirst({ where: { youtubeChannelId: ytData.id } });
             if (existing) {
               results.skipped++;
               continue;
@@ -228,7 +339,7 @@ export async function bulkImport(req, res, next) {
 
         } else {
           // Bare string that didn't match any pattern — try as channel ID
-          const existing = await Channel.findOne({ youtubeChannelId: parsed });
+          const existing = await prisma.channel.findFirst({ where: { youtubeChannelId: parsed } });
           if (existing) {
             results.skipped++;
             continue;
@@ -244,32 +355,32 @@ export async function bulkImport(req, res, next) {
         const category = (record.category || '').trim() || 'Uncategorized';
         const tags     = record.tags ? record.tags.split(';').map((t) => t.trim()).filter(Boolean) : [];
 
-        const channel = await Channel.create({
-          youtubeChannelId: ytData.id,
-          title:            ytData.snippet.title,
-          description:      ytData.snippet.description || '',
-          thumbnailUrl:     ytData.snippet.thumbnails?.high?.url || '',
-          bannerUrl:        ytData.brandingSettings?.image?.bannerExternalUrl || '',
-          customUrl:        ytData.snippet.customUrl || '',
-          country:          ytData.snippet.country || '',
-          publishedAt:      ytData.snippet.publishedAt,
-          uploadsPlaylistId: ytData.contentDetails?.relatedPlaylists?.uploads || '',
-          category,
-          tags,
-          notes:            record.notes || '',
-          currentStats: {
-            subscribers: parseYoutubeStatInt(ytData.statistics?.subscriberCount),
-            views:       parseYoutubeStatInt(ytData.statistics?.viewCount),
-            videoCount:  parseYoutubeStatInt(ytData.statistics?.videoCount),
+        const channel = await prisma.channel.create({
+          data: {
+            youtubeChannelId: ytData.id,
+            title:            ytData.snippet.title || '',
+            description:      ytData.snippet.description || '',
+            thumbnailUrl:     ytData.snippet.thumbnails?.high?.url || '',
+            bannerUrl:        ytData.brandingSettings?.image?.bannerExternalUrl || '',
+            customUrl:        ytData.snippet.customUrl || '',
+            country:          ytData.snippet.country || '',
+            publishedAt:      ytData.snippet.publishedAt ? new Date(ytData.snippet.publishedAt) : null,
+            uploadsPlaylistId: ytData.contentDetails?.relatedPlaylists?.uploads || '',
+            category,
+            tags,
+            notes:            record.notes || '',
+            currentSubscribers: parseYoutubeStatInt(ytData.statistics?.subscriberCount),
+            currentViews:      BigInt(parseYoutubeStatInt(ytData.statistics?.viewCount)),
+            currentVideoCount: parseYoutubeStatInt(ytData.statistics?.videoCount),
+            lastSyncedAt: new Date(),
           },
-          lastSyncedAt: new Date(),
         });
 
         results.added++;
         results.addedChannels.push({ title: channel.title, category, url: channelInput });
 
       } catch (err) {
-        if (err.code === 11000) {
+        if (err.code === 'P2002') {
           results.skipped++; // duplicate key — already exists
         } else {
           results.errors.push({ input: channelInput, error: err.message });
@@ -285,31 +396,41 @@ export async function bulkImport(req, res, next) {
 
 export async function getChannel(req, res, next) {
   try {
-    const channel = await Channel.findById(req.params.id).populate(
-      'assignedTo',
-      'name email'
-    );
+    if (!isValidId(req.params.id)) {
+      return res.status(400).json({ message: 'Invalid ID format' });
+    }
+
+    const channel = await prisma.channel.findUnique({
+      where: { id: req.params.id },
+      include: { assignedTo: { select: { id: true, name: true, email: true } } },
+    });
 
     if (!channel) {
       return res.status(404).json({ message: 'Channel not found' });
     }
 
-    // Get snapshots for trend data
-    const snapshots = await ChannelSnapshot.find({
-      channelId: channel._id,
-      deletedAt: null,
-    })
-      .sort({ date: -1 })
-      .limit(90);
+    const snapshots = await prisma.channelSnapshot.findMany({
+      where: { channelId: channel.id, deletedAt: null },
+      orderBy: { date: 'desc' },
+      take: 90,
+    });
 
-    // Get recent videos
-    const videos = await Video.find({ channelId: channel._id, deletedAt: null })
-      .sort({ publishedAt: -1 })
-      .limit(20);
+    const videos = await prisma.video.findMany({
+      where: { channelId: channel.id, deletedAt: null },
+      orderBy: { publishedAt: 'desc' },
+      take: 20,
+    });
 
-    const videoCountInDb = await Video.countDocuments({ channelId: channel._id, deletedAt: null });
+    const videoCountInDb = await prisma.video.count({
+      where: { channelId: channel.id, deletedAt: null },
+    });
 
-    res.json({ channel, snapshots: snapshots.reverse(), videos, videoCountInDb });
+    res.json({
+      channel: serializeChannel(channel),
+      snapshots: snapshots.reverse().map(serializeSnapshot),
+      videos: videos.map(serializeVideo),
+      videoCountInDb,
+    });
   } catch (err) {
     next(err);
   }
@@ -322,24 +443,30 @@ export async function updateChannel(req, res, next) {
 
     if (category !== undefined) update.category = category;
     if (tags !== undefined) update.tags = tags;
-    if (assignedTo !== undefined) update.assignedTo = assignedTo || null;
+    if (assignedTo !== undefined) update.assignedToId = assignedTo || null;
     if (status !== undefined) {
       update.status = status;
-      // A manual status change hands control back to the human: clear the
-      // auto-archive flag so the inactivity sync stops owning this channel.
       update.autoArchivedForInactivity = false;
     }
     if (notes !== undefined) update.notes = notes;
 
-    const channel = await Channel.findByIdAndUpdate(req.params.id, update, {
-      new: true,
-    }).populate('assignedTo', 'name email');
+    if (!isValidId(req.params.id)) {
+      return res.status(400).json({ message: 'Invalid ID format' });
+    }
 
-    if (!channel) {
+    // Check existence first so a missing record yields a clean 404 (not P2025).
+    const existing = await prisma.channel.findUnique({ where: { id: req.params.id } });
+    if (!existing) {
       return res.status(404).json({ message: 'Channel not found' });
     }
 
-    res.json(channel);
+    const channel = await prisma.channel.update({
+      where: { id: req.params.id },
+      data: update,
+      include: { assignedTo: { select: { id: true, name: true, email: true } } },
+    });
+
+    res.json(serializeChannel(channel));
   } catch (err) {
     next(err);
   }
@@ -347,12 +474,15 @@ export async function updateChannel(req, res, next) {
 
 /**
  * DELETE /api/channels/:id
- * Soft-delete a single channel and cascade to all related collections.
+ * Soft-delete a single channel and cascade to all related rows.
  */
 export async function deleteChannel(req, res, next) {
   try {
-    // Verify the channel exists first
-    const channel = await Channel.findById(req.params.id);
+    if (!isValidId(req.params.id)) {
+      return res.status(400).json({ message: 'Invalid ID format' });
+    }
+
+    const channel = await prisma.channel.findUnique({ where: { id: req.params.id } });
     if (!channel) {
       return res.status(404).json({ message: 'Channel not found' });
     }
@@ -367,7 +497,7 @@ export async function deleteChannel(req, res, next) {
 
 /**
  * DELETE /api/channels/bulk
- * Soft-delete multiple channels and cascade to all related collections.
+ * Soft-delete multiple channels and cascade.
  */
 export async function bulkDeleteChannels(req, res, next) {
   try {
@@ -386,8 +516,7 @@ export async function bulkDeleteChannels(req, res, next) {
 
 /**
  * POST /api/channels/reclassify-bulk
- * Force re-classify ALL videos for selected channels (clears existing classification first).
- * Dedicated channels: mark all as sadhguru. IHI/other: use AI.
+ * Force re-classify ALL videos for selected channels.
  */
 export async function bulkReclassifyChannelVideos(req, res, next) {
   try {
@@ -396,10 +525,10 @@ export async function bulkReclassifyChannelVideos(req, res, next) {
       return res.status(400).json({ message: 'ids array is required' });
     }
 
-    const channels = await Channel.find({
-      _id: { $in: ids },
-      status: { $ne: 'archived' },
-    }).sort({ title: 1 });
+    const channels = await prisma.channel.findMany({
+      where: { id: { in: ids }, status: { not: 'archived' } },
+      orderBy: { title: 'asc' },
+    });
 
     let channelsProcessed = 0;
     let totalVideos = 0;
@@ -411,20 +540,20 @@ export async function bulkReclassifyChannelVideos(req, res, next) {
 
     for (const channel of channels) {
       try {
-        await Video.updateMany(
-          { channelId: channel._id, deletedAt: null },
-          { $set: { classification: '' } }
-        );
+        await prisma.video.updateMany({
+          where: { channelId: channel.id, deletedAt: null },
+          data: { classification: '' },
+        });
 
         const result = await classifyVideosForChannel(channel);
         channelsProcessed++;
         totalVideos += result.totalVideos;
         totalNewlyClassified += result.newlyClassified;
         totalSadguru += result.sadhguruCount;
-        totalNonSadguru += result.nonSadguruCount;
+        totalNonSadguru += result.nonSadhguruCount;
         totalFailed += result.failed;
       } catch (err) {
-        errors.push({ channelId: channel._id, title: channel.title, message: err.message });
+        errors.push({ channelId: channel.id, title: channel.title, message: err.message });
       }
     }
 
@@ -448,12 +577,15 @@ export async function bulkReclassifyChannelVideos(req, res, next) {
 
 export async function syncSingleChannel(req, res, next) {
   try {
-    const channel = await Channel.findById(req.params.id);
+    if (!isValidId(req.params.id)) {
+      return res.status(400).json({ message: 'Invalid ID format' });
+    }
+    const channel = await prisma.channel.findUnique({ where: { id: req.params.id } });
     if (!channel) {
       return res.status(404).json({ message: 'Channel not found' });
     }
 
-    const log = await syncChannels([channel._id], 'manual');
+    const log = await syncChannels([channel.id], 'manual');
     res.json(log);
   } catch (err) {
     if (err.message === 'Sync already in progress') {
@@ -465,11 +597,13 @@ export async function syncSingleChannel(req, res, next) {
 
 /**
  * POST /api/channels/:id/pull-videos
- * Pull all videos for a channel in batches of 100.
  */
 export async function pullChannelVideos(req, res, next) {
   try {
-    const channel = await Channel.findById(req.params.id);
+    if (!isValidId(req.params.id)) {
+      return res.status(400).json({ message: 'Invalid ID format' });
+    }
+    const channel = await prisma.channel.findUnique({ where: { id: req.params.id } });
     if (!channel) {
       return res.status(404).json({ message: 'Channel not found' });
     }
@@ -477,7 +611,7 @@ export async function pullChannelVideos(req, res, next) {
       return res.status(400).json({ message: 'All videos already pulled for this channel' });
     }
 
-    const result = await pullAllChannelVideos(channel._id);
+    const result = await pullAllChannelVideos(channel.id);
     res.json(result);
   } catch (err) {
     if (err.message === 'Pull all videos already in progress') {
@@ -504,7 +638,6 @@ export async function syncAllChannels(req, res, next) {
 
 /**
  * POST /api/channels/pull-all-videos
- * Pull all videos for all channels (one channel at a time, 100 videos per batch).
  */
 export async function pullAllChannelsVideosHandler(req, res, next) {
   try {
@@ -524,55 +657,64 @@ export async function pullAllChannelsVideosHandler(req, res, next) {
 export async function getChannelVideos(req, res, next) {
   try {
     const { page = 1, limit = 50, sort = '-views', search, classification, minViews, maxViews } = req.query;
-    const skip = (parseInt(page) - 1) * parseInt(limit);
     const lim = Math.min(Math.max(parseInt(limit) || 50, 1), 100);
+    // Use the clamped `lim` for skip so a NaN limit (e.g. ?limit=abc) doesn't
+    // poison Prisma's required-int `skip` argument.
+    const skip = (parseInt(page) - 1) * lim;
 
-    if (!mongoose.isValidObjectId(req.params.id)) {
+    if (!isValidId(req.params.id)) {
       return res.status(400).json({ message: 'Invalid channel id' });
     }
-    const filter = { channelId: req.params.id, deletedAt: null };
-    const summaryFilter = {
-      ...filter,
-      channelId: mongoose.Types.ObjectId.createFromHexString(req.params.id),
-    };
+
+    const where = { channelId: req.params.id, deletedAt: null };
     if (search && search.trim()) {
-      filter.$or = [
-        { title: { $regex: search.trim(), $options: 'i' } },
-        { youtubeVideoId: { $regex: search.trim(), $options: 'i' } },
+      where.OR = [
+        { title: { contains: search.trim(), mode: 'insensitive' } },
+        { youtubeVideoId: { contains: search.trim(), mode: 'insensitive' } },
       ];
     }
-    if (classification === 'sadhguru') filter.classification = 'sadhguru';
-    else if (classification === 'non_sadhguru') filter.classification = 'non sadhguru';
-    if (minViews != null && minViews !== '') filter.views = { ...filter.views, $gte: parseInt(minViews) };
-    if (maxViews != null && maxViews !== '') filter.views = { ...filter.views, $lte: parseInt(maxViews) };
+    if (classification === 'sadhguru') where.classification = 'sadhguru';
+    else if (classification === 'non_sadhguru') where.classification = 'non sadhguru';
+    if (minViews != null && minViews !== '') where.views = { ...(where.views || {}), gte: parseInt(minViews) };
+    if (maxViews != null && maxViews !== '') where.views = { ...(where.views || {}), lte: parseInt(maxViews) };
 
     const sortMap = {
-      '-views': { views: -1 },
-      views: { views: 1 },
-      '-publishedAt': { publishedAt: -1 },
-      publishedAt: { publishedAt: 1 },
-      '-likes': { likes: -1 },
-      likes: { likes: 1 },
-      '-comments': { comments: -1 },
-      comments: { comments: 1 },
+      '-views':       [{ views: 'desc' }],
+      views:          [{ views: 'asc' }],
+      '-publishedAt': [{ publishedAt: 'desc' }],
+      publishedAt:    [{ publishedAt: 'asc' }],
+      '-likes':       [{ likes: 'desc' }],
+      likes:          [{ likes: 'asc' }],
+      '-comments':    [{ comments: 'desc' }],
+      comments:       [{ comments: 'asc' }],
     };
-    const sortOpt = sortMap[sort] || sortMap['-views'];
+    const orderBy = sortMap[sort] || sortMap['-views'];
+
+    // Summary aggregates over ALL videos of the channel (no search/classification filters)
+    // — matches the legacy aggregation that used summaryFilter = {channelId, deletedAt:null}.
+    const summaryWhere = { channelId: req.params.id, deletedAt: null };
 
     const [videos, total, summaryAgg] = await Promise.all([
-      Video.find(filter).sort(sortOpt).skip(skip).limit(lim).lean(),
-      Video.countDocuments(filter),
-      Video.aggregate([
-        { $match: summaryFilter },
-        { $group: { _id: null, totalViews: { $sum: '$views' }, totalLikes: { $sum: '$likes' }, totalComments: { $sum: '$comments' } } },
-      ]),
+      prisma.video.findMany({ where, orderBy, skip, take: lim }),
+      prisma.video.count({ where }),
+      prisma.video.aggregate({
+        where: summaryWhere,
+        _sum: { views: true, likes: true, comments: true },
+      }),
     ]);
 
-    const summary = summaryAgg[0]
-      ? { totalVideos: total, totalViews: summaryAgg[0].totalViews ?? 0, totalLikes: summaryAgg[0].totalLikes ?? 0, totalComments: summaryAgg[0].totalComments ?? 0 }
+    const sums = summaryAgg?._sum;
+    const summary = sums
+      ? {
+          totalVideos: total,
+          totalViews: bigIntToNumber(sums.views) ?? 0,
+          totalLikes: sums.likes ?? 0,
+          totalComments: sums.comments ?? 0,
+        }
       : { totalVideos: 0, totalViews: 0, totalLikes: 0, totalComments: 0 };
 
     res.json({
-      videos,
+      videos: videos.map(serializeVideo),
       pagination: {
         page: parseInt(page),
         limit: lim,
@@ -588,32 +730,35 @@ export async function getChannelVideos(req, res, next) {
 
 /**
  * Classify videos for a single channel.
- * Dedicated: mark unclassified as sadguru. IHI/other: use Vertex AI / Gemini.
- * Returns result object or throws.
+ * Dedicated: mark unclassified as sadhguru. IHI/other: use Vertex AI / Gemini.
  */
 async function classifyVideosForChannel(channel) {
-  let videos = await Video.find({ channelId: channel._id, deletedAt: null });
+  let videos = await prisma.video.findMany({ where: { channelId: channel.id, deletedAt: null } });
   if (videos.length === 0) {
     return {
       totalVideos: 0,
       alreadyClassified: 0,
       newlyClassified: 0,
       failed: 0,
-      sadguruCount: 0,
-      nonSadguruCount: 0,
+      sadhguruCount: 0,
+      nonSadhguruCount: 0,
       isSadhguruChannel: false,
     };
   }
 
+  // Legacy migration: any rows still carrying the deprecated `isSadguruVideo`
+  // boolean (Mongo-era) get their classification derived from it. The Prisma
+  // schema doesn't declare this field, so this branch is normally a no-op —
+  // it stays here so tests that fabricate the legacy shape can still verify it.
   const toMigrate = videos.filter((v) => v.isSadguruVideo != null && !v.classification);
   for (const v of toMigrate) {
-    await Video.findByIdAndUpdate(v._id, {
-      classification: v.isSadguruVideo ? 'sadhguru' : 'non sadhguru',
-      $unset: { isSadguruVideo: 1 },
+    await prisma.video.update({
+      where: { id: v.id },
+      data: { classification: v.isSadguruVideo ? 'sadhguru' : 'non sadhguru' },
     });
   }
   if (toMigrate.length) {
-    videos = await Video.find({ channelId: channel._id, deletedAt: null });
+    videos = await prisma.video.findMany({ where: { channelId: channel.id, deletedAt: null } });
   }
 
   const category = (channel.category || '').toLowerCase();
@@ -621,18 +766,18 @@ async function classifyVideosForChannel(channel) {
   const isEmpty = (v) => !v.classification || String(v.classification).trim() === '';
 
   if (isDedicated) {
-    const result = await Video.updateMany(
-      { channelId: channel._id, deletedAt: null, $or: [{ classification: '' }, { classification: { $exists: false } }] },
-      { $set: { classification: 'sadhguru' } }
-    );
-    const newlyClassified = result.modifiedCount;
+    const result = await prisma.video.updateMany({
+      where: { channelId: channel.id, deletedAt: null, classification: '' },
+      data: { classification: 'sadhguru' },
+    });
+    const newlyClassified = result.count;
     return {
       totalVideos: videos.length,
       alreadyClassified: videos.length - newlyClassified,
       newlyClassified,
       failed: 0,
-      sadguruCount: newlyClassified,
-      nonSadguruCount: 0,
+      sadhguruCount: newlyClassified,
+      nonSadhguruCount: 0,
       isSadhguruChannel: true,
     };
   }
@@ -640,12 +785,12 @@ async function classifyVideosForChannel(channel) {
   const toClassify = videos.filter(isEmpty);
   let failed = 0;
   const classificationMap = await classifySadguruVideoBatch(toClassify);
-  let sadguruCount = 0;
+  let sadhguruCount = 0;
   for (const video of toClassify) {
-    const value = classificationMap.get(String(video._id));
+    const value = classificationMap.get(String(video.id));
     if (value) {
-      await Video.findByIdAndUpdate(video._id, { classification: value });
-      if (value === 'sadhguru') sadguruCount++;
+      await prisma.video.update({ where: { id: video.id }, data: { classification: value } });
+      if (value === 'sadhguru') sadhguruCount++;
     } else {
       failed++;
     }
@@ -656,28 +801,29 @@ async function classifyVideosForChannel(channel) {
     alreadyClassified: videos.length - toClassify.length,
     newlyClassified,
     failed,
-    sadguruCount,
-    nonSadguruCount: newlyClassified - sadguruCount,
+    sadhguruCount,
+    nonSadhguruCount: newlyClassified - sadhguruCount,
     isSadhguruChannel: false,
   };
 }
 
 /**
  * POST /api/channels/:id/reclassify-videos
- * Force re-classify ALL videos (clears existing classification first).
- * Dedicated channels: mark all as sadhguru. IHI/other: use AI.
  */
 export async function reclassifyChannelVideos(req, res, next) {
   try {
-    const channel = await Channel.findById(req.params.id);
+    if (!isValidId(req.params.id)) {
+      return res.status(400).json({ message: 'Invalid ID format' });
+    }
+    const channel = await prisma.channel.findUnique({ where: { id: req.params.id } });
     if (!channel) {
       return res.status(404).json({ message: 'Channel not found' });
     }
 
-    await Video.updateMany(
-      { channelId: channel._id, deletedAt: null },
-      { $set: { classification: '' } }
-    );
+    await prisma.video.updateMany({
+      where: { channelId: channel.id, deletedAt: null },
+      data: { classification: '' },
+    });
 
     const result = await classifyVideosForChannel(channel);
     res.json({ ...result, reclassified: true });
@@ -692,12 +838,13 @@ export async function reclassifyChannelVideos(req, res, next) {
 
 /**
  * POST /api/channels/:id/classify-videos
- * Dedicated channels: mark all videos as Sadguru by default (no API call).
- * IHI channels: use Vertex AI to classify each video.
  */
 export async function classifyChannelVideos(req, res, next) {
   try {
-    const channel = await Channel.findById(req.params.id);
+    if (!isValidId(req.params.id)) {
+      return res.status(400).json({ message: 'Invalid ID format' });
+    }
+    const channel = await prisma.channel.findUnique({ where: { id: req.params.id } });
     if (!channel) {
       return res.status(404).json({ message: 'Channel not found' });
     }
@@ -714,11 +861,13 @@ export async function classifyChannelVideos(req, res, next) {
 
 /**
  * POST /api/channels/classify-all
- * Classify all videos for all channels using the same logic (Dedicated = sadguru, IHI/other = AI).
  */
 export async function classifyAllChannelsVideos(req, res, next) {
   try {
-    const channels = await Channel.find({ status: { $ne: 'archived' } }).sort({ title: 1 });
+    const channels = await prisma.channel.findMany({
+      where: { status: { not: 'archived' } },
+      orderBy: { title: 'asc' },
+    });
 
     let channelsProcessed = 0;
     let totalVideos = 0;
@@ -735,10 +884,10 @@ export async function classifyAllChannelsVideos(req, res, next) {
         totalVideos += result.totalVideos;
         totalNewlyClassified += result.newlyClassified;
         totalSadguru += result.sadhguruCount;
-        totalNonSadguru += result.nonSadguruCount;
+        totalNonSadguru += result.nonSadhguruCount;
         totalFailed += result.failed;
       } catch (err) {
-        errors.push({ channelId: channel._id, title: channel.title, message: err.message });
+        errors.push({ channelId: channel.id, title: channel.title, message: err.message });
       }
     }
 

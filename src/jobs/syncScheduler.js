@@ -6,7 +6,7 @@ import {
   syncIhiIngestLast24h,
   syncIhiSadhguruVideoStats,
 } from '../services/syncEngine.js';
-import SyncConfig from '../models/SyncConfig.js';
+import { prisma } from '../config/prisma.js';
 import { logger } from '../utils/logger.js';
 
 let channelTask = null;
@@ -15,8 +15,20 @@ let dedicatedIngestTask = null;
 let ihiIngestTask = null;
 let ihiSadhguruStatsTask = null;
 
+/**
+ * Singleton accessor — same upsert pattern as elsewhere. Exported so tests
+ * can mock it without reaching into prisma.syncConfig directly.
+ */
+export async function getSyncConfig() {
+  return prisma.syncConfig.upsert({
+    where: { id: 'sync' },
+    update: {},
+    create: { id: 'sync' },
+  });
+}
+
 export async function startSyncScheduler() {
-  const config = await SyncConfig.getSingleton();
+  const config = await getSyncConfig();
   scheduleChannelSync(config.channelSyncSchedule, config.channelSyncEnabled);
   scheduleVideoSync(config.videoSyncSchedule, config.videoSyncEnabled);
   scheduleDedicatedIngest(

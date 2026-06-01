@@ -1,5 +1,4 @@
-import SyncLog from '../models/SyncLog.js';
-import SyncConfig from '../models/SyncConfig.js';
+import { prisma } from '../config/prisma.js';
 import {
   getSyncStatus,
   syncChannelStats,
@@ -16,6 +15,18 @@ import {
   scheduleIhiIngest,
   scheduleIhiSadhguruStats,
 } from '../jobs/syncScheduler.js';
+
+/**
+ * Singleton accessor — the same upsert pattern we use everywhere else for
+ * SyncConfig. Exported so tests can stub it.
+ */
+export async function getSyncConfig() {
+  return prisma.syncConfig.upsert({
+    where: { id: 'sync' },
+    update: {},
+    create: { id: 'sync' },
+  });
+}
 
 function normalizeConfigDoc(config) {
   const o = config.toObject ? config.toObject() : { ...config };
@@ -37,7 +48,7 @@ function normalizeConfigDoc(config) {
 export async function getStatus(req, res) {
   const syncStatus = getSyncStatus();
   const quota = getQuotaUsage();
-  const config = await SyncConfig.getSingleton();
+  const config = await getSyncConfig();
 
   res.json({
     ...syncStatus,
@@ -52,11 +63,16 @@ export async function getLogs(req, res, next) {
     const { page = 1, limit = 15, syncType } = req.query;
     const skip = (parseInt(page) - 1) * parseInt(limit);
 
-    const filter = syncType ? { syncType } : {};
+    const where = syncType ? { syncType } : {};
 
     const [logs, total] = await Promise.all([
-      SyncLog.find(filter).sort({ startedAt: -1 }).skip(skip).limit(parseInt(limit)),
-      SyncLog.countDocuments(filter),
+      prisma.syncLog.findMany({
+        where,
+        orderBy: { startedAt: 'desc' },
+        skip,
+        take: parseInt(limit),
+      }),
+      prisma.syncLog.count({ where }),
     ]);
 
     res.json({
@@ -138,7 +154,7 @@ export async function triggerIhiSadhguruStats(req, res, next) {
 // GET /api/sync/config
 export async function getConfig(req, res, next) {
   try {
-    const config = await SyncConfig.getSingleton();
+    const config = await getSyncConfig();
     res.json(normalizeConfigDoc(config));
   } catch (err) {
     next(err);
@@ -161,7 +177,7 @@ export async function updateConfig(req, res, next) {
       ihiSadhguruStatsEnabled,
     } = req.body;
 
-    const config = await SyncConfig.getSingleton();
+    const config = await getSyncConfig();
 
     const channelScheduleChanged =
       channelSyncSchedule !== undefined &&
@@ -194,52 +210,55 @@ export async function updateConfig(req, res, next) {
       ihiSadhguruStatsEnabled !== undefined &&
       ihiSadhguruStatsEnabled !== config.ihiSadhguruStatsEnabled;
 
+    const updateData = {};
     if (channelSyncSchedule !== undefined)
-      config.channelSyncSchedule = channelSyncSchedule;
+      updateData.channelSyncSchedule = channelSyncSchedule;
     if (videoSyncSchedule !== undefined)
-      config.videoSyncSchedule = videoSyncSchedule;
+      updateData.videoSyncSchedule = videoSyncSchedule;
     if (dedicatedIngestSchedule !== undefined)
-      config.dedicatedIngestSchedule = dedicatedIngestSchedule;
+      updateData.dedicatedIngestSchedule = dedicatedIngestSchedule;
     if (ihiIngestSchedule !== undefined)
-      config.ihiIngestSchedule = ihiIngestSchedule;
+      updateData.ihiIngestSchedule = ihiIngestSchedule;
     if (ihiSadhguruStatsSchedule !== undefined)
-      config.ihiSadhguruStatsSchedule = ihiSadhguruStatsSchedule;
+      updateData.ihiSadhguruStatsSchedule = ihiSadhguruStatsSchedule;
     if (channelSyncEnabled !== undefined)
-      config.channelSyncEnabled = channelSyncEnabled;
+      updateData.channelSyncEnabled = channelSyncEnabled;
     if (videoSyncEnabled !== undefined)
-      config.videoSyncEnabled = videoSyncEnabled;
+      updateData.videoSyncEnabled = videoSyncEnabled;
     if (dedicatedIngestEnabled !== undefined)
-      config.dedicatedIngestEnabled = dedicatedIngestEnabled;
+      updateData.dedicatedIngestEnabled = dedicatedIngestEnabled;
     if (ihiIngestEnabled !== undefined)
-      config.ihiIngestEnabled = ihiIngestEnabled;
+      updateData.ihiIngestEnabled = ihiIngestEnabled;
     if (ihiSadhguruStatsEnabled !== undefined)
-      config.ihiSadhguruStatsEnabled = ihiSadhguruStatsEnabled;
+      updateData.ihiSadhguruStatsEnabled = ihiSadhguruStatsEnabled;
 
-    await config.save();
+    const updated = Object.keys(updateData).length > 0
+      ? await prisma.syncConfig.update({ where: { id: config.id }, data: updateData })
+      : config;
 
     if (channelScheduleChanged || channelEnabledChanged) {
-      scheduleChannelSync(config.channelSyncSchedule, config.channelSyncEnabled);
+      scheduleChannelSync(updated.channelSyncSchedule, updated.channelSyncEnabled);
     }
     if (videoScheduleChanged || videoEnabledChanged) {
-      scheduleVideoSync(config.videoSyncSchedule, config.videoSyncEnabled);
+      scheduleVideoSync(updated.videoSyncSchedule, updated.videoSyncEnabled);
     }
     if (dedicatedIngestScheduleChanged || dedicatedIngestEnabledChanged) {
       scheduleDedicatedIngest(
-        config.dedicatedIngestSchedule,
-        config.dedicatedIngestEnabled
+        updated.dedicatedIngestSchedule,
+        updated.dedicatedIngestEnabled
       );
     }
     if (ihiIngestScheduleChanged || ihiIngestEnabledChanged) {
-      scheduleIhiIngest(config.ihiIngestSchedule, config.ihiIngestEnabled);
+      scheduleIhiIngest(updated.ihiIngestSchedule, updated.ihiIngestEnabled);
     }
     if (ihiStatsScheduleChanged || ihiStatsEnabledChanged) {
       scheduleIhiSadhguruStats(
-        config.ihiSadhguruStatsSchedule,
-        config.ihiSadhguruStatsEnabled
+        updated.ihiSadhguruStatsSchedule,
+        updated.ihiSadhguruStatsEnabled
       );
     }
 
-    res.json(normalizeConfigDoc(config));
+    res.json(normalizeConfigDoc(updated));
   } catch (err) {
     next(err);
   }

@@ -4,3 +4,13 @@ node_modules/
 keys/
 *.log
 .DS_Store
+
+# Vitest coverage output
+coverage/
+coverage-prisma/
+
+# Local AI tooling (code-review-graph)
+.venv-crg/
+.code-review-graph/
+.code-review-graphignore
+.cursor/

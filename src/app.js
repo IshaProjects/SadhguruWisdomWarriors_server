@@ -4,11 +4,8 @@ import cors from 'cors';
 import morgan from 'morgan';
 import rateLimit from 'express-rate-limit';
 
-import connectDB from './config/db.js';
 import { errorHandler } from './middleware/errorHandler.js';
-import { startSyncScheduler } from './jobs/syncScheduler.js';
-import { logger } from './utils/logger.js';
-import { logRateLimitExceeded, getRateLimitLogPath } from './utils/rateLimitLog.js';
+import { logRateLimitExceeded } from './utils/rateLimitLog.js';
 
 import authRoutes from './routes/auth.js';
 import channelRoutes from './routes/channels.js';
@@ -26,7 +23,9 @@ const app = express();
 // Middleware
 app.use(cors());
 app.use(express.json());
-app.use(morgan('dev'));
+if (process.env.NODE_ENV !== 'test') {
+  app.use(morgan('dev'));
+}
 
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -63,17 +62,4 @@ app.get('/api/health', (req, res) => {
 // Error handler
 app.use(errorHandler);
 
-// Start server
-const PORT = process.env.PORT || 5000;
-
-async function start() {
-  await connectDB();
-  await startSyncScheduler();
-
-  app.listen(PORT, () => {
-    logger.info(`Server running on port ${PORT}`);
-    logger.info(`Rate limit 429 events append to: ${getRateLimitLogPath()}`);
-  });
-}
-
-start();
+export default app;

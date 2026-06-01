@@ -1,5 +1,5 @@
 import axios from 'axios';
-import VideoQueueItem from '../models/VideoQueueItem.js';
+import { prisma } from '../config/prisma.js';
 
 const PYTHON_URL = process.env.PYTHON_SERVER_URL || 'http://localhost:8000';
 
@@ -15,19 +15,24 @@ function priorityOrder(p) {
 export async function listQueue(req, res, next) {
   try {
     const { status, page = 1, limit = 50 } = req.query;
-    const filter = {};
-    if (status) filter.status = status;
+    const where = {};
+    if (status) where.status = status;
 
-    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const pageNum = parseInt(page);
+    const limitNum = parseInt(limit);
+    const skip = (pageNum - 1) * limitNum;
+
     const [items, total] = await Promise.all([
-      VideoQueueItem.find(filter)
-        .sort({ createdAt: -1 })
-        .skip(skip)
-        .limit(parseInt(limit)),
-      VideoQueueItem.countDocuments(filter),
+      prisma.videoQueueItem.findMany({
+        where,
+        orderBy: { createdAt: 'desc' },
+        skip,
+        take: limitNum,
+      }),
+      prisma.videoQueueItem.count({ where }),
     ]);
 
-    res.json({ items, total, page: parseInt(page), pages: Math.ceil(total / parseInt(limit)) });
+    res.json({ items, total, page: pageNum, pages: Math.ceil(total / limitNum) });
   } catch (err) {
     next(err);
   }
@@ -45,16 +50,23 @@ export async function addToQueue(req, res, next) {
       return res.status(400).json({ message: 'url or urls[] is required' });
     }
 
-    const created = await VideoQueueItem.insertMany(
-      rawUrls.map((u) => ({
-        url: u.trim(),
-        videoType: videoType || 'normal',
-        eventName: eventName || '',
-        notes: notes || '',
-        priority: priority || 'normal',
-        addedBy: req.user?.name || req.user?.email || '',
-      }))
-    );
+    const data = rawUrls.map((u) => ({
+      url: u.trim(),
+      videoType: videoType || 'normal',
+      eventName: eventName || '',
+      notes: notes || '',
+      priority: priority || 'normal',
+      addedBy: req.user?.name || req.user?.email || '',
+    }));
+
+    // createMany doesn't return rows; insert one-by-one so the response can
+    // include the created items (mirrors the legacy `insertMany(...)` shape).
+    // If any create rejects, the loop aborts and the error propagates to
+    // next(err) → 500, matching the legacy behaviour.
+    const created = [];
+    for (const d of data) {
+      created.push(await prisma.videoQueueItem.create({ data: d }));
+    }
 
     res.status(201).json({ added: created.length, items: created });
   } catch (err) {
@@ -66,8 +78,12 @@ export async function addToQueue(req, res, next) {
 
 export async function removeFromQueue(req, res, next) {
   try {
-    const item = await VideoQueueItem.findByIdAndDelete(req.params.id);
-    if (!item) return res.status(404).json({ message: 'Item not found' });
+    try {
+      await prisma.videoQueueItem.delete({ where: { id: req.params.id } });
+    } catch (err) {
+      if (err.code === 'P2025') return res.status(404).json({ message: 'Item not found' });
+      throw err;
+    }
     res.json({ message: 'Removed', id: req.params.id });
   } catch (err) {
     next(err);
@@ -85,9 +101,16 @@ export async function updateStatus(req, res, next) {
     if (status === 'completed' || status === 'failed') update.completedAt = new Date();
     if (errorMessage) update.errorMessage = errorMessage;
 
-    const item = await VideoQueueItem.findByIdAndUpdate(req.params.id, { $set: update }, { new: true });
-    if (!item) return res.status(404).json({ message: 'Item not found' });
-    res.json(item);
+    try {
+      const item = await prisma.videoQueueItem.update({
+        where: { id: req.params.id },
+        data: update,
+      });
+      res.json(item);
+    } catch (err) {
+      if (err.code === 'P2025') return res.status(404).json({ message: 'Item not found' });
+      throw err;
+    }
   } catch (err) {
     next(err);
   }
@@ -103,7 +126,7 @@ export async function updateStatus(req, res, next) {
 export async function processQueue(req, res, next) {
   try {
     // Fetch all queued items, sorted by priority then age
-    const items = await VideoQueueItem.find({ status: 'queued' }).lean();
+    const items = await prisma.videoQueueItem.findMany({ where: { status: 'queued' } });
 
     if (items.length === 0) {
       return res.json({ message: 'No queued items to process', processed: 0 });
@@ -121,8 +144,9 @@ export async function processQueue(req, res, next) {
     ;(async () => {
       for (const item of items) {
         try {
-          await VideoQueueItem.findByIdAndUpdate(item._id, {
-            $set: { status: 'processing', startedAt: new Date() },
+          await prisma.videoQueueItem.update({
+            where: { id: item.id },
+            data: { status: 'processing', startedAt: new Date() },
           });
 
           const response = await axios.post(
@@ -137,8 +161,9 @@ export async function processQueue(req, res, next) {
             { timeout: 300_000 } // 5 min — transcription can be slow
           );
 
-          await VideoQueueItem.findByIdAndUpdate(item._id, {
-            $set: {
+          await prisma.videoQueueItem.update({
+            where: { id: item.id },
+            data: {
               status:      'completed',
               completedAt: new Date(),
               title:       response.data?.title || '',
@@ -152,13 +177,19 @@ export async function processQueue(req, res, next) {
             err.message ||
             'Unknown error';
 
-          await VideoQueueItem.findByIdAndUpdate(item._id, {
-            $set: {
-              status:       'failed',
-              completedAt:  new Date(),
-              errorMessage: msg,
-            },
-          });
+          try {
+            await prisma.videoQueueItem.update({
+              where: { id: item.id },
+              data: {
+                status:       'failed',
+                completedAt:  new Date(),
+                errorMessage: msg,
+              },
+            });
+          } catch {
+            // Row may have been deleted concurrently — swallow to keep the
+            // background loop running for the remaining items.
+          }
         }
       }
     })();
