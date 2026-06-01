@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto';
+import { Prisma } from '@prisma/client';
 import { prisma } from '../config/prisma.js';
 import {
   fetchChannelsBatch,
@@ -284,6 +286,7 @@ export async function updateChannelActivityStatuses(type = 'auto') {
 // ---------------------------------------------------------------------------
 const VIDEO_FETCH_BATCH = 50;        // YouTube videos.list cap
 const VIDEO_FETCH_PARALLELISM = 5;   // concurrent batches
+const VIDEO_WRITE_FLUSH = 500;       // rows per bulk DB write
 
 export async function syncVideoStats(channelIds = null, type = 'manual') {
   if (isVideoSyncing) {
@@ -349,6 +352,76 @@ export async function syncVideoStats(channelIds = null, type = 'manual') {
       batches.push(videos.slice(i, i + VIDEO_FETCH_BATCH));
     }
 
+    // Every video here already exists locally (it came from the findMany above
+    // and unknowns are skipped), so we hold its internal id (local.id) and can
+    // write both the video-stats UPDATE and the snapshot UPSERT in two bulk SQL
+    // statements per flush — instead of two sequential round-trips per video,
+    // which made the full sweep take ~hours against the pooler.
+    let pending = [];
+    const flush = async () => {
+      if (!pending.length) return;
+      const batch = pending;
+      pending = [];
+      try {
+        // 1) Bulk-refresh video stats by internal id.
+        const vRows = Prisma.join(
+          batch.map(
+            (p) => Prisma.sql`(${p.id}, ${p.title}, ${p.description}, ${p.thumbnailUrl}, ${p.publishedAt}::timestamptz, ${p.views}::bigint, ${p.likes}::int, ${p.comments}::int, ${p.duration}, ${p.lastSyncedAt}::timestamptz)`
+          )
+        );
+        await prisma.$executeRaw(Prisma.sql`
+          UPDATE videos AS v SET
+            title = d.title, description = d.description, thumbnail_url = d.thumbnail_url,
+            published_at = d.published_at, views = d.views, likes = d.likes,
+            comments = d.comments, duration = d.duration, last_synced_at = d.last_synced_at,
+            updated_at = now()
+          FROM (VALUES ${vRows}) AS d(id, title, description, thumbnail_url, published_at, views, likes, comments, duration, last_synced_at)
+          WHERE v.id = d.id
+        `);
+
+        // 2) Bulk-upsert today's snapshot (id/updated_at have no DB default).
+        const sRows = Prisma.join(
+          batch.map(
+            (p) => Prisma.sql`(${p.snapId}, ${p.id}, ${p.channelId}, ${today}::timestamptz, ${p.views}::bigint, ${p.likes}::int, ${p.comments}::int, now())`
+          )
+        );
+        await prisma.$executeRaw(Prisma.sql`
+          INSERT INTO video_snapshots (id, video_id, channel_id, date, views, likes, comments, updated_at)
+          VALUES ${sRows}
+          ON CONFLICT (video_id, date) DO UPDATE SET
+            channel_id = EXCLUDED.channel_id, views = EXCLUDED.views,
+            likes = EXCLUDED.likes, comments = EXCLUDED.comments, updated_at = now()
+        `);
+
+        videosProcessed += batch.length;
+      } catch (err) {
+        // A bad row (e.g. a video deleted mid-run) would fail the whole bulk
+        // statement; fall back to per-row so the rest of the batch still lands
+        // and we capture the offending row in the error log.
+        logger.error(`[Video Sync] Bulk write failed for ${batch.length} rows, retrying per-row: ${err.message}`);
+        for (const p of batch) {
+          try {
+            await prisma.video.update({
+              where: { id: p.id },
+              data: {
+                title: p.title, description: p.description, thumbnailUrl: p.thumbnailUrl,
+                publishedAt: p.publishedAt, views: p.views, likes: p.likes,
+                comments: p.comments, duration: p.duration, lastSyncedAt: p.lastSyncedAt,
+              },
+            });
+            await prisma.videoSnapshot.upsert({
+              where: { videoId_date: { videoId: p.id, date: today } },
+              update: { channelId: p.channelId, views: p.views, likes: p.likes, comments: p.comments },
+              create: { videoId: p.id, channelId: p.channelId, date: today, views: p.views, likes: p.likes, comments: p.comments },
+            });
+            videosProcessed += 1;
+          } catch (e2) {
+            errors.push({ channelId: ytChannelById.get(p.channelId) ?? 'unknown', message: `${p.youtubeVideoId}: ${e2.message}` });
+          }
+        }
+      }
+    };
+
     // Run batches in groups of VIDEO_FETCH_PARALLELISM so we trade wall-time
     // for a bounded burst of concurrent HTTP requests against YouTube. Each
     // batch is one quota unit regardless of how many parts we ask for.
@@ -394,7 +467,9 @@ export async function syncVideoStats(channelIds = null, type = 'manual') {
           const likes = parseInt(vid.statistics?.likeCount) || 0;
           const comments = parseInt(vid.statistics?.commentCount) || 0;
 
-          const videoCommon = {
+          pending.push({
+            id: local.id,
+            youtubeVideoId: vid.id,
             channelId: local.channelId,
             title: vid.snippet?.title || '',
             description: vid.snippet?.description || '',
@@ -405,42 +480,16 @@ export async function syncVideoStats(channelIds = null, type = 'manual') {
             comments,
             duration: vid.contentDetails?.duration || '',
             lastSyncedAt: new Date(),
-          };
+            snapId: randomUUID(),
+          });
 
-          try {
-            const savedVideo = await prisma.video.upsert({
-              where: { youtubeVideoId: vid.id },
-              update: videoCommon,
-              create: { youtubeVideoId: vid.id, ...videoCommon },
-            });
-
-            await prisma.videoSnapshot.upsert({
-              where: { videoId_date: { videoId: savedVideo.id, date: today } },
-              update: {
-                channelId: local.channelId,
-                views: BigInt(views),
-                likes,
-                comments,
-              },
-              create: {
-                videoId: savedVideo.id,
-                channelId: local.channelId,
-                date: today,
-                views: BigInt(views),
-                likes,
-                comments,
-              },
-            });
-
-            videosProcessed += 1;
-          } catch (err) {
-            const ytChannel = ytChannelById.get(local.channelId) ?? 'unknown';
-            logger.error(`[Video Sync] Upsert failed for ${vid.id}: ${err.message}`);
-            errors.push({ channelId: ytChannel, message: `${vid.id}: ${err.message}` });
-          }
+          if (pending.length >= VIDEO_WRITE_FLUSH) await flush();
         }
       }
     }
+
+    // Write any rows accumulated since the last flush.
+    await flush();
 
     syncLog = await prisma.syncLog.update({
       where: { id: syncLog.id },
