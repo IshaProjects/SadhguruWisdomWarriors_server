@@ -20,6 +20,12 @@ import microUnitRoutes from './routes/microUnits.js';
 
 const app = express();
 
+// Behind DigitalOcean App Platform's load balancer, which sets X-Forwarded-For.
+// Trust exactly one proxy hop so req.ip reflects the real client (and
+// express-rate-limit can key on it). `1` rather than `true` — `true` is
+// permissive and lets clients spoof X-Forwarded-For to evade the limiter.
+app.set('trust proxy', 1);
+
 // Middleware
 app.use(cors());
 app.use(express.json());
