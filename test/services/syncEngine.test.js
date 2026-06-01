@@ -707,6 +707,33 @@ describe('syncVideoStats', () => {
     expect(fetchVideosBatch.mock.calls[0][0]).toHaveLength(50);
     expect(fetchVideosBatch.mock.calls[1][0]).toHaveLength(25);
   });
+
+  it('crosses the bulk-write flush boundary (>500 rows) and writes every snapshot', async () => {
+    const ch = await prisma.channel.create({
+      data: { youtubeChannelId: 'UC_big', category: 'Dedicated Sadhguru' },
+    });
+    // 600 videos → forces a mid-loop flush (VIDEO_WRITE_FLUSH=500) plus a final flush.
+    const data = Array.from({ length: 600 }, (_, i) => ({
+      youtubeVideoId: `bv${i}`,
+      channelId: ch.id,
+    }));
+    await prisma.video.createMany({ data });
+    fetchVideosBatch.mockImplementation(async (ids) =>
+      ids.map((id) => makeYtVideo({ id, statistics: { viewCount: '7', likeCount: '1', commentCount: '0' } }))
+    );
+
+    const log = await syncVideoStats([ch.id]);
+    expect(log.status).toBe('success');
+    expect(log.videosProcessed).toBe(600);
+
+    // Exactly one snapshot per video, all carrying the refreshed view count.
+    const snapCount = await prisma.videoSnapshot.count({ where: { channelId: ch.id } });
+    expect(snapCount).toBe(600);
+    const sample = await prisma.videoSnapshot.findMany({ where: { channelId: ch.id }, take: 5 });
+    for (const s of sample) expect(Number(s.views)).toBe(7);
+    const v = await prisma.video.findUnique({ where: { youtubeVideoId: 'bv0' } });
+    expect(Number(v.views)).toBe(7);
+  });
 });
 
 // ────────────────────────────────────────────────────────────────────────────
