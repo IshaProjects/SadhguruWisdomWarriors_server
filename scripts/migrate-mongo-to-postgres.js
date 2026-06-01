@@ -137,6 +137,72 @@ async function streamInsert(prisma, mongo, label, collectionName, modelName, fil
 }
 
 /* ─────────────────────────────────────────────────────────────────────
+   Streaming UPSERT — for mutable tables (channels, videos) whose existing
+   rows change in Mongo between ETL runs (currentStats, view counts, etc.).
+   Insert-only `createMany skipDuplicates` would leave those stale on a delta
+   re-run, so we upsert: insert brand-new rows, update existing ones in place.
+   Append-only tables (snapshots, sync_logs) keep using streamInsert.
+
+   Upserts run in bounded-concurrency groups to keep the Postgres pooler happy
+   while still being much faster than fully-serial.
+───────────────────────────────────────────────────────────────────── */
+
+// Kept below the Supabase session-pooler client cap (15) together with the
+// Prisma connection_limit set in main(). 8 in-flight upserts + pool overhead
+// stays comfortably under the ceiling.
+const UPSERT_CONCURRENCY = 8;
+
+async function streamUpsert(prisma, mongo, label, collectionName, modelName, filter, mapRow) {
+  const startedAt = Date.now();
+  const collection = mongo.collection(collectionName);
+  const cursor = collection.find(filter ?? {}, { batchSize: BATCH });
+
+  let read = 0;
+  let dropped = 0;
+  let written = 0;
+  let group = [];
+
+  const flushGroup = async () => {
+    if (!group.length) return;
+    if (DRY_RUN) {
+      written += group.length;
+    } else {
+      await Promise.all(
+        group.map((row) => {
+          const { id, ...rest } = row;
+          return prisma[modelName].upsert({
+            where: { id },
+            update: rest,
+            create: row,
+          });
+        }),
+      );
+      written += group.length;
+    }
+    group = [];
+  };
+
+  for await (const doc of cursor) {
+    read += 1;
+    const row = mapRow(doc);
+    if (row === null) {
+      dropped += 1;
+      continue;
+    }
+    group.push(row);
+    if (group.length >= UPSERT_CONCURRENCY) {
+      await flushGroup();
+      process.stdout.write(`  [${label}] ${read} read · ${written} upserted\r`);
+    }
+  }
+  await flushGroup();
+  const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1);
+  const droppedNote = dropped ? ` · ${dropped} dropped (orphaned FK)` : '';
+  console.log(`  [${label}] ${read} read · ${written} upserted${droppedNote} · ${elapsed}s`);
+  return { read, upserted: written, dropped };
+}
+
+/* ─────────────────────────────────────────────────────────────────────
    Per-collection migrations
 ───────────────────────────────────────────────────────────────────── */
 
@@ -170,7 +236,7 @@ async function migrateCategories(prisma, mongo) {
 
 async function migrateChannels(prisma, mongo, validUserIds) {
   const validIds = new Set();
-  await streamInsert(prisma, mongo, 'channels', 'channels', 'channel', null, (d) => {
+  await streamUpsert(prisma, mongo, 'channels', 'channels', 'channel', null, (d) => {
     const id = toIdString(d._id);
     validIds.add(id);
     const assignedToId = toIdString(d.assignedTo);
@@ -205,6 +271,12 @@ async function migrateChannels(prisma, mongo, validUserIds) {
 }
 
 async function migrateVideos(prisma, mongo, validChannelIds) {
+  // Insert-only (not upsert): some videos are deleted+re-ingested in Mongo and
+  // come back with a NEW _id but the SAME youtubeVideoId. An id-keyed upsert
+  // would try to insert the new _id and collide on the youtube_video_id unique
+  // constraint (P2002). createMany skipDuplicates skips on EITHER unique key,
+  // so it handles that case cleanly. Existing videos' stats are refreshed by
+  // the daily videoSync cron post-cutover, so insert-only is sufficient here.
   const validIds = new Set();
   await streamInsert(prisma, mongo, 'videos', 'videos', 'video', null, (d) => {
     const channelId = toIdString(d.channelId);
@@ -513,11 +585,15 @@ async function main() {
   await mongoClient.connect();
   const mongo = mongoClient.db(mongoDbName);
 
-  // Force DIRECT_URL for the ETL — large batched writes choke on the pgbouncer pooler.
+  // Bound Prisma's connection pool below the Supabase session-pooler cap
+  // (15 clients in session mode). Concurrent upserts (UPSERT_CONCURRENCY) draw
+  // from this pool, so connection_limit must stay under 15 with headroom.
+  let pgUrl = process.env.DIRECT_URL || process.env.DATABASE_URL;
+  if (!/[?&]connection_limit=/.test(pgUrl)) {
+    pgUrl += (pgUrl.includes('?') ? '&' : '?') + 'connection_limit=10';
+  }
   const prisma = new PrismaClient({
-    datasources: {
-      db: { url: process.env.DIRECT_URL || process.env.DATABASE_URL },
-    },
+    datasources: { db: { url: pgUrl } },
   });
   await prisma.$connect();
 
