@@ -346,6 +346,28 @@ export async function syncVideoStats(channelIds = null, type = 'manual') {
       `[Video Sync] Syncing ${videos.length} videos across ${channels.length} channels...`
     );
 
+    // Only-on-change guard: load each video's most recent prior-day snapshot so
+    // we can skip appending today's row when the fetched stats are unchanged.
+    // We still refresh every video's current stats below (accuracy is never
+    // sacrificed); we just don't store a duplicate time-series point. A video
+    // with NO prior snapshot always gets its first one (absent from this map).
+    // The carry-forward reports treat a skipped (unchanged) day as the carried
+    // value, so this is lossless.
+    const priorSnaps = await prisma.$queryRaw(Prisma.sql`
+      SELECT DISTINCT ON (video_id) video_id, views, likes, comments
+      FROM video_snapshots
+      WHERE channel_id IN (${Prisma.join(channelIdSet)})
+        AND deleted_at IS NULL
+        AND date < ${today}
+      ORDER BY video_id, date DESC
+    `);
+    const prevByVideo = new Map(
+      priorSnaps.map((s) => [
+        s.video_id,
+        { views: BigInt(s.views), likes: Number(s.likes), comments: Number(s.comments) },
+      ]),
+    );
+
     const localByYt = new Map(videos.map((v) => [v.youtubeVideoId, v]));
     const batches = [];
     for (let i = 0; i < videos.length; i += VIDEO_FETCH_BATCH) {
@@ -380,18 +402,24 @@ export async function syncVideoStats(channelIds = null, type = 'manual') {
         `);
 
         // 2) Bulk-upsert today's snapshot (id/updated_at have no DB default).
-        const sRows = Prisma.join(
-          batch.map(
-            (p) => Prisma.sql`(${p.snapId}, ${p.id}, ${p.channelId}, ${today}::timestamptz, ${p.views}::bigint, ${p.likes}::int, ${p.comments}::int, now())`
-          )
-        );
-        await prisma.$executeRaw(Prisma.sql`
-          INSERT INTO video_snapshots (id, video_id, channel_id, date, views, likes, comments, updated_at)
-          VALUES ${sRows}
-          ON CONFLICT (video_id, date) DO UPDATE SET
-            channel_id = EXCLUDED.channel_id, views = EXCLUDED.views,
-            likes = EXCLUDED.likes, comments = EXCLUDED.comments, updated_at = now()
-        `);
+        //    Only-on-change: skip rows whose stats are unchanged vs the prior
+        //    snapshot (writeSnapshot=false) — the video UPDATE above already
+        //    refreshed current stats; we just don't append a duplicate point.
+        const snapBatch = batch.filter((p) => p.writeSnapshot);
+        if (snapBatch.length) {
+          const sRows = Prisma.join(
+            snapBatch.map(
+              (p) => Prisma.sql`(${p.snapId}, ${p.id}, ${p.channelId}, ${today}::timestamptz, ${p.views}::bigint, ${p.likes}::int, ${p.comments}::int, now())`
+            )
+          );
+          await prisma.$executeRaw(Prisma.sql`
+            INSERT INTO video_snapshots (id, video_id, channel_id, date, views, likes, comments, updated_at)
+            VALUES ${sRows}
+            ON CONFLICT (video_id, date) DO UPDATE SET
+              channel_id = EXCLUDED.channel_id, views = EXCLUDED.views,
+              likes = EXCLUDED.likes, comments = EXCLUDED.comments, updated_at = now()
+          `);
+        }
 
         videosProcessed += batch.length;
       } catch (err) {
@@ -409,11 +437,13 @@ export async function syncVideoStats(channelIds = null, type = 'manual') {
                 comments: p.comments, duration: p.duration, lastSyncedAt: p.lastSyncedAt,
               },
             });
-            await prisma.videoSnapshot.upsert({
-              where: { videoId_date: { videoId: p.id, date: today } },
-              update: { channelId: p.channelId, views: p.views, likes: p.likes, comments: p.comments },
-              create: { videoId: p.id, channelId: p.channelId, date: today, views: p.views, likes: p.likes, comments: p.comments },
-            });
+            if (p.writeSnapshot) {
+              await prisma.videoSnapshot.upsert({
+                where: { videoId_date: { videoId: p.id, date: today } },
+                update: { channelId: p.channelId, views: p.views, likes: p.likes, comments: p.comments },
+                create: { videoId: p.id, channelId: p.channelId, date: today, views: p.views, likes: p.likes, comments: p.comments },
+              });
+            }
             videosProcessed += 1;
           } catch (e2) {
             errors.push({ channelId: ytChannelById.get(p.channelId) ?? 'unknown', message: `${p.youtubeVideoId}: ${e2.message}` });
@@ -467,6 +497,15 @@ export async function syncVideoStats(channelIds = null, type = 'manual') {
           const likes = parseInt(vid.statistics?.likeCount) || 0;
           const comments = parseInt(vid.statistics?.commentCount) || 0;
 
+          // Append today's snapshot only when the stats moved since the most
+          // recent prior-day snapshot (or when there is none — first-ever).
+          const prev = prevByVideo.get(local.id);
+          const writeSnapshot =
+            !prev ||
+            prev.views !== BigInt(views) ||
+            prev.likes !== likes ||
+            prev.comments !== comments;
+
           pending.push({
             id: local.id,
             youtubeVideoId: vid.id,
@@ -481,6 +520,7 @@ export async function syncVideoStats(channelIds = null, type = 'manual') {
             duration: vid.contentDetails?.duration || '',
             lastSyncedAt: new Date(),
             snapId: randomUUID(),
+            writeSnapshot,
           });
 
           if (pending.length >= VIDEO_WRITE_FLUSH) await flush();
@@ -982,6 +1022,28 @@ export async function syncIhiSadhguruVideoStats(channelIds = null, type = 'manua
     const ytIds = videos.map((v) => v.youtubeVideoId).filter(Boolean);
     const idByYt = new Map(videos.map((v) => [v.youtubeVideoId, v.id]));
 
+    // Only-on-change guard (same as syncVideoStats): load each video's most
+    // recent prior-day snapshot so we skip appending an unchanged duplicate.
+    // This path overlaps syncVideoStats (it re-stats existing IHI sadhguru
+    // videos), so without the guard here it would re-create the very rows
+    // syncVideoStats skips. The video UPDATE below still refreshes current
+    // stats unconditionally.
+    const prevByVideo = new Map(
+      (
+        await prisma.$queryRaw(Prisma.sql`
+          SELECT DISTINCT ON (video_id) video_id, views, likes, comments
+          FROM video_snapshots
+          WHERE channel_id IN (${Prisma.join(ihiChannelIds)})
+            AND deleted_at IS NULL
+            AND date < ${today}
+          ORDER BY video_id, date DESC
+        `)
+      ).map((s) => [
+        s.video_id,
+        { views: BigInt(s.views), likes: Number(s.likes), comments: Number(s.comments) },
+      ]),
+    );
+
     const chunkSize = 50;
     for (let i = 0; i < ytIds.length; i += chunkSize) {
       const quota = getQuotaUsage();
@@ -1032,23 +1094,34 @@ export async function syncIhiSadhguruVideoStats(channelIds = null, type = 'manua
 
           if (!savedVideo) continue;
 
-          await prisma.videoSnapshot.upsert({
-            where: { videoId_date: { videoId: savedVideo.id, date: today } },
-            update: {
-              channelId: savedVideo.channelId,
-              views: BigInt(views),
-              likes,
-              comments,
-            },
-            create: {
-              videoId: savedVideo.id,
-              channelId: savedVideo.channelId,
-              date: today,
-              views: BigInt(views),
-              likes,
-              comments,
-            },
-          });
+          // Append today's snapshot only when stats moved vs the prior day
+          // (or first-ever). Current stats were already refreshed above.
+          const prev = prevByVideo.get(savedVideo.id);
+          const writeSnapshot =
+            !prev ||
+            prev.views !== BigInt(views) ||
+            prev.likes !== likes ||
+            prev.comments !== comments;
+
+          if (writeSnapshot) {
+            await prisma.videoSnapshot.upsert({
+              where: { videoId_date: { videoId: savedVideo.id, date: today } },
+              update: {
+                channelId: savedVideo.channelId,
+                views: BigInt(views),
+                likes,
+                comments,
+              },
+              create: {
+                videoId: savedVideo.id,
+                channelId: savedVideo.channelId,
+                date: today,
+                views: BigInt(views),
+                likes,
+                comments,
+              },
+            });
+          }
 
           videosProcessed++;
         }

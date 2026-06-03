@@ -56,23 +56,51 @@ export async function getChannelVideoTrends(req, res, next) {
       ? parseYmdToUtcStart(startDate)
       : utcStartOfDay(Date.now() - 30 * 24 * 60 * 60 * 1000);
 
-    // 1. Daily aggregated trend across all videos in the channel.
-    //    Mongo's $dateToString('%Y-%m-%d', $date) is replicated with
-    //    to_char(date, 'YYYY-MM-DD') in Postgres.
+    // 1. Daily aggregated trend across all videos in the channel — CARRY-FORWARD.
+    //    Each output day reports the channel's TOTAL cumulative views/likes/
+    //    comments as of that day (sum over videos of each video's latest
+    //    snapshot with date <= day), so the series is invariant to whether
+    //    unchanged days are materialized (the only-on-change sync guard skips
+    //    writing a row when a video's stats don't move). Implemented as a
+    //    prefix-sum of per-snapshot increments (value - previous snapshot's
+    //    value, which telescopes to the latest value per video): for each day d
+    //    the total = SUM of all increments with date <= d. Increments are not
+    //    lower-bounded by `start` so pre-window snapshots set the carried-in
+    //    baseline. videoCount = videos whose first snapshot is <= d (i.e. live
+    //    by that day). Output days are the distinct in-range snapshot days — on
+    //    dense daily data that is every tracked day and this equals the old
+    //    per-day SUM exactly; it differs only on unmaterialized days, where it
+    //    correctly carries forward instead of dropping out.
     const dailyRows = await prisma.$queryRaw(Prisma.sql`
+      WITH days AS (
+        SELECT DISTINCT date AS d
+        FROM video_snapshots
+        WHERE channel_id = ${channelId}
+          AND deleted_at IS NULL
+          AND date >= ${start}
+          AND date <= ${end}
+      ),
+      incs AS (
+        SELECT
+          date,
+          views    - COALESCE(LAG(views)    OVER w, 0) AS inc_views,
+          likes    - COALESCE(LAG(likes)    OVER w, 0) AS inc_likes,
+          comments - COALESCE(LAG(comments) OVER w, 0) AS inc_comments,
+          ROW_NUMBER() OVER w AS rn
+        FROM video_snapshots
+        WHERE channel_id = ${channelId}
+          AND deleted_at IS NULL
+          AND date <= ${end}
+        WINDOW w AS (PARTITION BY video_id ORDER BY date)
+      )
       SELECT
-        to_char(date AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS date,
-        COALESCE(SUM(views), 0)::bigint    AS total_views,
-        COALESCE(SUM(likes), 0)::bigint    AS total_likes,
-        COALESCE(SUM(comments), 0)::bigint AS total_comments,
-        COUNT(*)::bigint                   AS video_count
-      FROM video_snapshots
-      WHERE channel_id = ${channelId}
-        AND date >= ${start}
-        AND date <= ${end}
-        AND deleted_at IS NULL
-      GROUP BY 1
-      ORDER BY 1 ASC
+        to_char(days.d AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS date,
+        COALESCE((SELECT SUM(inc_views)    FROM incs WHERE incs.date <= days.d), 0)::bigint AS total_views,
+        COALESCE((SELECT SUM(inc_likes)    FROM incs WHERE incs.date <= days.d), 0)::bigint AS total_likes,
+        COALESCE((SELECT SUM(inc_comments) FROM incs WHERE incs.date <= days.d), 0)::bigint AS total_comments,
+        (SELECT COUNT(*) FROM incs WHERE incs.date <= days.d AND incs.rn = 1)::bigint AS video_count
+      FROM days
+      ORDER BY days.d ASC
     `);
 
     const dailyTrend = dailyRows.map((r) => ({
@@ -83,22 +111,54 @@ export async function getChannelVideoTrends(req, res, next) {
       videoCount: Number(r.video_count),
     }));
 
-    // 2. Top videos by total views in the period, with raw data points to
-    //    rebuild the trend client-side. Mongo's $first/$last on an unsorted
-    //    $group is implementation-defined; here we compute first/last
-    //    against the *date* ordering explicitly so the result is stable.
+    // 2. Top videos by view count in the period. "Views (period)" = the
+    //    video's actual view count at period end (carry-forward closing: latest
+    //    snapshot with date <= end), NOT a sum across days — so the number is
+    //    invariant to snapshot density and matches the column's meaning. Each
+    //    row also carries the opening balance (latest snapshot <= start, else
+    //    the first in-range snapshot) so viewsGrowth = closing - opening is
+    //    stable. A video must have at least one in-range snapshot to appear
+    //    (matches the previous membership rule); a video that is completely
+    //    flat for the entire window therefore won't list — it has zero growth.
     const videoIdRows = await prisma.$queryRaw(Prisma.sql`
       SELECT
-        video_id,
-        COALESCE(SUM(views), 0)::bigint    AS total_views,
-        COALESCE(SUM(likes), 0)::bigint    AS total_likes,
-        COALESCE(SUM(comments), 0)::bigint AS total_comments
-      FROM video_snapshots
-      WHERE channel_id = ${channelId}
-        AND date >= ${start}
-        AND date <= ${end}
-        AND deleted_at IS NULL
-      GROUP BY video_id
+        tv.id AS video_id,
+        COALESCE((
+          SELECT s.views FROM video_snapshots s
+          WHERE s.video_id = tv.id AND s.deleted_at IS NULL AND s.date <= ${end}
+          ORDER BY s.date DESC LIMIT 1
+        ), 0)::bigint AS total_views,
+        COALESCE((
+          SELECT s.likes FROM video_snapshots s
+          WHERE s.video_id = tv.id AND s.deleted_at IS NULL AND s.date <= ${end}
+          ORDER BY s.date DESC LIMIT 1
+        ), 0)::bigint AS total_likes,
+        COALESCE((
+          SELECT s.comments FROM video_snapshots s
+          WHERE s.video_id = tv.id AND s.deleted_at IS NULL AND s.date <= ${end}
+          ORDER BY s.date DESC LIMIT 1
+        ), 0)::bigint AS total_comments,
+        COALESCE(
+          (
+            SELECT s.views FROM video_snapshots s
+            WHERE s.video_id = tv.id AND s.deleted_at IS NULL AND s.date <= ${start}
+            ORDER BY s.date DESC LIMIT 1
+          ),
+          (
+            SELECT s.views FROM video_snapshots s
+            WHERE s.video_id = tv.id AND s.deleted_at IS NULL
+              AND s.date >= ${start} AND s.date <= ${end}
+            ORDER BY s.date ASC LIMIT 1
+          ),
+          0
+        )::bigint AS opening_views
+      FROM videos tv
+      WHERE tv.channel_id = ${channelId}
+        AND EXISTS (
+          SELECT 1 FROM video_snapshots s
+          WHERE s.video_id = tv.id AND s.deleted_at IS NULL
+            AND s.date >= ${start} AND s.date <= ${end}
+        )
       ORDER BY total_views DESC
       LIMIT 10
     `);
@@ -138,8 +198,12 @@ export async function getChannelVideoTrends(req, res, next) {
 
     const enriched = videoIdRows.map((r) => {
       const points = byVideo.get(r.video_id) || [];
-      const firstViews = points.length ? Number(points[0].views) : 0;
-      const lastViews  = points.length ? Number(points[points.length - 1].views) : 0;
+      // firstViews/lastViews are the carry-forward opening/closing balances
+      // computed in SQL (not derived from the in-range points, which may be
+      // sparse under the only-on-change guard). totalViews IS the closing
+      // balance, so lastViews === totalViews.
+      const firstViews = Number(r.opening_views);
+      const lastViews  = Number(r.total_views);
       return {
         _id: r.video_id,
         totalViews: Number(r.total_views),

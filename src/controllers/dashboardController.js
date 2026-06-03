@@ -152,17 +152,40 @@ export async function getSummary(req, res, next) {
         });
         const sadhguruVideoIds = sadhguruVideos.map((v) => v.id);
         if (sadhguruVideoIds.length > 0) {
+          // prevViews = total sadhguru views at the START of the period. Use a
+          // carry-forward opening so the result is invariant to whether
+          // unchanged days are materialized (the only-on-change sync guard
+          // skips writing a row when views don't move): the latest snapshot
+          // with date <= start, falling back to the first in-range snapshot for
+          // videos with no pre-start history (the guard always keeps a video's
+          // first-ever snapshot). On dense daily data both resolve to the
+          // start-day row, so this preserves the previous output exactly.
           const ihiPrev = await prisma.$queryRaw(Prisma.sql`
-            SELECT COALESCE(SUM(first_views), 0)::bigint AS total
+            SELECT COALESCE(SUM(opening), 0)::bigint AS total
             FROM (
-              SELECT DISTINCT ON (video_id) video_id, views AS first_views
-              FROM video_snapshots
-              WHERE video_id IN (${Prisma.join(sadhguruVideoIds)})
-                AND deleted_at IS NULL
-                AND date >= ${start}
-                AND date <= ${end}
-              ORDER BY video_id, date ASC
-            ) firsts
+              SELECT
+                COALESCE(
+                  (
+                    SELECT s.views FROM video_snapshots s
+                    WHERE s.video_id = tv.id
+                      AND s.deleted_at IS NULL
+                      AND s.date <= ${start}
+                    ORDER BY s.date DESC
+                    LIMIT 1
+                  ),
+                  (
+                    SELECT s.views FROM video_snapshots s
+                    WHERE s.video_id = tv.id
+                      AND s.deleted_at IS NULL
+                      AND s.date >= ${start}
+                      AND s.date <= ${end}
+                    ORDER BY s.date ASC
+                    LIMIT 1
+                  )
+                ) AS opening
+              FROM videos tv
+              WHERE tv.id IN (${Prisma.join(sadhguruVideoIds)})
+            ) openings
           `);
           prevViews = n(ihiPrev[0]?.total);
         }
@@ -271,17 +294,47 @@ export async function getGrowthData(req, res, next) {
       });
       const sadhguruVideoIds = sadhguruVideos.map((v) => v.id);
 
+      // Per-day cumulative views, carry-forward. Each output day reports the
+      // TOTAL sadhguru views as of that day (sum over videos of their latest
+      // snapshot with date <= day), so the series is invariant to whether
+      // unchanged days are materialized (the only-on-change sync guard skips
+      // writing a row when views don't move). We compute it as a prefix-sum of
+      // per-snapshot increments (views - previous snapshot's views, telescoping
+      // to the latest value per video): for each day d, SUM of all increments
+      // with date <= d. Increments are NOT lower-bounded by `start` — pre-start
+      // snapshots set the opening cumulative carried into the window. On dense
+      // daily data this equals the old per-day SUM(views) exactly; it differs
+      // only on days with no snapshot, where it (correctly) carries forward
+      // instead of dropping to 0. The output days are driven by the channel
+      // snapshots (same set the chart renders), mirroring the JS merge below.
       const ihiSnapshots = sadhguruVideoIds.length
         ? await prisma.$queryRaw(Prisma.sql`
-            SELECT TO_CHAR(date AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS day,
-                   COALESCE(SUM(views), 0)::bigint AS total_views
-            FROM video_snapshots
-            WHERE video_id IN (${Prisma.join(sadhguruVideoIds)})
-              AND deleted_at IS NULL
-              AND date >= ${start}
-              AND date <= ${end}
-            GROUP BY day
-            ORDER BY day ASC
+            WITH days AS (
+              SELECT DISTINCT date AS d
+              FROM channel_snapshots
+              WHERE channel_id IN (${Prisma.join(channelIds)})
+                AND deleted_at IS NULL
+                AND date >= ${start}
+                AND date <= ${end}
+            ),
+            incs AS (
+              SELECT
+                date,
+                views - COALESCE(
+                  LAG(views) OVER (PARTITION BY video_id ORDER BY date), 0
+                ) AS inc
+              FROM video_snapshots
+              WHERE video_id IN (${Prisma.join(sadhguruVideoIds)})
+                AND deleted_at IS NULL
+                AND date <= ${end}
+            )
+            SELECT
+              TO_CHAR(d AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS day,
+              COALESCE(
+                (SELECT SUM(inc) FROM incs WHERE incs.date <= days.d), 0
+              )::bigint AS total_views
+            FROM days
+            ORDER BY d ASC
           `)
         : [];
 
