@@ -188,6 +188,79 @@ describe('GET /api/dashboard/summary', () => {
 });
 
 // ============================================================================
+// GET /api/dashboard/summary — only-on-change invariance (IHI prevViews)
+//
+// The only-on-change sync guard writes a video_snapshot row ONLY when views
+// differ from the previous stored row. The IHI prevViews baseline must
+// therefore be invariant to whether unchanged days are materialized: a "dense"
+// trajectory (a row every day, including unchanged days) and the equivalent
+// "sparse" trajectory (rows only where the value changed) must produce the
+// SAME viewsChange. prevViews is the view total at the START of the period, so
+// the correct, densify-invariant baseline is carry-forward: the latest
+// snapshot with date <= start (falling back to the first in-range snapshot for
+// videos with no pre-start history — which the guard always keeps).
+// ============================================================================
+describe('GET /api/dashboard/summary — only-on-change invariance (IHI)', () => {
+  // Old sadhguru video, published before the window, current views = 200.
+  // Baseline (views at start = Jan 10) is 100, so viewsChange = (200-100)/100 = 100%.
+  const seedVideo = async () => {
+    const ch = await mkChannel({ category: 'IHI - Inv', lastSyncedAt: D('15') });
+    const v = await mkVideo({
+      channelId: ch.id,
+      classification: 'sadhguru',
+      views: 200,
+      publishedAt: D('05'),
+    });
+    return v;
+  };
+
+  it('200 — IHI viewsChange: dense daily snapshots (incl. unchanged days)', async () => {
+    const { headers } = await authFor('admin');
+    const v = await seedVideo();
+    // Dense: a row every day. 100 through Jan 14, 150 through Jan 19, 200 on Jan 20.
+    const dense = [
+      ['08', 100], ['09', 100], ['10', 100], ['11', 100], ['12', 100],
+      ['13', 100], ['14', 100], ['15', 150], ['16', 150], ['17', 150],
+      ['18', 150], ['19', 150], ['20', 200],
+    ];
+    for (const [day, views] of dense) {
+      await mkVidSnap({ videoId: v.id, channelId: v.channelId, date: D(day), views });
+    }
+
+    const res = await request(app)
+      .get('/api/dashboard/summary?group=ihi&startDate=2024-01-10&endDate=2024-01-20')
+      .set(headers);
+
+    expect(res.status).toBe(200);
+    expect(res.body.totalViews).toBe(200);
+    expect(res.body.viewsChange).toBe(100);
+  });
+
+  it('200 — IHI viewsChange: SPARSE only-on-change snapshots match the dense result', async () => {
+    const { headers } = await authFor('admin');
+    const v = await seedVideo();
+    // Same trajectory, but only the days the value changed are stored. The
+    // last change before the window is Jan 08 (=100); inside the window the
+    // value steps to 150 (Jan 15) then 200 (Jan 20). Carry-forward makes the
+    // baseline at Jan 10 still 100 → viewsChange 100%, identical to dense.
+    const sparse = [
+      ['08', 100], ['15', 150], ['20', 200],
+    ];
+    for (const [day, views] of sparse) {
+      await mkVidSnap({ videoId: v.id, channelId: v.channelId, date: D(day), views });
+    }
+
+    const res = await request(app)
+      .get('/api/dashboard/summary?group=ihi&startDate=2024-01-10&endDate=2024-01-20')
+      .set(headers);
+
+    expect(res.status).toBe(200);
+    expect(res.body.totalViews).toBe(200);
+    expect(res.body.viewsChange).toBe(100);
+  });
+});
+
+// ============================================================================
 // GET /api/dashboard/growth
 // ============================================================================
 describe('GET /api/dashboard/growth', () => {
@@ -207,7 +280,7 @@ describe('GET /api/dashboard/growth', () => {
     ]);
   });
 
-  it('200 — ihi: merges VideoSnapshot daily sums into channel snapshot rows', async () => {
+  it('200 — ihi: per-day cumulative views, carry-forward on a gap day', async () => {
     const { headers } = await authFor('viewer');
     const ch = await mkChannel({ category: 'IHI - A', lastSyncedAt: D('15') });
     const v = await mkVideo({
@@ -225,10 +298,14 @@ describe('GET /api/dashboard/growth', () => {
       .get('/api/dashboard/growth?group=ihi&startDate=2024-01-10&endDate=2024-01-20')
       .set(headers);
     expect(res.status).toBe(200);
+    // Jan 14 has a channel snapshot but NO video snapshot. Carry-forward
+    // reports the video's last-known cumulative views (1500) rather than the
+    // old gap→0. This is the behavior the only-on-change guard relies on: an
+    // unmaterialized (unchanged) day shows the carried value, not zero.
     expect(res.body).toEqual([
       { date: '2024-01-12', subscribers: 100, views: 1000, videoCount: 3 },
       { date: '2024-01-13', subscribers: 110, views: 1500, videoCount: 4 },
-      { date: '2024-01-14', subscribers: 120, views: 0, videoCount: 5 },
+      { date: '2024-01-14', subscribers: 120, views: 1500, videoCount: 5 },
     ]);
   });
 
@@ -240,6 +317,57 @@ describe('GET /api/dashboard/growth', () => {
     const res = await request(app).get('/api/dashboard/growth').set(headers);
     expect(res.status).toBe(500);
     expect(res.body.message).toBe('boom');
+  });
+
+  // --- only-on-change invariance --------------------------------------------
+  // The IHI per-day views must be carry-forward (each day = total cumulative
+  // sadhguru views as of that day) so the chart is invariant to whether
+  // unchanged days are materialized. A "dense" trajectory (a row every day,
+  // incl. unchanged days) and the equivalent "sparse" trajectory (rows only
+  // where the value changed) must produce the SAME per-day array.
+  const seedGrowthIhi = async () => {
+    const ch = await mkChannel({ category: 'IHI - G', lastSyncedAt: D('15') });
+    const v = await mkVideo({ channelId: ch.id, classification: 'sadhguru', publishedAt: D('05') });
+    // Three output days are driven by the channel snapshots.
+    await mkChSnap({ channelId: ch.id, date: D('12'), subscribers: 100, videoCount: 3 });
+    await mkChSnap({ channelId: ch.id, date: D('13'), subscribers: 110, videoCount: 4 });
+    await mkChSnap({ channelId: ch.id, date: D('14'), subscribers: 120, videoCount: 5 });
+    return v;
+  };
+  const expectedGrowth = [
+    { date: '2024-01-12', subscribers: 100, views: 1000, videoCount: 3 },
+    { date: '2024-01-13', subscribers: 110, views: 1000, videoCount: 4 },
+    { date: '2024-01-14', subscribers: 120, views: 1500, videoCount: 5 },
+  ];
+
+  it('200 — ihi dense: per-day cumulative views (Jan13 unchanged at 1000)', async () => {
+    const { headers } = await authFor('viewer');
+    const v = await seedGrowthIhi();
+    // Dense: a video snapshot every day; Jan13 is unchanged (still 1000).
+    await mkVidSnap({ videoId: v.id, channelId: v.channelId, date: D('12'), views: 1000 });
+    await mkVidSnap({ videoId: v.id, channelId: v.channelId, date: D('13'), views: 1000 });
+    await mkVidSnap({ videoId: v.id, channelId: v.channelId, date: D('14'), views: 1500 });
+
+    const res = await request(app)
+      .get('/api/dashboard/growth?group=ihi&startDate=2024-01-10&endDate=2024-01-20')
+      .set(headers);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(expectedGrowth);
+  });
+
+  it('200 — ihi SPARSE only-on-change: Jan13 carries forward, matches dense', async () => {
+    const { headers } = await authFor('viewer');
+    const v = await seedGrowthIhi();
+    // Sparse: Jan13 (unchanged) is not materialized. Carry-forward must still
+    // report 1000 for Jan13 — identical to the dense result above.
+    await mkVidSnap({ videoId: v.id, channelId: v.channelId, date: D('12'), views: 1000 });
+    await mkVidSnap({ videoId: v.id, channelId: v.channelId, date: D('14'), views: 1500 });
+
+    const res = await request(app)
+      .get('/api/dashboard/growth?group=ihi&startDate=2024-01-10&endDate=2024-01-20')
+      .set(headers);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(expectedGrowth);
   });
 });
 

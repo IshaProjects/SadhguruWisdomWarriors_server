@@ -567,6 +567,73 @@ describe('syncVideoStats', () => {
     expect(Number(snaps[0].views)).toBe(999);
   });
 
+  // --- only-on-change guard -------------------------------------------------
+  // The sync must still UPDATE every video's current stats (so the dashboard
+  // stays accurate), but it should only APPEND today's video_snapshot row when
+  // the fetched stats differ from the video's most recent prior snapshot. This
+  // is what keeps free-tier storage growth bounded; the carry-forward reports
+  // make a skipped (unchanged) day lossless.
+  const PRIOR = new Date('2025-01-01T00:00:00.000Z'); // any day before "today"
+
+  it('only-on-change: unchanged stats update the video but write NO new snapshot', async () => {
+    const ch = await prisma.channel.create({
+      data: { youtubeChannelId: 'UC_d', category: 'Dedicated Sadhguru' },
+    });
+    const v = await prisma.video.create({
+      data: { youtubeVideoId: 'v1', channelId: ch.id, views: 0 },
+    });
+    // Prior snapshot equals what YouTube will return (100 / 10 / 5).
+    await prisma.videoSnapshot.create({
+      data: { videoId: v.id, channelId: ch.id, date: PRIOR, views: 100, likes: 10, comments: 5 },
+    });
+
+    fetchVideosBatch.mockResolvedValueOnce([makeYtVideo({ id: 'v1' })]); // 100/10/5
+    await syncVideoStats([ch.id]);
+
+    // The video's current stats are still refreshed...
+    const vid = await prisma.video.findUnique({ where: { id: v.id } });
+    expect(Number(vid.views)).toBe(100);
+    // ...but no new (today) snapshot row was appended — only the prior remains.
+    const snaps = await prisma.videoSnapshot.findMany({});
+    expect(snaps).toHaveLength(1);
+    expect(snaps[0].date.toISOString()).toBe(PRIOR.toISOString());
+  });
+
+  it('only-on-change: changed stats DO append a new snapshot', async () => {
+    const ch = await prisma.channel.create({
+      data: { youtubeChannelId: 'UC_d', category: 'Dedicated Sadhguru' },
+    });
+    const v = await prisma.video.create({
+      data: { youtubeVideoId: 'v1', channelId: ch.id, views: 0 },
+    });
+    await prisma.videoSnapshot.create({
+      data: { videoId: v.id, channelId: ch.id, date: PRIOR, views: 100, likes: 10, comments: 5 },
+    });
+
+    fetchVideosBatch.mockResolvedValueOnce([
+      makeYtVideo({ id: 'v1', statistics: { viewCount: '150', likeCount: '10', commentCount: '5' } }),
+    ]);
+    await syncVideoStats([ch.id]);
+
+    const snaps = await prisma.videoSnapshot.findMany({ orderBy: { date: 'asc' } });
+    expect(snaps).toHaveLength(2); // prior + today
+    expect(Number(snaps[1].views)).toBe(150);
+  });
+
+  it('only-on-change: a video with no prior snapshot always gets its first one', async () => {
+    const ch = await prisma.channel.create({
+      data: { youtubeChannelId: 'UC_d', category: 'Dedicated Sadhguru' },
+    });
+    await prisma.video.create({ data: { youtubeVideoId: 'v1', channelId: ch.id } });
+
+    fetchVideosBatch.mockResolvedValueOnce([makeYtVideo({ id: 'v1' })]); // 100/10/5
+    await syncVideoStats([ch.id]);
+
+    const snaps = await prisma.videoSnapshot.findMany({});
+    expect(snaps).toHaveLength(1);
+    expect(Number(snaps[0].views)).toBe(100);
+  });
+
   it('skips soft-deleted videos', async () => {
     const ch = await prisma.channel.create({
       data: { youtubeChannelId: 'UC_d', category: 'Dedicated Sadhguru' },
@@ -1310,6 +1377,28 @@ describe('syncIhiSadhguruVideoStats', () => {
     expect(Number(v.views)).toBe(100);
     const snaps = await prisma.videoSnapshot.findMany({ where: { videoId: v.id } });
     expect(snaps).toHaveLength(1);
+  });
+
+  it('only-on-change: unchanged sadhguru stats update the video but write NO new snapshot', async () => {
+    const ch = await prisma.channel.create({
+      data: { youtubeChannelId: 'UC_ihi', category: 'IHI Partner' },
+    });
+    const v = await prisma.video.create({
+      data: { youtubeVideoId: 'v1', channelId: ch.id, classification: 'sadhguru', views: 0 },
+    });
+    const prior = new Date('2025-01-01T00:00:00.000Z');
+    await prisma.videoSnapshot.create({
+      data: { videoId: v.id, channelId: ch.id, date: prior, views: 100, likes: 10, comments: 5 },
+    });
+
+    fetchVideosBatch.mockResolvedValue([makeYtVideo({ id: 'v1' })]); // 100/10/5 unchanged
+    await syncIhiSadhguruVideoStats([ch.id]);
+
+    const vid = await prisma.video.findUnique({ where: { id: v.id } });
+    expect(Number(vid.views)).toBe(100); // current stats still refreshed
+    const snaps = await prisma.videoSnapshot.findMany({ where: { videoId: v.id } });
+    expect(snaps).toHaveLength(1); // no duplicate today row appended
+    expect(snaps[0].date.toISOString()).toBe(prior.toISOString());
   });
 
   it('ignores YouTube payload entries we no longer have a video for', async () => {
