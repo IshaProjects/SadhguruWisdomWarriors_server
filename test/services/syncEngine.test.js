@@ -862,14 +862,13 @@ describe('syncIhiIngestLast24h', () => {
     expect(v1.classification).toBe('sadhguru');
   });
 
-  it('includes auto-archived inactive channels (for reactivation flow)', async () => {
+  it('includes inactive channels (for reactivation flow)', async () => {
     const ch = await prisma.channel.create({
       data: {
         youtubeChannelId: 'UC_ihi_arch',
         uploadsPlaylistId: 'UU_ihi_arch',
         category: 'IHI Partner',
-        status: 'archived',
-        autoArchivedForInactivity: true,
+        status: 'inactive',
       },
     });
     fetchPlaylistItemsPublishedSince.mockResolvedValue({ items: [makePlaylistItem('vx')], pagesFetched: 1 });
@@ -1165,14 +1164,13 @@ describe('syncDedicatedIngestLast24h', () => {
     expect(v.classification).toBe('sadhguru');
   });
 
-  it('includes auto-archived inactive dedicated channels (reactivation flow)', async () => {
+  it('includes inactive dedicated channels (reactivation flow)', async () => {
     const ch = await prisma.channel.create({
       data: {
         youtubeChannelId: 'UC_d_arch',
         uploadsPlaylistId: 'UU_d_arch',
         category: 'Dedicated Sadhguru',
-        status: 'archived',
-        autoArchivedForInactivity: true,
+        status: 'inactive',
       },
     });
     fetchPlaylistItemsPublishedSince.mockResolvedValue({ items: [makePlaylistItem('v1')], pagesFetched: 1 });

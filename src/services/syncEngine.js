@@ -594,11 +594,9 @@ export async function syncIhiIngestLast24h(channelIds = null, type = 'manual') {
   let classified = 0;
 
   try {
-    // Include inactivity-archived channels so new uploads keep being ingested
-    // (and classified) — this is what lets the daily sync reactivate them.
-    const where = {
-      OR: [{ status: { not: 'archived' } }, { autoArchivedForInactivity: true }],
-    };
+    // Inactive channels are included (status != archived) so new uploads keep
+    // being ingested and classified — the daily sync reactivates them.
+    const where = { status: { not: 'archived' } };
     if (channelIds) where.id = { in: channelIds };
     const channels = (await prisma.channel.findMany({ where })).filter(isIhiChannel);
 
@@ -805,11 +803,9 @@ export async function syncDedicatedIngestLast24h(channelIds = null, type = 'manu
   let classified = 0;
 
   try {
-    // Include inactivity-archived channels so new uploads keep being ingested
-    // — this is what lets the daily sync reactivate them.
-    const where = {
-      OR: [{ status: { not: 'archived' } }, { autoArchivedForInactivity: true }],
-    };
+    // Inactive channels are included (status != archived) so new uploads keep
+    // being ingested — the daily sync reactivates them.
+    const where = { status: { not: 'archived' } };
     if (channelIds) where.id = { in: channelIds };
     const channels = (await prisma.channel.findMany({ where })).filter(isDedicatedChannel);
 
