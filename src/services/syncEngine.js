@@ -168,7 +168,7 @@ export async function syncChannelStats(channelIds = null, type = 'manual') {
       }
     }
 
-    // Recompute Active/Inactive: auto-archive dormant channels and reactivate
+    // Recompute Active/Inactive: mark dormant channels inactive and reactivate
     // those that have posted again. Isolated so a failure can't fail the sync.
     try {
       await updateChannelActivityStatuses(type);
@@ -211,11 +211,15 @@ export async function syncChannelStats(channelIds = null, type = 'manual') {
 }
 
 // ---------------------------------------------------------------------------
-// Activity status — auto-archive channels with no qualifying recent posts, and
-// reactivate auto-archived channels that have posted again. Runs as the final
-// step of the daily channel sync. Reuses the `archived` status (already hidden
-// by every status filter) plus the hidden `autoArchivedForInactivity` flag to
-// tell automatic archives apart from deliberate manual ones.
+// Activity status — mark channels with no qualifying recent posts `inactive`,
+// and reactivate inactive channels that have posted again. Runs as the final
+// step of the daily channel sync.
+//
+// `inactive` channels stay fully tracked and counted (their back-catalog keeps
+// earning views); every sync/dashboard filter is `status != 'archived'`, so
+// they flow through automatically. `archived` is reserved for soft-deleted
+// channels (softDeleteChannels sets it together with deletedAt) and is never
+// written or reverted here.
 //
 // "Qualifying post" depends on channel group:
 //   IHI             → only sadhguru-classified videos count
@@ -237,42 +241,42 @@ export async function updateChannelActivityStatuses(type = 'auto') {
     return !!found;
   };
 
-  let archived = 0;
+  let inactivated = 0;
   let reactivated = 0;
 
-  // Detection: active channels that have gone quiet → archive for inactivity.
+  // Detection: active channels that have gone quiet → inactive.
   const activeChannels = await prisma.channel.findMany({ where: { status: 'active' } });
   for (const channel of activeChannels) {
-    // Don't archive a freshly-added channel before ingest has had time to
+    // Don't demote a freshly-added channel before ingest has had time to
     // populate its videos.
     if (channel.createdAt && channel.createdAt > cutoff) continue;
     if (await hasQualifyingRecentPost(channel)) continue;
     await prisma.channel.update({
       where: { id: channel.id },
-      data: { status: 'archived', autoArchivedForInactivity: true },
+      data: { status: 'inactive' },
     });
-    archived += 1;
+    inactivated += 1;
   }
 
-  // Reactivation: auto-archived channels that posted again → back to active.
+  // Reactivation: inactive channels that posted again → back to active.
   const dormantChannels = await prisma.channel.findMany({
-    where: { status: 'archived', autoArchivedForInactivity: true },
+    where: { status: 'inactive' },
   });
   for (const channel of dormantChannels) {
     if (!(await hasQualifyingRecentPost(channel))) continue;
     await prisma.channel.update({
       where: { id: channel.id },
-      data: { status: 'active', autoArchivedForInactivity: false },
+      data: { status: 'active' },
     });
     reactivated += 1;
   }
 
   logger.info(
-    `[Activity Status] ${archived} channel(s) archived for inactivity, ` +
+    `[Activity Status] ${inactivated} channel(s) marked inactive, ` +
       `${reactivated} reactivated (window: ${days}d, ${type})`
   );
 
-  return { archived, reactivated, thresholdDays: days };
+  return { inactivated, reactivated, thresholdDays: days };
 }
 
 // ---------------------------------------------------------------------------

@@ -335,7 +335,7 @@ describe('syncChannelStats', () => {
 // ────────────────────────────────────────────────────────────────────────────
 
 describe('updateChannelActivityStatuses', () => {
-  it('archives an active channel with no qualifying recent post', async () => {
+  it('marks an active channel with no qualifying recent post inactive (NOT archived)', async () => {
     const oldDate = new Date(Date.now() - 100 * 24 * 60 * 60 * 1000);
     const ch = await prisma.channel.create({
       data: {
@@ -352,11 +352,10 @@ describe('updateChannelActivityStatuses', () => {
       ch.id,
     );
     const result = await updateChannelActivityStatuses();
-    expect(result.archived).toBe(1);
+    expect(result.inactivated).toBe(1);
     expect(result.thresholdDays).toBe(14);
     const fresh = await prisma.channel.findUnique({ where: { id: ch.id } });
-    expect(fresh.status).toBe('archived');
-    expect(fresh.autoArchivedForInactivity).toBe(true);
+    expect(fresh.status).toBe('inactive');
   });
 
   it('skips a freshly-created channel even if it has no recent post', async () => {
@@ -364,7 +363,7 @@ describe('updateChannelActivityStatuses', () => {
       data: { youtubeChannelId: 'UC_new', status: 'active', category: 'Dedicated Sadhguru' },
     });
     const result = await updateChannelActivityStatuses();
-    expect(result.archived).toBe(0);
+    expect(result.inactivated).toBe(0);
   });
 
   it('keeps an active channel that has a recent post (any class for dedicated)', async () => {
@@ -389,7 +388,7 @@ describe('updateChannelActivityStatuses', () => {
       },
     });
     const result = await updateChannelActivityStatuses('auto');
-    expect(result.archived).toBe(0);
+    expect(result.inactivated).toBe(0);
     const fresh = await prisma.channel.findUnique({ where: { id: ch.id } });
     expect(fresh.status).toBe('active');
   });
@@ -418,12 +417,12 @@ describe('updateChannelActivityStatuses', () => {
       },
     });
     const r1 = await updateChannelActivityStatuses();
-    expect(r1.archived).toBe(1);
+    expect(r1.inactivated).toBe(1);
 
     // Reset and check sadhguru classification qualifies
     await prisma.channel.update({
       where: { id: ihiChan.id },
-      data: { status: 'active', autoArchivedForInactivity: false },
+      data: { status: 'active' },
     });
     await prisma.$executeRawUnsafe(
       `UPDATE "channels" SET created_at = $1 WHERE id = $2`,
@@ -440,15 +439,14 @@ describe('updateChannelActivityStatuses', () => {
       },
     });
     const r2 = await updateChannelActivityStatuses();
-    expect(r2.archived).toBe(0);
+    expect(r2.inactivated).toBe(0);
   });
 
-  it('reactivates auto-archived channels that now have a qualifying post', async () => {
+  it('reactivates inactive channels that now have a qualifying post', async () => {
     const ch = await prisma.channel.create({
       data: {
         youtubeChannelId: 'UC_reactivate',
-        status: 'archived',
-        autoArchivedForInactivity: true,
+        status: 'inactive',
         category: 'Dedicated Sadhguru',
       },
     });
@@ -463,20 +461,40 @@ describe('updateChannelActivityStatuses', () => {
     expect(r.reactivated).toBe(1);
     const fresh = await prisma.channel.findUnique({ where: { id: ch.id } });
     expect(fresh.status).toBe('active');
-    expect(fresh.autoArchivedForInactivity).toBe(false);
   });
 
-  it('does not reactivate a dormant channel still without recent posts', async () => {
+  it('does not reactivate an inactive channel still without recent posts', async () => {
     await prisma.channel.create({
       data: {
         youtubeChannelId: 'UC_still_dormant',
-        status: 'archived',
-        autoArchivedForInactivity: true,
+        status: 'inactive',
         category: 'Dedicated Sadhguru',
       },
     });
     const r = await updateChannelActivityStatuses();
     expect(r.reactivated).toBe(0);
+  });
+
+  it('never touches soft-deleted (archived) channels, even with a recent post', async () => {
+    const ch = await prisma.channel.create({
+      data: {
+        youtubeChannelId: 'UC_deleted',
+        status: 'archived',
+        deletedAt: new Date(),
+        category: 'Dedicated Sadhguru',
+      },
+    });
+    await prisma.video.create({
+      data: {
+        youtubeVideoId: 'ghostpost',
+        channelId: ch.id,
+        publishedAt: new Date(),
+      },
+    });
+    const r = await updateChannelActivityStatuses();
+    expect(r.reactivated).toBe(0);
+    const fresh = await prisma.channel.findUnique({ where: { id: ch.id } });
+    expect(fresh.status).toBe('archived');
   });
 
   it('respects custom inactivityThresholdDays from SyncConfig', async () => {
