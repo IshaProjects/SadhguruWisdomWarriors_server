@@ -291,6 +291,7 @@ export async function updateChannelActivityStatuses(type = 'auto') {
 const VIDEO_FETCH_BATCH = 50;        // YouTube videos.list cap
 const VIDEO_FETCH_PARALLELISM = 5;   // concurrent batches
 const VIDEO_WRITE_FLUSH = 500;       // rows per bulk DB write
+const VIDEO_SYNC_MIN_COVERAGE = 0.95; // below this share of live videos → loud error
 
 export async function syncVideoStats(channelIds = null, type = 'manual') {
   if (isVideoSyncing) {
@@ -534,6 +535,21 @@ export async function syncVideoStats(channelIds = null, type = 'manual') {
 
     // Write any rows accumulated since the last flush.
     await flush();
+
+    // Coverage guard: this sync feeds the snapshot history that period views
+    // are computed from. A pass that silently skips a chunk of the library
+    // makes every period report undercount (this ran unnoticed Feb–May 2026),
+    // so anything under the threshold is flagged as a loud, explicit error.
+    const totalLiveVideos = videos.length;
+    const coverage = totalLiveVideos > 0 ? videosProcessed / totalLiveVideos : 1;
+    if (coverage < VIDEO_SYNC_MIN_COVERAGE) {
+      const pct = Math.round(coverage * 100);
+      const message =
+        `LOW COVERAGE: snapshotted ${videosProcessed} of ${totalLiveVideos} live videos ` +
+        `(${pct}%) — period views will undercount until resolved`;
+      logger.error(`[Video Sync] ${message}`);
+      errors.push({ channelId: null, message });
+    }
 
     syncLog = await prisma.syncLog.update({
       where: { id: syncLog.id },

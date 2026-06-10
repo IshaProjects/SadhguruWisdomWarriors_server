@@ -533,6 +533,37 @@ describe('syncVideoStats', () => {
     expect(fetchVideosBatch).not.toHaveBeenCalled();
   });
 
+  it('flags low snapshot coverage loudly in the sync log', async () => {
+    // 3 live videos in scope but YouTube only returns stats for 1 → 33%
+    // coverage. The Feb–May 2026 regression (period views undercounting)
+    // looked exactly like this and ran silently; it must surface as a
+    // partial log with an explicit LOW COVERAGE error entry.
+    const ch = await prisma.channel.create({
+      data: { youtubeChannelId: 'UC_cov', category: 'Dedicated Sadhguru' },
+    });
+    await prisma.video.create({ data: { youtubeVideoId: 'cv1', channelId: ch.id } });
+    await prisma.video.create({ data: { youtubeVideoId: 'cv2', channelId: ch.id } });
+    await prisma.video.create({ data: { youtubeVideoId: 'cv3', channelId: ch.id } });
+
+    fetchVideosBatch.mockResolvedValueOnce([makeYtVideo({ id: 'cv1' })]);
+
+    const log = await syncVideoStats();
+    expect(log.status).toBe('partial');
+    expect(JSON.stringify(log.errors)).toContain('LOW COVERAGE');
+  });
+
+  it('does not flag coverage when nearly all videos are processed', async () => {
+    const ch = await prisma.channel.create({
+      data: { youtubeChannelId: 'UC_cov_ok', category: 'Dedicated Sadhguru' },
+    });
+    await prisma.video.create({ data: { youtubeVideoId: 'ok1', channelId: ch.id } });
+    fetchVideosBatch.mockResolvedValueOnce([makeYtVideo({ id: 'ok1' })]);
+
+    const log = await syncVideoStats();
+    expect(log.status).toBe('success');
+    expect(JSON.stringify(log.errors)).not.toContain('LOW COVERAGE');
+  });
+
   it('refreshes stats + writes snapshots for every live video across all channel groups', async () => {
     const ded = await prisma.channel.create({
       data: { youtubeChannelId: 'UC_d', category: 'Dedicated Sadhguru' },
@@ -682,26 +713,29 @@ describe('syncVideoStats', () => {
     expect(fetchVideosBatch).not.toHaveBeenCalled();
   });
 
-  it('breaks early when quota is low (before any fetch)', async () => {
+  it('breaks early when quota is low (before any fetch) and flags the missed coverage', async () => {
     const ch = await prisma.channel.create({
       data: { youtubeChannelId: 'UC_d', category: 'Dedicated Sadhguru' },
     });
     await prisma.video.create({ data: { youtubeVideoId: 'v1', channelId: ch.id } });
     getQuotaUsage.mockReturnValue(LOW_QUOTA);
     const log = await syncVideoStats();
-    expect(log.status).toBe('success');
+    // The quota stop itself is graceful, but leaving live videos without a
+    // snapshot must never be silent — that was the Feb–May 2026 undercount.
+    expect(log.status).toBe('partial');
+    expect(JSON.stringify(log.errors)).toContain('LOW COVERAGE');
     expect(fetchVideosBatch).not.toHaveBeenCalled();
   });
 
-  it('stops processing on QUOTA_EXCEEDED from a batch fetch', async () => {
+  it('stops processing on QUOTA_EXCEEDED from a batch fetch and flags the missed coverage', async () => {
     const ch = await prisma.channel.create({
       data: { youtubeChannelId: 'UC_d', category: 'Dedicated Sadhguru' },
     });
     await prisma.video.create({ data: { youtubeVideoId: 'v1', channelId: ch.id } });
     fetchVideosBatch.mockRejectedValueOnce(new Error('QUOTA_EXCEEDED'));
     const log = await syncVideoStats();
-    expect(log.status).toBe('success'); // no errors recorded because quota stop is graceful
-    expect(log.errors).toEqual([]);
+    expect(log.status).toBe('partial');
+    expect(JSON.stringify(log.errors)).toContain('LOW COVERAGE');
   });
 
   it('captures non-quota batch errors as partial (attributes channel id of first video in slice)', async () => {
