@@ -335,7 +335,7 @@ describe('syncChannelStats', () => {
 // ────────────────────────────────────────────────────────────────────────────
 
 describe('updateChannelActivityStatuses', () => {
-  it('archives an active channel with no qualifying recent post', async () => {
+  it('marks an active channel with no qualifying recent post inactive (NOT archived)', async () => {
     const oldDate = new Date(Date.now() - 100 * 24 * 60 * 60 * 1000);
     const ch = await prisma.channel.create({
       data: {
@@ -352,11 +352,10 @@ describe('updateChannelActivityStatuses', () => {
       ch.id,
     );
     const result = await updateChannelActivityStatuses();
-    expect(result.archived).toBe(1);
+    expect(result.inactivated).toBe(1);
     expect(result.thresholdDays).toBe(14);
     const fresh = await prisma.channel.findUnique({ where: { id: ch.id } });
-    expect(fresh.status).toBe('archived');
-    expect(fresh.autoArchivedForInactivity).toBe(true);
+    expect(fresh.status).toBe('inactive');
   });
 
   it('skips a freshly-created channel even if it has no recent post', async () => {
@@ -364,7 +363,7 @@ describe('updateChannelActivityStatuses', () => {
       data: { youtubeChannelId: 'UC_new', status: 'active', category: 'Dedicated Sadhguru' },
     });
     const result = await updateChannelActivityStatuses();
-    expect(result.archived).toBe(0);
+    expect(result.inactivated).toBe(0);
   });
 
   it('keeps an active channel that has a recent post (any class for dedicated)', async () => {
@@ -389,7 +388,7 @@ describe('updateChannelActivityStatuses', () => {
       },
     });
     const result = await updateChannelActivityStatuses('auto');
-    expect(result.archived).toBe(0);
+    expect(result.inactivated).toBe(0);
     const fresh = await prisma.channel.findUnique({ where: { id: ch.id } });
     expect(fresh.status).toBe('active');
   });
@@ -418,12 +417,12 @@ describe('updateChannelActivityStatuses', () => {
       },
     });
     const r1 = await updateChannelActivityStatuses();
-    expect(r1.archived).toBe(1);
+    expect(r1.inactivated).toBe(1);
 
     // Reset and check sadhguru classification qualifies
     await prisma.channel.update({
       where: { id: ihiChan.id },
-      data: { status: 'active', autoArchivedForInactivity: false },
+      data: { status: 'active' },
     });
     await prisma.$executeRawUnsafe(
       `UPDATE "channels" SET created_at = $1 WHERE id = $2`,
@@ -440,15 +439,14 @@ describe('updateChannelActivityStatuses', () => {
       },
     });
     const r2 = await updateChannelActivityStatuses();
-    expect(r2.archived).toBe(0);
+    expect(r2.inactivated).toBe(0);
   });
 
-  it('reactivates auto-archived channels that now have a qualifying post', async () => {
+  it('reactivates inactive channels that now have a qualifying post', async () => {
     const ch = await prisma.channel.create({
       data: {
         youtubeChannelId: 'UC_reactivate',
-        status: 'archived',
-        autoArchivedForInactivity: true,
+        status: 'inactive',
         category: 'Dedicated Sadhguru',
       },
     });
@@ -463,20 +461,40 @@ describe('updateChannelActivityStatuses', () => {
     expect(r.reactivated).toBe(1);
     const fresh = await prisma.channel.findUnique({ where: { id: ch.id } });
     expect(fresh.status).toBe('active');
-    expect(fresh.autoArchivedForInactivity).toBe(false);
   });
 
-  it('does not reactivate a dormant channel still without recent posts', async () => {
+  it('does not reactivate an inactive channel still without recent posts', async () => {
     await prisma.channel.create({
       data: {
         youtubeChannelId: 'UC_still_dormant',
-        status: 'archived',
-        autoArchivedForInactivity: true,
+        status: 'inactive',
         category: 'Dedicated Sadhguru',
       },
     });
     const r = await updateChannelActivityStatuses();
     expect(r.reactivated).toBe(0);
+  });
+
+  it('never touches soft-deleted (archived) channels, even with a recent post', async () => {
+    const ch = await prisma.channel.create({
+      data: {
+        youtubeChannelId: 'UC_deleted',
+        status: 'archived',
+        deletedAt: new Date(),
+        category: 'Dedicated Sadhguru',
+      },
+    });
+    await prisma.video.create({
+      data: {
+        youtubeVideoId: 'ghostpost',
+        channelId: ch.id,
+        publishedAt: new Date(),
+      },
+    });
+    const r = await updateChannelActivityStatuses();
+    expect(r.reactivated).toBe(0);
+    const fresh = await prisma.channel.findUnique({ where: { id: ch.id } });
+    expect(fresh.status).toBe('archived');
   });
 
   it('respects custom inactivityThresholdDays from SyncConfig', async () => {
@@ -513,6 +531,37 @@ describe('syncVideoStats', () => {
     expect(log.status).toBe('success');
     expect(log.videosProcessed).toBe(0);
     expect(fetchVideosBatch).not.toHaveBeenCalled();
+  });
+
+  it('flags low snapshot coverage loudly in the sync log', async () => {
+    // 3 live videos in scope but YouTube only returns stats for 1 → 33%
+    // coverage. The Feb–May 2026 regression (period views undercounting)
+    // looked exactly like this and ran silently; it must surface as a
+    // partial log with an explicit LOW COVERAGE error entry.
+    const ch = await prisma.channel.create({
+      data: { youtubeChannelId: 'UC_cov', category: 'Dedicated Sadhguru' },
+    });
+    await prisma.video.create({ data: { youtubeVideoId: 'cv1', channelId: ch.id } });
+    await prisma.video.create({ data: { youtubeVideoId: 'cv2', channelId: ch.id } });
+    await prisma.video.create({ data: { youtubeVideoId: 'cv3', channelId: ch.id } });
+
+    fetchVideosBatch.mockResolvedValueOnce([makeYtVideo({ id: 'cv1' })]);
+
+    const log = await syncVideoStats();
+    expect(log.status).toBe('partial');
+    expect(JSON.stringify(log.errors)).toContain('LOW COVERAGE');
+  });
+
+  it('does not flag coverage when nearly all videos are processed', async () => {
+    const ch = await prisma.channel.create({
+      data: { youtubeChannelId: 'UC_cov_ok', category: 'Dedicated Sadhguru' },
+    });
+    await prisma.video.create({ data: { youtubeVideoId: 'ok1', channelId: ch.id } });
+    fetchVideosBatch.mockResolvedValueOnce([makeYtVideo({ id: 'ok1' })]);
+
+    const log = await syncVideoStats();
+    expect(log.status).toBe('success');
+    expect(JSON.stringify(log.errors)).not.toContain('LOW COVERAGE');
   });
 
   it('refreshes stats + writes snapshots for every live video across all channel groups', async () => {
@@ -664,26 +713,29 @@ describe('syncVideoStats', () => {
     expect(fetchVideosBatch).not.toHaveBeenCalled();
   });
 
-  it('breaks early when quota is low (before any fetch)', async () => {
+  it('breaks early when quota is low (before any fetch) and flags the missed coverage', async () => {
     const ch = await prisma.channel.create({
       data: { youtubeChannelId: 'UC_d', category: 'Dedicated Sadhguru' },
     });
     await prisma.video.create({ data: { youtubeVideoId: 'v1', channelId: ch.id } });
     getQuotaUsage.mockReturnValue(LOW_QUOTA);
     const log = await syncVideoStats();
-    expect(log.status).toBe('success');
+    // The quota stop itself is graceful, but leaving live videos without a
+    // snapshot must never be silent — that was the Feb–May 2026 undercount.
+    expect(log.status).toBe('partial');
+    expect(JSON.stringify(log.errors)).toContain('LOW COVERAGE');
     expect(fetchVideosBatch).not.toHaveBeenCalled();
   });
 
-  it('stops processing on QUOTA_EXCEEDED from a batch fetch', async () => {
+  it('stops processing on QUOTA_EXCEEDED from a batch fetch and flags the missed coverage', async () => {
     const ch = await prisma.channel.create({
       data: { youtubeChannelId: 'UC_d', category: 'Dedicated Sadhguru' },
     });
     await prisma.video.create({ data: { youtubeVideoId: 'v1', channelId: ch.id } });
     fetchVideosBatch.mockRejectedValueOnce(new Error('QUOTA_EXCEEDED'));
     const log = await syncVideoStats();
-    expect(log.status).toBe('success'); // no errors recorded because quota stop is graceful
-    expect(log.errors).toEqual([]);
+    expect(log.status).toBe('partial');
+    expect(JSON.stringify(log.errors)).toContain('LOW COVERAGE');
   });
 
   it('captures non-quota batch errors as partial (attributes channel id of first video in slice)', async () => {
@@ -844,14 +896,13 @@ describe('syncIhiIngestLast24h', () => {
     expect(v1.classification).toBe('sadhguru');
   });
 
-  it('includes auto-archived inactive channels (for reactivation flow)', async () => {
+  it('includes inactive channels (for reactivation flow)', async () => {
     const ch = await prisma.channel.create({
       data: {
         youtubeChannelId: 'UC_ihi_arch',
         uploadsPlaylistId: 'UU_ihi_arch',
         category: 'IHI Partner',
-        status: 'archived',
-        autoArchivedForInactivity: true,
+        status: 'inactive',
       },
     });
     fetchPlaylistItemsPublishedSince.mockResolvedValue({ items: [makePlaylistItem('vx')], pagesFetched: 1 });
@@ -1147,14 +1198,13 @@ describe('syncDedicatedIngestLast24h', () => {
     expect(v.classification).toBe('sadhguru');
   });
 
-  it('includes auto-archived inactive dedicated channels (reactivation flow)', async () => {
+  it('includes inactive dedicated channels (reactivation flow)', async () => {
     const ch = await prisma.channel.create({
       data: {
         youtubeChannelId: 'UC_d_arch',
         uploadsPlaylistId: 'UU_d_arch',
         category: 'Dedicated Sadhguru',
-        status: 'archived',
-        autoArchivedForInactivity: true,
+        status: 'inactive',
       },
     });
     fetchPlaylistItemsPublishedSince.mockResolvedValue({ items: [makePlaylistItem('v1')], pagesFetched: 1 });

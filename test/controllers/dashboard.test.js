@@ -868,6 +868,23 @@ describe('GET /api/dashboard/channel-metrics', () => {
     expect(res.body).toEqual([]);
   });
 
+  it('200 — period mode includes channels synced AFTER the window end', async () => {
+    // Regression: buildChannelFilter turns startDate/endDate into a
+    // lastSyncedAt window; period mode must drop that (like every other
+    // period endpoint) or actively-synced channels vanish from the widget.
+    const { headers } = await authFor('viewer');
+    await mkChannel({
+      title: 'Fresh Sync',
+      lastSyncedAt: D('20'),
+      currentStats: { subscribers: 10, views: 100, videoCount: 1 },
+    });
+    const res = await request(app)
+      .get('/api/dashboard/channel-metrics?startDate=2024-01-01&endDate=2024-01-05')
+      .set(headers);
+    expect(res.status).toBe(200);
+    expect(res.body.map((r) => r.title)).toContain('Fresh Sync');
+  });
+
   it('200 — computes all four metrics with deterministic numbers', async () => {
     const { headers } = await authFor('viewer');
     const ch = await mkChannel({

@@ -33,6 +33,9 @@ enum Role {
 enum ChannelStatus {
   active
   paused
+  // Not posting recently but still tracked and counted everywhere.
+  inactive
+  // Reserved for soft-deleted channels (set together with deletedAt).
   archived
 }
 

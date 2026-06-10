@@ -769,6 +769,12 @@ export async function getMicroUnitsReport(req, res, next) {
 export async function getChannelMetrics(req, res, next) {
   try {
     const channelFilter = buildChannelFilter(req.query);
+    // Period mode: startDate/endDate scope the metrics window, not the
+    // channel set — drop the lastSyncedAt filter buildChannelFilter derives
+    // from them (same as getCategoryBreakdown / getMicroUnitsReport).
+    if (req.query.startDate && req.query.endDate) {
+      delete channelFilter.lastSyncedAt;
+    }
     const channels = await prisma.channel.findMany({
       where: channelFilter,
       select: {
