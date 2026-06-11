@@ -5,6 +5,7 @@ import {
   syncDedicatedIngestLast24h,
   syncIhiIngestLast24h,
   syncIhiSadhguruVideoStats,
+  pullAllChannelsVideos,
 } from '../services/syncEngine.js';
 import { prisma } from '../config/prisma.js';
 import { logger } from '../utils/logger.js';
@@ -63,6 +64,25 @@ export function scheduleChannelSync(cronExpr, enabled) {
       );
     } catch (err) {
       logger.error(`[Scheduler] Channel sync failed: ${err.message}`);
+      return;
+    }
+
+    // Catalog self-heal — the repair half of the gap detection above. The
+    // sync just compared YouTube's per-channel video counts against ours and
+    // flipped allVideosPulled=false on any mismatch; pull those catalogs now
+    // instead of waiting for a human to notice (the Feb–Jun 2026 gap ran
+    // silently for 4 months). No-op (one DB query, zero YouTube quota) on
+    // healthy nights; isolated so a failure can't affect the sync above.
+    try {
+      const heal = await pullAllChannelsVideos();
+      if (heal.channelsProcessed > 0) {
+        logger.info(
+          `[Scheduler] Catalog self-heal: ${heal.channelsProcessed} channel(s), ` +
+            `${heal.totalVideosPulled} video(s) recovered`
+        );
+      }
+    } catch (err) {
+      logger.error(`[Scheduler] Catalog self-heal failed: ${err.message}`);
     }
   });
   logger.info(`[Scheduler] Channel sync scheduled: ${cronExpr}`);
