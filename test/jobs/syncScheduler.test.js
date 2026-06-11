@@ -23,6 +23,7 @@ vi.mock('../../src/services/syncEngine.js', () => ({
   syncDedicatedIngestLast24h: vi.fn(async () => ({ videosProcessed: 3, status: 'done' })),
   syncIhiIngestLast24h: vi.fn(async () => ({ videosProcessed: 7, status: 'done' })),
   syncIhiSadhguruVideoStats: vi.fn(async () => ({ videosProcessed: 2, status: 'done' })),
+  pullAllChannelsVideos: vi.fn(async () => ({ channelsProcessed: 0, totalVideosPulled: 0 })),
 }));
 
 // ─── Mock logger ───────────────────────────────────────────────────────────
@@ -42,6 +43,7 @@ import {
   syncDedicatedIngestLast24h,
   syncIhiIngestLast24h,
   syncIhiSadhguruVideoStats,
+  pullAllChannelsVideos,
 } from '../../src/services/syncEngine.js';
 import { logger } from '../../src/utils/logger.js';
 import {
@@ -106,6 +108,49 @@ describe('scheduleChannelSync', () => {
     const cb = cron.schedule.mock.calls[0][1];
     await cb();
     expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('Channel sync failed'));
+  });
+
+  // Self-heal: after the nightly sync refreshes allVideosPulled flags, any
+  // channel flagged incomplete gets its catalog pulled automatically. This is
+  // the repair half of the gap-detection that ran silently for 4 months
+  // (Feb–Jun 2026) while The Mystic World sat at 37 of 631 videos.
+  it('runs the catalog self-heal after a successful channel sync', async () => {
+    pullAllChannelsVideos.mockResolvedValueOnce({ channelsProcessed: 2, totalVideosPulled: 640 });
+    scheduleChannelSync('0 3 * * *', true);
+    const cb = cron.schedule.mock.calls[0][1];
+    await cb();
+    expect(pullAllChannelsVideos).toHaveBeenCalled();
+    // Order: sync first (it refreshes the flags), then the heal.
+    expect(pullAllChannelsVideos.mock.invocationCallOrder[0])
+      .toBeGreaterThan(syncChannelStats.mock.invocationCallOrder[0]);
+    expect(logger.info).toHaveBeenCalledWith(
+      expect.stringContaining('Catalog self-heal: 2 channel(s), 640 video(s) recovered')
+    );
+  });
+
+  it('stays quiet when the self-heal finds nothing to pull', async () => {
+    scheduleChannelSync('0 3 * * *', true);
+    const cb = cron.schedule.mock.calls[0][1];
+    await cb();
+    expect(pullAllChannelsVideos).toHaveBeenCalled();
+    expect(logger.info).not.toHaveBeenCalledWith(expect.stringContaining('Catalog self-heal'));
+  });
+
+  it('logs but survives a self-heal failure (channel sync result unaffected)', async () => {
+    pullAllChannelsVideos.mockRejectedValueOnce(new Error('QUOTA_EXCEEDED'));
+    scheduleChannelSync('0 3 * * *', true);
+    const cb = cron.schedule.mock.calls[0][1];
+    await cb();
+    expect(logger.info).toHaveBeenCalledWith(expect.stringContaining('Channel sync done'));
+    expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('Catalog self-heal failed'));
+  });
+
+  it('skips the self-heal when the channel sync itself failed', async () => {
+    syncChannelStats.mockRejectedValueOnce(new Error('network fail'));
+    scheduleChannelSync('0 3 * * *', true);
+    const cb = cron.schedule.mock.calls[0][1];
+    await cb();
+    expect(pullAllChannelsVideos).not.toHaveBeenCalled();
   });
 });
 
