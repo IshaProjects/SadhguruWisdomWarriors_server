@@ -26,6 +26,13 @@ const DETAIL_CHANNEL_SELECT = {
   category: true,
 };
 
+const POC_SELECT = {
+  id: true,
+  name: true,
+  email: true,
+  role: true,
+};
+
 function buildChannelProjection(channel) {
   if (!channel) return null;
   const {
@@ -59,6 +66,7 @@ export async function listMicroUnits(req, res, next) {
     const microUnits = await prisma.microUnit.findMany({
       orderBy: { name: 'asc' },
       include: {
+        poc: { select: POC_SELECT },
         microUnitChannels: { include: { channel: { select: LIST_CHANNEL_SELECT } } },
       },
     });
@@ -71,7 +79,7 @@ export async function listMicroUnits(req, res, next) {
 
 export async function createMicroUnit(req, res, next) {
   try {
-    const { name, channelIds = [], notes = '' } = req.body;
+    const { name, channelIds = [], notes = '', pocId = null } = req.body;
 
     if (!name || typeof name !== 'string' || !name.trim()) {
       return res.status(400).json({ message: 'Name is required' });
@@ -80,15 +88,21 @@ export async function createMicroUnit(req, res, next) {
     const ids = Array.isArray(channelIds) ? channelIds : [];
     const validIds = ids.filter((id) => id && typeof id === 'string');
 
+    if (validIds.length > 5) {
+      return res.status(400).json({ message: 'A micro unit can have at most 5 channels' });
+    }
+
     const created = await prisma.microUnit.create({
       data: {
         name: name.trim(),
         notes: (notes || '').trim(),
+        pocId: pocId || null,
         microUnitChannels: {
           create: validIds.map((channelId) => ({ channelId })),
         },
       },
       include: {
+        poc: { select: POC_SELECT },
         microUnitChannels: { include: { channel: { select: LIST_CHANNEL_SELECT } } },
       },
     });
@@ -104,6 +118,7 @@ export async function getMicroUnit(req, res, next) {
     const microUnit = await prisma.microUnit.findUnique({
       where: { id: req.params.id },
       include: {
+        poc: { select: POC_SELECT },
         microUnitChannels: { include: { channel: { select: DETAIL_CHANNEL_SELECT } } },
       },
     });
@@ -120,18 +135,22 @@ export async function getMicroUnit(req, res, next) {
 
 export async function updateMicroUnit(req, res, next) {
   try {
-    const { name, channelIds, notes } = req.body;
+    const { name, channelIds, notes, pocId } = req.body;
 
     const update = {};
     if (name !== undefined) update.name = String(name).trim();
     if (notes !== undefined) update.notes = String(notes).trim();
+    if (pocId !== undefined) update.pocId = pocId || null;
 
     const replaceChannels = Array.isArray(channelIds);
     const nextChannelIds = replaceChannels
       ? channelIds.filter((id) => id && typeof id === 'string')
       : null;
 
-    // Confirm the row exists first so we can return 404 instead of P2025-on-update.
+    if (nextChannelIds && nextChannelIds.length > 5) {
+      return res.status(400).json({ message: 'A micro unit can have at most 5 channels' });
+    }
+
     const existing = await prisma.microUnit.findUnique({
       where: { id: req.params.id },
       select: { id: true },
@@ -140,9 +159,6 @@ export async function updateMicroUnit(req, res, next) {
       return res.status(404).json({ message: 'Micro unit not found' });
     }
 
-    // Updates that replace the channel list need to delete the old junction
-    // rows and create the new ones atomically — a transaction is the cleanest
-    // way to do that without racing with concurrent reads.
     const updated = await prisma.$transaction(async (tx) => {
       if (Object.keys(update).length) {
         await tx.microUnit.update({
@@ -167,6 +183,7 @@ export async function updateMicroUnit(req, res, next) {
       return tx.microUnit.findUnique({
         where: { id: req.params.id },
         include: {
+          poc: { select: POC_SELECT },
           microUnitChannels: { include: { channel: { select: LIST_CHANNEL_SELECT } } },
         },
       });

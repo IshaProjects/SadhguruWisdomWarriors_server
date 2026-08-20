@@ -94,7 +94,8 @@ model User {
   createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt    DateTime @updatedAt      @map("updated_at") @db.Timestamptz(6)
 
-  assignedChannels Channel[] @relation("ChannelAssignedTo")
+  assignedChannels Channel[]   @relation("ChannelAssignedTo")
+  pocMicroUnits    MicroUnit[] @relation("MicroUnitPoc")
 
   @@map("users")
 }
@@ -252,6 +253,8 @@ model MicroUnit {
   id        String   @id @default(cuid())
   name      String
   notes     String   @default("")
+  pocId     String?  @map("poc_id")
+  poc       User?    @relation("MicroUnitPoc", fields: [pocId], references: [id], onDelete: SetNull)
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt DateTime @updatedAt      @map("updated_at") @db.Timestamptz(6)
 
