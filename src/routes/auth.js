@@ -5,7 +5,6 @@ import {
   refresh,
   getMe,
   getTeamMembers,
-  getPocUsers,
   inviteUser,
   updateTeamMember,
   deleteTeamMember,
@@ -19,7 +18,6 @@ router.post('/login', login);
 router.post('/refresh', refresh);
 router.get('/me', authenticate, getMe);
 router.get('/team', authenticate, authorize('admin', 'manager'), getTeamMembers);
-router.get('/pocs', authenticate, getPocUsers);
 router.post('/invite', authenticate, authorize('admin'), inviteUser);
 router.put('/team/:id', authenticate, authorize('admin'), updateTeamMember);
 router.delete('/team/:id', authenticate, authorize('admin'), deleteTeamMember);
