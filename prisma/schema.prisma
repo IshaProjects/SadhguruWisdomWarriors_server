@@ -28,6 +28,13 @@ enum Role {
   admin
   manager
   viewer
+  poc
+}
+
+enum UserStatus {
+  pending
+  approved
+  rejected
 }
 
 enum ChannelStatus {
@@ -89,13 +96,14 @@ model User {
   email        String   @unique
   password     String
   name         String
-  role         Role     @default(viewer)
-  refreshToken String?  @map("refresh_token")
-  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt    DateTime @updatedAt      @map("updated_at") @db.Timestamptz(6)
+  role         Role       @default(viewer)
+  status       UserStatus @default(pending)
+  refreshToken String?    @map("refresh_token")
+  createdAt    DateTime   @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt    DateTime   @updatedAt      @map("updated_at") @db.Timestamptz(6)
 
   assignedChannels Channel[]   @relation("ChannelAssignedTo")
-  pocMicroUnits    MicroUnit[] @relation("MicroUnitPoc")
+  microUnitsPoc    MicroUnit[] @relation("MicroUnitPoc")
 
   @@map("users")
 }

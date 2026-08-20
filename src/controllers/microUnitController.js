@@ -31,6 +31,7 @@ const POC_SELECT = {
   name: true,
   email: true,
   role: true,
+  status: true,
 };
 
 function buildChannelProjection(channel) {
@@ -58,12 +59,23 @@ function shapeMicroUnit(mu) {
     buildChannelProjection(mc.channel),
   );
   const { microUnitChannels, ...rest } = mu;
-  return { ...rest, _id: mu.id, channelIds };
+  return {
+    ...rest,
+    _id: mu.id,
+    channelIds,
+    poc: mu.poc ? { ...mu.poc, _id: mu.poc.id } : null,
+  };
 }
 
 export async function listMicroUnits(req, res, next) {
   try {
+    const where = {};
+    if (req.user && req.user.role === 'poc') {
+      where.pocId = req.user.id;
+    }
+
     const microUnits = await prisma.microUnit.findMany({
+      where,
       orderBy: { name: 'asc' },
       include: {
         poc: { select: POC_SELECT },
@@ -87,10 +99,6 @@ export async function createMicroUnit(req, res, next) {
 
     const ids = Array.isArray(channelIds) ? channelIds : [];
     const validIds = ids.filter((id) => id && typeof id === 'string');
-
-    if (validIds.length > 5) {
-      return res.status(400).json({ message: 'A micro unit can have at most 5 channels' });
-    }
 
     const created = await prisma.microUnit.create({
       data: {
@@ -127,6 +135,11 @@ export async function getMicroUnit(req, res, next) {
       return res.status(404).json({ message: 'Micro unit not found' });
     }
 
+    // Check if POC user is requesting another unit
+    if (req.user && req.user.role === 'poc' && microUnit.pocId !== req.user.id) {
+      return res.status(403).json({ message: 'Access denied to this Micro Unit' });
+    }
+
     res.json(shapeMicroUnit(microUnit));
   } catch (err) {
     next(err);
@@ -146,10 +159,6 @@ export async function updateMicroUnit(req, res, next) {
     const nextChannelIds = replaceChannels
       ? channelIds.filter((id) => id && typeof id === 'string')
       : null;
-
-    if (nextChannelIds && nextChannelIds.length > 5) {
-      return res.status(400).json({ message: 'A micro unit can have at most 5 channels' });
-    }
 
     const existing = await prisma.microUnit.findUnique({
       where: { id: req.params.id },
@@ -191,6 +200,41 @@ export async function updateMicroUnit(req, res, next) {
 
     res.json(shapeMicroUnit(updated));
   } catch (err) {
+    next(err);
+  }
+}
+
+export async function assignPoc(req, res, next) {
+  try {
+    const { pocId } = req.body; // pass null to unassign
+
+    if (pocId) {
+      const targetUser = await prisma.user.findUnique({
+        where: { id: pocId },
+        select: { id: true, role: true, status: true },
+      });
+      if (!targetUser) {
+        return res.status(404).json({ message: 'User not found' });
+      }
+      if (targetUser.status !== 'approved') {
+        return res.status(400).json({ message: 'Only approved users can be assigned as POC' });
+      }
+    }
+
+    const updated = await prisma.microUnit.update({
+      where: { id: req.params.id },
+      data: { pocId: pocId || null },
+      include: {
+        poc: { select: POC_SELECT },
+        microUnitChannels: { include: { channel: { select: LIST_CHANNEL_SELECT } } },
+      },
+    });
+
+    res.json(shapeMicroUnit(updated));
+  } catch (err) {
+    if (err.code === 'P2025') {
+      return res.status(404).json({ message: 'Micro unit not found' });
+    }
     next(err);
   }
 }

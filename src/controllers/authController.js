@@ -17,6 +17,7 @@ const PUBLIC_USER_SELECT = {
   email: true,
   name: true,
   role: true,
+  status: true,
   createdAt: true,
   updatedAt: true,
 };
@@ -26,10 +27,12 @@ const TEAM_LIST_SELECT = {
   name: true,
   email: true,
   role: true,
+  status: true,
   createdAt: true,
 };
 
-const VALID_ROLES = ['admin', 'manager', 'viewer'];
+const VALID_ROLES = ['admin', 'manager', 'viewer', 'poc'];
+const VALID_STATUSES = ['pending', 'approved', 'rejected'];
 
 /** Bcrypt-hash a plaintext password using the same cost factor the legacy
  *  Mongoose pre('save') hook used (12). */
@@ -71,22 +74,29 @@ export async function register(req, res, next) {
       return res.status(409).json({ message: 'Email already registered' });
     }
 
-    // First user becomes admin
+    // First user becomes admin and approved; others default to viewer and pending
     const userCount = await prisma.user.count();
     const role = userCount === 0 ? 'admin' : 'viewer';
+    const status = userCount === 0 ? 'approved' : 'pending';
 
     // Hash explicitly — no pre('save') hook now that we're on Prisma.
     const hashed = await hashPassword(password);
 
     const created = await prisma.user.create({
-      data: { email, password: hashed, name, role },
+      data: { email, password: hashed, name, role, status },
       select: PUBLIC_USER_SELECT,
     });
 
+    if (status === 'pending') {
+      return res.status(201).json({
+        message: 'Account created successfully. Your registration is pending Admin approval.',
+        user: { id: created.id, email: created.email, name: created.name, role: created.role, status: created.status },
+        pendingApproval: true,
+      });
+    }
+
     const tokens = generateTokens(created.id);
 
-    // Persist the refresh token. Use a follow-up update rather than a
-    // create-with-token so we never echo the value back from the create call.
     await prisma.user.update({
       where: { id: created.id },
       data: { refreshToken: tokens.refreshToken },
@@ -94,7 +104,7 @@ export async function register(req, res, next) {
     });
 
     res.status(201).json({
-      user: { id: created.id, email: created.email, name: created.name, role: created.role },
+      user: { id: created.id, email: created.email, name: created.name, role: created.role, status: created.status },
       ...tokens,
     });
   } catch (err) {
@@ -113,13 +123,20 @@ export async function login(req, res, next) {
       return res.status(400).json({ message: 'Email and password are required' });
     }
 
-    // Need the hashed password to verify — fetched only here, never returned.
+    // Need the hashed password & status to verify
     const credsRow = await prisma.user.findUnique({
       where: { email },
-      select: { id: true, password: true },
+      select: { id: true, password: true, status: true },
     });
     if (!credsRow || !(await comparePassword(password, credsRow.password))) {
       return res.status(401).json({ message: 'Invalid credentials' });
+    }
+
+    if (credsRow.status === 'pending') {
+      return res.status(403).json({ message: 'Your account is pending Admin approval.' });
+    }
+    if (credsRow.status === 'rejected') {
+      return res.status(403).json({ message: 'Your account registration was rejected by Admin.' });
     }
 
     const tokens = generateTokens(credsRow.id);
@@ -176,15 +193,13 @@ export async function refresh(req, res, next) {
 }
 
 export async function getMe(req, res) {
-  // `req.user` is populated by authenticate() which already projects away
-  // password/refreshToken — we trust it. (Belt-and-braces: only echo the
-  // fields we know to be public.)
   res.json({
     user: {
       id: req.user.id,
       email: req.user.email,
       name: req.user.name,
       role: req.user.role,
+      status: req.user.status,
     },
   });
 }
@@ -196,6 +211,28 @@ export async function getTeamMembers(req, res, next) {
       orderBy: { createdAt: 'asc' },
     });
     res.json(users);
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function getPocUsers(req, res, next) {
+  try {
+    const pocs = await prisma.user.findMany({
+      where: {
+        role: 'poc',
+        status: 'approved',
+      },
+      select: {
+        id: true,
+        name: true,
+        email: true,
+        role: true,
+        status: true,
+      },
+      orderBy: { name: 'asc' },
+    });
+    res.json(pocs);
   } catch (err) {
     next(err);
   }
@@ -224,15 +261,18 @@ export async function inviteUser(req, res, next) {
         name,
         password: hashed,
         role: role || 'viewer',
+        status: 'approved', // Admin invited users are auto-approved
       },
       select: PUBLIC_USER_SELECT,
     });
 
     res.status(201).json({
       _id: created.id,
+      id: created.id,
       email: created.email,
       name: created.name,
       role: created.role,
+      status: created.status,
     });
   } catch (err) {
     if (err.code === 'P2002') {
@@ -244,7 +284,7 @@ export async function inviteUser(req, res, next) {
 
 export async function updateTeamMember(req, res, next) {
   try {
-    const { name, email, role } = req.body;
+    const { name, email, role, status } = req.body;
     const update = {};
 
     if (name !== undefined) update.name = name;
@@ -264,6 +304,12 @@ export async function updateTeamMember(req, res, next) {
         return res.status(400).json({ message: 'Invalid role' });
       }
       update.role = role;
+    }
+    if (status !== undefined) {
+      if (!VALID_STATUSES.includes(status)) {
+        return res.status(400).json({ message: 'Invalid status' });
+      }
+      update.status = status;
     }
 
     // Prevent demoting yourself
