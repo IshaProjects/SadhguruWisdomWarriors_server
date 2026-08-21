@@ -17,7 +17,7 @@ const PUBLIC_USER_SELECT = {
   email: true,
   name: true,
   role: true,
-  approved: true,
+  status: true,
   createdAt: true,
   updatedAt: true,
 };
@@ -27,7 +27,7 @@ const TEAM_LIST_SELECT = {
   name: true,
   email: true,
   role: true,
-  approved: true,
+  status: true,
   createdAt: true,
 };
 
@@ -77,20 +77,18 @@ export async function register(req, res, next) {
     const userCount = await prisma.user.count();
     const isFirstUser = userCount === 0;
     const role = isFirstUser ? 'admin' : 'viewer';
-    const approved = isFirstUser ? true : false;
+    const status = isFirstUser ? 'approved' : 'pending';
 
     // Hash explicitly — no pre('save') hook now that we're on Prisma.
     const hashed = await hashPassword(password);
 
     const created = await prisma.user.create({
-      data: { email, password: hashed, name, role, approved },
+      data: { email, password: hashed, name, role, status },
       select: PUBLIC_USER_SELECT,
     });
 
     const tokens = generateTokens(created.id);
 
-    // Persist the refresh token. Use a follow-up update rather than a
-    // create-with-token so we never echo the value back from the create call.
     await prisma.user.update({
       where: { id: created.id },
       data: { refreshToken: tokens.refreshToken },
@@ -98,7 +96,7 @@ export async function register(req, res, next) {
     });
 
     res.status(201).json({
-      user: { id: created.id, email: created.email, name: created.name, role: created.role, approved: created.approved },
+      user: { id: created.id, email: created.email, name: created.name, role: created.role, status: created.status, approved: created.status === 'approved' },
       ...tokens,
     });
   } catch (err) {
@@ -117,16 +115,15 @@ export async function login(req, res, next) {
       return res.status(400).json({ message: 'Email and password are required' });
     }
 
-    // Need the hashed password & approved flag to verify — fetched only here, never returned.
     const credsRow = await prisma.user.findUnique({
       where: { email },
-      select: { id: true, password: true, approved: true },
+      select: { id: true, password: true, status: true },
     });
     if (!credsRow || !(await comparePassword(password, credsRow.password))) {
       return res.status(401).json({ message: 'Invalid credentials' });
     }
 
-    if (credsRow.approved === false) {
+    if (credsRow.status === 'pending') {
       return res.status(403).json({ message: 'Your account is pending admin approval' });
     }
 
@@ -199,25 +196,15 @@ export async function getMe(req, res) {
 
 export async function getTeamMembers(req, res, next) {
   try {
-    let users;
-    try {
-      users = await prisma.user.findMany({
-        select: { ...TEAM_LIST_SELECT, approved: true },
-        orderBy: { createdAt: 'asc' },
-      });
-    } catch {
-      // Fallback if 'approved' column is not in DB table
-      users = await prisma.user.findMany({
-        select: TEAM_LIST_SELECT,
-        orderBy: { createdAt: 'asc' },
-      });
-    }
-    const safeUsers = users.map((u) => ({
+    const users = await prisma.user.findMany({
+      select: TEAM_LIST_SELECT,
+      orderBy: { createdAt: 'asc' },
+    });
+    const mapped = users.map((u) => ({
       ...u,
-      _id: u.id,
-      approved: u.approved !== undefined && u.approved !== null ? u.approved : true,
+      approved: u.status !== 'pending',
     }));
-    res.json(safeUsers);
+    res.json(mapped);
   } catch (err) {
     next(err);
   }
@@ -241,36 +228,23 @@ export async function inviteUser(req, res, next) {
     const hashed = await hashPassword(password);
     const targetRole = role ? String(role).toLowerCase() : 'viewer';
 
-    let created;
-    try {
-      created = await prisma.user.create({
-        data: {
-          email,
-          name,
-          password: hashed,
-          role: targetRole,
-          approved: true,
-        },
-        select: PUBLIC_USER_SELECT,
-      });
-    } catch {
-      created = await prisma.user.create({
-        data: {
-          email,
-          name,
-          password: hashed,
-          role: targetRole,
-        },
-        select: PUBLIC_USER_SELECT,
-      });
-    }
+    const created = await prisma.user.create({
+      data: {
+        email,
+        name,
+        password: hashed,
+        role: targetRole,
+        status: 'approved',
+      },
+      select: PUBLIC_USER_SELECT,
+    });
 
     res.status(201).json({
       _id: created.id,
-      id: created.id,
       email: created.email,
       name: created.name,
       role: created.role,
+      status: created.status,
       approved: true,
     });
   } catch (err) {
@@ -283,11 +257,12 @@ export async function inviteUser(req, res, next) {
 
 export async function updateTeamMember(req, res, next) {
   try {
-    const { name, email, role, approved } = req.body;
+    const { name, email, role, approved, status } = req.body;
     const update = {};
 
     if (name !== undefined) update.name = name;
-    if (approved !== undefined) update.approved = Boolean(approved);
+    if (approved !== undefined) update.status = Boolean(approved) ? 'approved' : 'pending';
+    if (status !== undefined) update.status = status;
     if (email !== undefined) {
       // Check if email is already taken by another user
       const existing = await prisma.user.findFirst({
@@ -313,29 +288,14 @@ export async function updateTeamMember(req, res, next) {
     }
 
     try {
-      let user;
-      try {
-        user = await prisma.user.update({
-          where: { id: req.params.id },
-          data: update,
-          select: { ...TEAM_LIST_SELECT, approved: true },
-        });
-      } catch (err) {
-        if (update.approved !== undefined) {
-          delete update.approved;
-          user = await prisma.user.update({
-            where: { id: req.params.id },
-            data: update,
-            select: TEAM_LIST_SELECT,
-          });
-        } else {
-          throw err;
-        }
-      }
+      const user = await prisma.user.update({
+        where: { id: req.params.id },
+        data: update,
+        select: TEAM_LIST_SELECT,
+      });
       res.json({
         ...user,
-        _id: user.id,
-        approved: user.approved !== undefined && user.approved !== null ? user.approved : true,
+        approved: user.status !== 'pending',
       });
     } catch (err) {
       if (err.code === 'P2025') {
