@@ -13,6 +13,14 @@ const connectDB = async () => {
       throw new Error('DATABASE_URL is required');
     }
     await prisma.$connect();
+    // Ensure PostgreSQL Role enum contains 'poc' in Supabase DB
+    try {
+      await prisma.$executeRawUnsafe(`ALTER TYPE "Role" ADD VALUE IF NOT EXISTS 'poc';`);
+      logger.info(`Postgres Role enum updated with 'poc'`);
+    } catch (enumErr) {
+      logger.warn(`Role enum check note: ${enumErr.message}`);
+    }
+
     // Pull host out of the URL purely for the log line.
     let host = '(from URL)';
     try {
