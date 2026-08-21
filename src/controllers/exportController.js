@@ -21,7 +21,7 @@ function asNumber(value) {
   return Number(value) || 0;
 }
 
-async function buildChannelFilter(query) {
+function buildChannelFilter(query) {
   const {
     search,
     category,
@@ -34,28 +34,12 @@ async function buildChannelFilter(query) {
     country,
     startDate,
     endDate,
-    microUnitId,
-    micro_unit_id,
   } = query;
 
   // Default: exclude archived channels (matches dashboard + listChannels behavior).
   // Caller can opt back in by passing ?status=archived explicitly.
   // Also exclude soft-deleted rows.
   const where = { deletedAt: null, status: { not: 'archived' } };
-
-  const muId = microUnitId || micro_unit_id;
-  if (muId) {
-    const mu = await prisma.microUnit.findUnique({
-      where: { id: muId },
-      select: { channelIds: true },
-    });
-    const channelIds = mu?.channelIds || [];
-    if (channelIds.length > 0) {
-      where.id = { in: channelIds };
-    } else {
-      where.id = { in: ['__no_channel_matches__'] };
-    }
-  }
 
   if (search) {
     where.OR = [
@@ -94,7 +78,7 @@ async function buildChannelFilter(query) {
   return where;
 }
 
-async function buildVideoFilter(query) {
+function buildVideoFilter(query) {
   const {
     search,
     channelId,
@@ -107,8 +91,6 @@ async function buildVideoFilter(query) {
     startDate,
     endDate,
     hashtags,
-    microUnitId,
-    micro_unit_id,
   } = query;
 
   // Default: video reports exclude videos whose channel is archived.
@@ -116,20 +98,6 @@ async function buildVideoFilter(query) {
   // Channel-level filters resolve to a channelId list later.
   const channelWhere = { deletedAt: null, status: { not: 'archived' } };
   const videoWhere   = {};
-
-  const muId = microUnitId || micro_unit_id;
-  if (muId) {
-    const mu = await prisma.microUnit.findUnique({
-      where: { id: muId },
-      select: { channelIds: true },
-    });
-    const channelIds = mu?.channelIds || [];
-    if (channelIds.length > 0) {
-      channelWhere.id = { in: channelIds };
-    } else {
-      channelWhere.id = { in: ['__no_channel_matches__'] };
-    }
-  }
 
   if (category) channelWhere.category = category;
   if (status)   channelWhere.status   = status;
@@ -454,7 +422,7 @@ export async function reportChannels(req, res, next) {
       endDate,
     } = req.query;
 
-    const where = await buildChannelFilter(req.query);
+    const where = buildChannelFilter(req.query);
 
     if (req.query.classification) {
       const cls = req.query.classification === 'sadhguru' ? 'sadhguru' : 'non sadhguru';
@@ -465,6 +433,19 @@ export async function reportChannels(req, res, next) {
       });
       const ids = distinctRows.map((r) => r.channelId);
       where.id = { in: ids };
+    }
+
+    if (req.query.microUnitId) {
+      const unit = await prisma.microUnit.findUnique({
+        where: { id: req.query.microUnitId },
+        select: { channelIds: true },
+      });
+      const unitChannelIds = unit?.channelIds || [];
+      if (where.id && where.id.in) {
+        where.id = { in: where.id.in.filter((id) => unitChannelIds.includes(id)) };
+      } else {
+        where.id = { in: unitChannelIds };
+      }
     }
 
     const isPeriodMode = !!(startDate && endDate);
@@ -712,7 +693,7 @@ export async function reportVideos(req, res, next) {
       limit  = 50,
     } = req.query;
 
-    const { channelWhere, videoWhere } = await buildVideoFilter(req.query);
+    const { channelWhere, videoWhere } = buildVideoFilter(req.query);
 
     // Resolve channel IDs from channel-level filters
     if (Object.keys(channelWhere).length > 0) {
@@ -724,6 +705,23 @@ export async function reportVideos(req, res, next) {
       // If an explicit channelId was set, keep it; else restrict to resolved ids.
       if (!videoWhere.channelId) {
         videoWhere.channelId = { in: ids };
+      }
+    }
+
+    if (req.query.microUnitId) {
+      const unit = await prisma.microUnit.findUnique({
+        where: { id: req.query.microUnitId },
+        select: { channelIds: true },
+      });
+      const unitChannelIds = unit?.channelIds || [];
+      if (videoWhere.channelId && videoWhere.channelId.in) {
+        videoWhere.channelId = { in: videoWhere.channelId.in.filter((id) => unitChannelIds.includes(id)) };
+      } else if (typeof videoWhere.channelId === 'string') {
+        if (!unitChannelIds.includes(videoWhere.channelId)) {
+          videoWhere.channelId = { in: [] };
+        }
+      } else {
+        videoWhere.channelId = { in: unitChannelIds };
       }
     }
 
