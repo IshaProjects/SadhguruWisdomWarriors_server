@@ -21,7 +21,7 @@ function asNumber(value) {
   return Number(value) || 0;
 }
 
-function buildChannelFilter(query) {
+async function buildChannelFilter(query) {
   const {
     search,
     category,
@@ -34,12 +34,28 @@ function buildChannelFilter(query) {
     country,
     startDate,
     endDate,
+    microUnitId,
+    micro_unit_id,
   } = query;
 
   // Default: exclude archived channels (matches dashboard + listChannels behavior).
   // Caller can opt back in by passing ?status=archived explicitly.
   // Also exclude soft-deleted rows.
   const where = { deletedAt: null, status: { not: 'archived' } };
+
+  const muId = microUnitId || micro_unit_id;
+  if (muId) {
+    const mu = await prisma.microUnit.findUnique({
+      where: { id: muId },
+      select: { channelIds: true },
+    });
+    const channelIds = mu?.channelIds || [];
+    if (channelIds.length > 0) {
+      where.id = { in: channelIds };
+    } else {
+      where.id = { in: ['__no_channel_matches__'] };
+    }
+  }
 
   if (search) {
     where.OR = [
@@ -78,7 +94,7 @@ function buildChannelFilter(query) {
   return where;
 }
 
-function buildVideoFilter(query) {
+async function buildVideoFilter(query) {
   const {
     search,
     channelId,
@@ -91,6 +107,8 @@ function buildVideoFilter(query) {
     startDate,
     endDate,
     hashtags,
+    microUnitId,
+    micro_unit_id,
   } = query;
 
   // Default: video reports exclude videos whose channel is archived.
@@ -98,6 +116,20 @@ function buildVideoFilter(query) {
   // Channel-level filters resolve to a channelId list later.
   const channelWhere = { deletedAt: null, status: { not: 'archived' } };
   const videoWhere   = {};
+
+  const muId = microUnitId || micro_unit_id;
+  if (muId) {
+    const mu = await prisma.microUnit.findUnique({
+      where: { id: muId },
+      select: { channelIds: true },
+    });
+    const channelIds = mu?.channelIds || [];
+    if (channelIds.length > 0) {
+      channelWhere.id = { in: channelIds };
+    } else {
+      channelWhere.id = { in: ['__no_channel_matches__'] };
+    }
+  }
 
   if (category) channelWhere.category = category;
   if (status)   channelWhere.status   = status;
@@ -422,7 +454,7 @@ export async function reportChannels(req, res, next) {
       endDate,
     } = req.query;
 
-    const where = buildChannelFilter(req.query);
+    const where = await buildChannelFilter(req.query);
 
     if (req.query.classification) {
       const cls = req.query.classification === 'sadhguru' ? 'sadhguru' : 'non sadhguru';
@@ -680,7 +712,7 @@ export async function reportVideos(req, res, next) {
       limit  = 50,
     } = req.query;
 
-    const { channelWhere, videoWhere } = buildVideoFilter(req.query);
+    const { channelWhere, videoWhere } = await buildVideoFilter(req.query);
 
     // Resolve channel IDs from channel-level filters
     if (Object.keys(channelWhere).length > 0) {
