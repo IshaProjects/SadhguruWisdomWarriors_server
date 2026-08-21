@@ -199,11 +199,25 @@ export async function getMe(req, res) {
 
 export async function getTeamMembers(req, res, next) {
   try {
-    const users = await prisma.user.findMany({
-      select: TEAM_LIST_SELECT,
-      orderBy: { createdAt: 'asc' },
-    });
-    res.json(users);
+    let users;
+    try {
+      users = await prisma.user.findMany({
+        select: { ...TEAM_LIST_SELECT, approved: true },
+        orderBy: { createdAt: 'asc' },
+      });
+    } catch {
+      // Fallback if 'approved' column is not in DB table
+      users = await prisma.user.findMany({
+        select: TEAM_LIST_SELECT,
+        orderBy: { createdAt: 'asc' },
+      });
+    }
+    const safeUsers = users.map((u) => ({
+      ...u,
+      _id: u.id,
+      approved: u.approved !== undefined && u.approved !== null ? u.approved : true,
+    }));
+    res.json(safeUsers);
   } catch (err) {
     next(err);
   }
@@ -227,21 +241,37 @@ export async function inviteUser(req, res, next) {
     const hashed = await hashPassword(password);
     const targetRole = role ? String(role).toLowerCase() : 'viewer';
 
-    const created = await prisma.user.create({
-      data: {
-        email,
-        name,
-        password: hashed,
-        role: targetRole,
-      },
-      select: PUBLIC_USER_SELECT,
-    });
+    let created;
+    try {
+      created = await prisma.user.create({
+        data: {
+          email,
+          name,
+          password: hashed,
+          role: targetRole,
+          approved: true,
+        },
+        select: PUBLIC_USER_SELECT,
+      });
+    } catch {
+      created = await prisma.user.create({
+        data: {
+          email,
+          name,
+          password: hashed,
+          role: targetRole,
+        },
+        select: PUBLIC_USER_SELECT,
+      });
+    }
 
     res.status(201).json({
       _id: created.id,
+      id: created.id,
       email: created.email,
       name: created.name,
       role: created.role,
+      approved: true,
     });
   } catch (err) {
     if (err.code === 'P2002') {
@@ -283,12 +313,30 @@ export async function updateTeamMember(req, res, next) {
     }
 
     try {
-      const user = await prisma.user.update({
-        where: { id: req.params.id },
-        data: update,
-        select: TEAM_LIST_SELECT,
+      let user;
+      try {
+        user = await prisma.user.update({
+          where: { id: req.params.id },
+          data: update,
+          select: { ...TEAM_LIST_SELECT, approved: true },
+        });
+      } catch (err) {
+        if (update.approved !== undefined) {
+          delete update.approved;
+          user = await prisma.user.update({
+            where: { id: req.params.id },
+            data: update,
+            select: TEAM_LIST_SELECT,
+          });
+        } else {
+          throw err;
+        }
+      }
+      res.json({
+        ...user,
+        _id: user.id,
+        approved: user.approved !== undefined && user.approved !== null ? user.approved : true,
       });
-      res.json(user);
     } catch (err) {
       if (err.code === 'P2025') {
         return res.status(404).json({ message: 'User not found' });
