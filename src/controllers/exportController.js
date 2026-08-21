@@ -435,12 +435,17 @@ export async function reportChannels(req, res, next) {
       where.id = { in: ids };
     }
 
+async function getMicroUnitChannelIds(microUnitId) {
+  if (!microUnitId) return [];
+  const rows = await prisma.microUnitChannel.findMany({
+    where: { microUnitId },
+    select: { channelId: true },
+  });
+  return rows.map((r) => r.channelId);
+}
+
     if (req.query.microUnitId) {
-      const unit = await prisma.microUnit.findUnique({
-        where: { id: req.query.microUnitId },
-        select: { channelIds: true },
-      });
-      const unitChannelIds = unit?.channelIds || [];
+      const unitChannelIds = await getMicroUnitChannelIds(req.query.microUnitId);
       if (where.id && where.id.in) {
         where.id = { in: where.id.in.filter((id) => unitChannelIds.includes(id)) };
       } else {
@@ -709,11 +714,7 @@ export async function reportVideos(req, res, next) {
     }
 
     if (req.query.microUnitId) {
-      const unit = await prisma.microUnit.findUnique({
-        where: { id: req.query.microUnitId },
-        select: { channelIds: true },
-      });
-      const unitChannelIds = unit?.channelIds || [];
+      const unitChannelIds = await getMicroUnitChannelIds(req.query.microUnitId);
       if (videoWhere.channelId && videoWhere.channelId.in) {
         videoWhere.channelId = { in: videoWhere.channelId.in.filter((id) => unitChannelIds.includes(id)) };
       } else if (typeof videoWhere.channelId === 'string') {
