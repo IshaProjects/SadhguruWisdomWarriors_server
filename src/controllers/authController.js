@@ -203,12 +203,7 @@ export async function getTeamMembers(req, res, next) {
       select: TEAM_LIST_SELECT,
       orderBy: { createdAt: 'asc' },
     });
-    const shaped = users.map((u) => ({
-      ...u,
-      _id: u.id,
-      approved: u.approved !== false,
-    }));
-    res.json(shaped);
+    res.json(users);
   } catch (err) {
     next(err);
   }
@@ -230,13 +225,17 @@ export async function inviteUser(req, res, next) {
     }
 
     const hashed = await hashPassword(password);
+    const targetRole = role ? String(role).toLowerCase() : 'viewer';
+    if (!VALID_ROLES.includes(targetRole)) {
+      return res.status(400).json({ message: 'Invalid role' });
+    }
 
     const created = await prisma.user.create({
       data: {
         email,
         name,
         password: hashed,
-        role: role || 'viewer',
+        role: targetRole,
       },
       select: PUBLIC_USER_SELECT,
     });
@@ -274,10 +273,11 @@ export async function updateTeamMember(req, res, next) {
       update.email = email;
     }
     if (role !== undefined) {
-      if (!VALID_ROLES.includes(role)) {
+      const targetRole = String(role).toLowerCase();
+      if (!VALID_ROLES.includes(targetRole)) {
         return res.status(400).json({ message: 'Invalid role' });
       }
-      update.role = role;
+      update.role = targetRole;
     }
 
     // Prevent demoting yourself
@@ -291,7 +291,7 @@ export async function updateTeamMember(req, res, next) {
         data: update,
         select: TEAM_LIST_SELECT,
       });
-      res.json({ ...user, _id: user.id, approved: user.approved !== false });
+      res.json(user);
     } catch (err) {
       if (err.code === 'P2025') {
         return res.status(404).json({ message: 'User not found' });
