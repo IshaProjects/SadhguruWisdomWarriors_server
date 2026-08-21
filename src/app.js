@@ -1,4 +1,4 @@
-// DigitalOcean deployment trigger
+// DigitalOcean deployment trigger - fixed lockfile and build script
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
