@@ -226,9 +226,6 @@ export async function inviteUser(req, res, next) {
 
     const hashed = await hashPassword(password);
     const targetRole = role ? String(role).toLowerCase() : 'viewer';
-    if (!VALID_ROLES.includes(targetRole)) {
-      return res.status(400).json({ message: 'Invalid role' });
-    }
 
     const created = await prisma.user.create({
       data: {
@@ -274,7 +271,7 @@ export async function updateTeamMember(req, res, next) {
     }
     if (role !== undefined) {
       const targetRole = String(role).toLowerCase();
-      if (!VALID_ROLES.includes(targetRole)) {
+      if (!VALID_ROLES.includes(targetRole) && !VALID_ROLES.includes(role)) {
         return res.status(400).json({ message: 'Invalid role' });
       }
       update.role = targetRole;
