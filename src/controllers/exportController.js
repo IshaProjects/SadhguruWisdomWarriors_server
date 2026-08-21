@@ -21,6 +21,15 @@ function asNumber(value) {
   return Number(value) || 0;
 }
 
+async function getMicroUnitChannelIds(microUnitId) {
+  if (!microUnitId) return [];
+  const rows = await prisma.microUnitChannel.findMany({
+    where: { microUnitId },
+    select: { channelId: true },
+  });
+  return rows.map((r) => r.channelId);
+}
+
 function buildChannelFilter(query) {
   const {
     search,
@@ -434,15 +443,6 @@ export async function reportChannels(req, res, next) {
       const ids = distinctRows.map((r) => r.channelId);
       where.id = { in: ids };
     }
-
-async function getMicroUnitChannelIds(microUnitId) {
-  if (!microUnitId) return [];
-  const rows = await prisma.microUnitChannel.findMany({
-    where: { microUnitId },
-    select: { channelId: true },
-  });
-  return rows.map((r) => r.channelId);
-}
 
     if (req.query.microUnitId) {
       const unitChannelIds = await getMicroUnitChannelIds(req.query.microUnitId);
