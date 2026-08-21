@@ -700,6 +700,22 @@ export async function reportVideos(req, res, next) {
 
     const { channelWhere, videoWhere } = buildVideoFilter(req.query);
 
+    if (req.query.microUnitId) {
+      const unitChannelIds = await getMicroUnitChannelIds(req.query.microUnitId);
+      channelWhere.id = { in: unitChannelIds };
+      if (videoWhere.channelId) {
+        if (typeof videoWhere.channelId === 'string') {
+          if (!unitChannelIds.includes(videoWhere.channelId)) {
+            videoWhere.channelId = { in: [] };
+          }
+        } else if (videoWhere.channelId.in) {
+          videoWhere.channelId = { in: videoWhere.channelId.in.filter((id) => unitChannelIds.includes(id)) };
+        }
+      } else {
+        videoWhere.channelId = { in: unitChannelIds };
+      }
+    }
+
     // Resolve channel IDs from channel-level filters
     if (Object.keys(channelWhere).length > 0) {
       const matched = await prisma.channel.findMany({
@@ -707,22 +723,10 @@ export async function reportVideos(req, res, next) {
         select: { id: true },
       });
       const ids = matched.map((c) => c.id);
-      // If an explicit channelId was set, keep it; else restrict to resolved ids.
       if (!videoWhere.channelId) {
         videoWhere.channelId = { in: ids };
-      }
-    }
-
-    if (req.query.microUnitId) {
-      const unitChannelIds = await getMicroUnitChannelIds(req.query.microUnitId);
-      if (videoWhere.channelId && videoWhere.channelId.in) {
-        videoWhere.channelId = { in: videoWhere.channelId.in.filter((id) => unitChannelIds.includes(id)) };
-      } else if (typeof videoWhere.channelId === 'string') {
-        if (!unitChannelIds.includes(videoWhere.channelId)) {
-          videoWhere.channelId = { in: [] };
-        }
-      } else {
-        videoWhere.channelId = { in: unitChannelIds };
+      } else if (videoWhere.channelId.in) {
+        videoWhere.channelId = { in: videoWhere.channelId.in.filter((id) => ids.includes(id)) };
       }
     }
 
