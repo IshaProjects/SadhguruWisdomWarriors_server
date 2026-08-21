@@ -5,31 +5,31 @@ import { prisma } from '../config/prisma.js';
  * Admin always has access to everything by default.
  */
 const DEFAULT_PAGES = [
-  { key: 'dashboard',  label: 'Dashboard',    roles: { admin: true, manager: true, viewer: true,  poc: true  } },
-  { key: 'channels',   label: 'Channels',     roles: { admin: true, manager: true, viewer: true,  poc: true  } },
-  { key: 'reports',    label: 'Reports',      roles: { admin: true, manager: true, viewer: false, poc: true  } },
-  { key: 'sync',       label: 'Sync Status',  roles: { admin: true, manager: true, viewer: false, poc: false } },
-  { key: 'settings',   label: 'Settings',     roles: { admin: true, manager: false,viewer: false, poc: false } },
-  { key: 'import',     label: 'Import',       roles: { admin: true, manager: true, viewer: false, poc: false } },
-  { key: 'ai-studio', label: 'AI Studio',    roles: { admin: true, manager: true, viewer: true,  poc: true  } },
-  { key: 'micro-units', label: 'Micro Units', roles: { admin: true, manager: true, viewer: true,  poc: true  } },
+  { key: 'dashboard',  label: 'Dashboard',    roles: { admin: true, manager: true, viewer: true  } },
+  { key: 'channels',   label: 'Channels',     roles: { admin: true, manager: true, viewer: true  } },
+  { key: 'reports',    label: 'Reports',      roles: { admin: true, manager: true, viewer: false } },
+  { key: 'sync',       label: 'Sync Status',  roles: { admin: true, manager: true, viewer: false } },
+  { key: 'settings',   label: 'Settings',     roles: { admin: true, manager: false,viewer: false } },
+  { key: 'import',     label: 'Import',       roles: { admin: true, manager: true, viewer: false } },
+  { key: 'ai-studio', label: 'AI Studio',    roles: { admin: true, manager: true, viewer: true  } },
+  { key: 'micro-units', label: 'Micro Units', roles: { admin: true, manager: true, viewer: true  } },
 ];
 
 const DEFAULT_ACTIONS = [
-  { key: 'channels.add',        label: 'Add Channel',              roles: { admin: true, manager: true,  viewer: false, poc: true  } },
-  { key: 'channels.edit',       label: 'Edit Channel',             roles: { admin: true, manager: true,  viewer: false, poc: true  } },
-  { key: 'channels.delete',     label: 'Delete Channel',           roles: { admin: true, manager: false, viewer: false, poc: false } },
-  { key: 'channels.sync',       label: 'Sync Channel',             roles: { admin: true, manager: true,  viewer: false, poc: true  } },
-  { key: 'channels.export',     label: 'Export Channels CSV',      roles: { admin: true, manager: true,  viewer: false, poc: true  } },
-  { key: 'channels.import',     label: 'Import Channels CSV',      roles: { admin: true, manager: true,  viewer: false, poc: false } },
-  { key: 'team.invite',         label: 'Invite Team Member',       roles: { admin: true, manager: false, viewer: false, poc: false } },
-  { key: 'sync.triggerChannel', label: 'Trigger Channel Sync Now', roles: { admin: true, manager: true,  viewer: false, poc: false } },
-  { key: 'sync.triggerVideo',   label: 'Trigger Dedicated Video Sync', roles: { admin: true, manager: true,  viewer: false, poc: false } },
-  { key: 'sync.triggerIhiIngest', label: 'Trigger IHI Ingest (24h + classify)', roles: { admin: true, manager: true, viewer: false, poc: false } },
-  { key: 'sync.triggerIhiSadhguruStats', label: 'Trigger IHI Sadhguru Stats', roles: { admin: true, manager: true, viewer: false, poc: false } },
-  { key: 'sync.configure',      label: 'Configure Sync Schedule',  roles: { admin: true, manager: false, viewer: false, poc: false } },
-  { key: 'queue.add',           label: 'Add to Ingest Queue',      roles: { admin: true, manager: true,  viewer: false, poc: true  } },
-  { key: 'queue.process',       label: 'Process Ingest Queue',     roles: { admin: true, manager: false, viewer: false, poc: false } },
+  { key: 'channels.add',        label: 'Add Channel',              roles: { admin: true, manager: true,  viewer: false } },
+  { key: 'channels.edit',       label: 'Edit Channel',             roles: { admin: true, manager: true,  viewer: false } },
+  { key: 'channels.delete',     label: 'Delete Channel',           roles: { admin: true, manager: false, viewer: false } },
+  { key: 'channels.sync',       label: 'Sync Channel',             roles: { admin: true, manager: true,  viewer: false } },
+  { key: 'channels.export',     label: 'Export Channels CSV',      roles: { admin: true, manager: true,  viewer: false } },
+  { key: 'channels.import',     label: 'Import Channels CSV',      roles: { admin: true, manager: true,  viewer: false } },
+  { key: 'team.invite',         label: 'Invite Team Member',       roles: { admin: true, manager: false, viewer: false } },
+  { key: 'sync.triggerChannel', label: 'Trigger Channel Sync Now', roles: { admin: true, manager: true,  viewer: false } },
+  { key: 'sync.triggerVideo',   label: 'Trigger Dedicated Video Sync', roles: { admin: true, manager: true,  viewer: false } },
+  { key: 'sync.triggerIhiIngest', label: 'Trigger IHI Ingest (24h + classify)', roles: { admin: true, manager: true, viewer: false } },
+  { key: 'sync.triggerIhiSadhguruStats', label: 'Trigger IHI Sadhguru Stats', roles: { admin: true, manager: true, viewer: false } },
+  { key: 'sync.configure',      label: 'Configure Sync Schedule',  roles: { admin: true, manager: false, viewer: false } },
+  { key: 'queue.add',           label: 'Add to Ingest Queue',      roles: { admin: true, manager: true,  viewer: false } },
+  { key: 'queue.process',       label: 'Process Ingest Queue',     roles: { admin: true, manager: false, viewer: false } },
 ];
 
 const SINGLETON_ID = 'rbac';
