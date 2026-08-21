@@ -203,7 +203,12 @@ export async function getTeamMembers(req, res, next) {
       select: TEAM_LIST_SELECT,
       orderBy: { createdAt: 'asc' },
     });
-    res.json(users);
+    const shaped = users.map((u) => ({
+      ...u,
+      _id: u.id,
+      approved: u.approved !== false,
+    }));
+    res.json(shaped);
   } catch (err) {
     next(err);
   }
@@ -286,7 +291,7 @@ export async function updateTeamMember(req, res, next) {
         data: update,
         select: TEAM_LIST_SELECT,
       });
-      res.json(user);
+      res.json({ ...user, _id: user.id, approved: user.approved !== false });
     } catch (err) {
       if (err.code === 'P2025') {
         return res.status(404).json({ message: 'User not found' });
