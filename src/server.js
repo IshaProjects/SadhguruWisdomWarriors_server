@@ -9,8 +9,17 @@ import { getRateLimitLogPath } from './utils/rateLimitLog.js';
 const PORT = process.env.PORT || 5000;
 
 async function start() {
-  await connectDB();
-  await startSyncScheduler();
+  try {
+    await connectDB();
+  } catch (err) {
+    logger.error('Database connection error during startup:', err);
+  }
+
+  try {
+    await startSyncScheduler();
+  } catch (err) {
+    logger.error('Sync scheduler error during startup:', err);
+  }
 
   app.listen(PORT, () => {
     logger.info(`Server running on port ${PORT}`);
