@@ -87,6 +87,14 @@ export async function register(req, res, next) {
       select: PUBLIC_USER_SELECT,
     });
 
+    if (status === 'pending') {
+      return res.status(201).json({
+        message: 'Registration successful! Once an admin approves your account, you will get access.',
+        pending: true,
+        user: { id: created.id, email: created.email, name: created.name, role: created.role, status: created.status, approved: false },
+      });
+    }
+
     const tokens = generateTokens(created.id);
 
     await prisma.user.update({
@@ -96,7 +104,7 @@ export async function register(req, res, next) {
     });
 
     res.status(201).json({
-      user: { id: created.id, email: created.email, name: created.name, role: created.role, status: created.status, approved: created.status === 'approved' },
+      user: { id: created.id, email: created.email, name: created.name, role: created.role, status: created.status, approved: true },
       ...tokens,
     });
   } catch (err) {
