@@ -64,7 +64,15 @@ function shapeMicroUnit(mu) {
 
 export async function listMicroUnits(req, res, next) {
   try {
+    const where = {};
+    if (req.user && req.user.role === 'poc') {
+      where.OR = [
+        { pocId: req.user.id },
+        { poc: { email: req.user.email } },
+      ];
+    }
     const microUnits = await prisma.microUnit.findMany({
+      where,
       orderBy: { name: 'asc' },
       include: {
         poc: { select: POC_USER_SELECT },
