@@ -31,6 +31,12 @@ enum Role {
   poc
 }
 
+enum UserStatus {
+  pending
+  approved
+  rejected
+}
+
 enum ChannelStatus {
   active
   paused
@@ -91,7 +97,7 @@ model User {
   password            String
   name                String
   role                Role        @default(viewer)
-  status              String      @default("approved") @map("status")
+  status              UserStatus  @default(approved) @map("status")
   refreshToken        String?     @map("refresh_token")
   createdAt           DateTime    @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt           DateTime    @updatedAt      @map("updated_at") @db.Timestamptz(6)
