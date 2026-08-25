@@ -20,6 +20,8 @@ import {
   findFirstMissingSheetChannelHandler,
   addFirstMissingSheetChannelHandler,
   syncGoogleSheetChannelsHandler,
+  previewGoogleSheetSyncHandler,
+  importApprovedSheetChannelsHandler,
 } from '../controllers/channelController.js';
 import { authenticate, authorize } from '../middleware/auth.js';
 
@@ -27,6 +29,7 @@ const router = Router();
 const upload = multer({ storage: multer.memoryStorage() });
 
 router.get('/find-first-missing-sheet', findFirstMissingSheetChannelHandler);
+router.get('/preview-google-sheet-sync', previewGoogleSheetSyncHandler);
 
 router.use(authenticate);
 
@@ -41,6 +44,7 @@ router.post('/classify-all', authorize('admin', 'manager'), classifyAllChannelsV
 
 router.post('/add-first-missing-sheet', authorize('admin', 'manager'), addFirstMissingSheetChannelHandler);
 router.post('/sync-google-sheet', authorize('admin', 'manager'), syncGoogleSheetChannelsHandler);
+router.post('/import-approved-sheet-channels', authorize('admin', 'manager'), importApprovedSheetChannelsHandler);
 
 router.get('/:id', getChannel);
 router.put('/:id', authorize('admin', 'manager'), updateChannel);

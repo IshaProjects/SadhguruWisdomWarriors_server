@@ -10,6 +10,8 @@ import {
   findFirstMissingGoogleSheetChannel,
   addFirstMissingGoogleSheetChannel,
   syncAllGoogleSheetChannels,
+  previewGoogleSheetSync,
+  importApprovedSheetChannels,
 } from '../services/googleSheetSync.js';
 
 // ---------------------------------------------------------------------------
@@ -934,6 +936,25 @@ export async function addFirstMissingSheetChannelHandler(req, res, next) {
 export async function syncGoogleSheetChannelsHandler(req, res, next) {
   try {
     const result = await syncAllGoogleSheetChannels();
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function previewGoogleSheetSyncHandler(req, res, next) {
+  try {
+    const result = await previewGoogleSheetSync();
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function importApprovedSheetChannelsHandler(req, res, next) {
+  try {
+    const { approvedItems } = req.body;
+    const result = await importApprovedSheetChannels(approvedItems);
     res.json(result);
   } catch (err) {
     next(err);
