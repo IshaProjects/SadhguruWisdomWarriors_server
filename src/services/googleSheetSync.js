@@ -55,7 +55,11 @@ export async function findFirstMissingGoogleSheetChannel() {
     const res = await fetch(url);
     if (!res.ok) continue;
 
-    const csvText = await res.text();
+    const rawText = await res.text();
+    const lines = rawText.split('\n');
+    const headerIdx = lines.findIndex((l) => l.includes('Full Name') || l.includes('Channel name') || l.includes('Channel link') || l.includes('ID'));
+    const csvText = headerIdx !== -1 ? lines.slice(headerIdx).join('\n') : rawText;
+
     const records = parse(csvText, {
       columns: true,
       skip_empty_lines: true,
