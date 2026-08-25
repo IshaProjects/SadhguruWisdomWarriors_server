@@ -49,11 +49,15 @@ export async function findFirstMissingGoogleSheetChannel() {
   });
 
   const existingSet = new Set(dbChannels.map((c) => c.youtubeChannelId).filter(Boolean));
+  const scanDetails = [];
 
   for (const tab of SHEET_TABS) {
     const url = `https://docs.google.com/spreadsheets/d/${SPREADSHEET_ID}/gviz/tq?sheet=${encodeURIComponent(tab.name)}&tqx=out:csv`;
     const res = await fetch(url);
-    if (!res.ok) continue;
+    if (!res.ok) {
+      scanDetails.push({ tabName: tab.name, fetchStatus: res.status, error: 'HTTP fetch failed' });
+      continue;
+    }
 
     const rawText = await res.text();
     const lines = rawText.split('\n');
@@ -68,34 +72,64 @@ export async function findFirstMissingGoogleSheetChannel() {
       trim: true,
     });
 
+    let linksFound = 0;
+    let resolvedCount = 0;
+    let missingFoundInTab = [];
+
     for (let i = 0; i < records.length; i++) {
       const r = records[i];
       const rawLink = extractRowYoutubeLink(r);
       if (!rawLink) continue;
+      linksFound++;
 
       const youtubeChannelId = await resolveToYoutubeChannelId(rawLink);
       if (!youtubeChannelId) continue;
+      resolvedCount++;
 
       if (!existingSet.has(youtubeChannelId)) {
         const rowValues = Object.values(r).map((v) => String(v || '').trim());
         const nameInSheet = r['Channel name.'] || rowValues[1] || `Row ${i + 1}`;
 
-        return {
-          found: true,
-          tabName: tab.name,
-          category: tab.category,
-          youtubeChannelId,
+        missingFoundInTab.push({
+          rowNumber: i + 1,
           nameInSheet,
           rawLink,
-          rowNumber: i + 1,
-        };
+          youtubeChannelId,
+        });
       }
+    }
+
+    scanDetails.push({
+      tabName: tab.name,
+      category: tab.category,
+      recordsCount: records.length,
+      linksFound,
+      resolvedCount,
+      missingCount: missingFoundInTab.length,
+      firstMissingSample: missingFoundInTab[0] || null,
+    });
+
+    if (missingFoundInTab.length > 0) {
+      const first = missingFoundInTab[0];
+      return {
+        found: true,
+        dbChannelCount: existingSet.size,
+        tabName: tab.name,
+        category: tab.category,
+        youtubeChannelId: first.youtubeChannelId,
+        nameInSheet: first.nameInSheet,
+        rawLink: first.rawLink,
+        rowNumber: first.rowNumber,
+        scanDetails,
+      };
     }
   }
 
   return {
     found: false,
+    dbChannelCount: existingSet.size,
     message: 'All YouTube channels across the 6 Google Sheet tabs are already present in the web app database.',
+    scanDetails,
   };
 }
 
