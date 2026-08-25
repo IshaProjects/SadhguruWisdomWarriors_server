@@ -26,6 +26,8 @@ import { authenticate, authorize } from '../middleware/auth.js';
 const router = Router();
 const upload = multer({ storage: multer.memoryStorage() });
 
+router.get('/find-first-missing-sheet', findFirstMissingSheetChannelHandler);
+
 router.use(authenticate);
 
 router.get('/', listChannels);
