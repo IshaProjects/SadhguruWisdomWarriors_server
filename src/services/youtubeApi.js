@@ -86,17 +86,64 @@ export async function fetchChannelsBatch(channelIds) {
 }
 
 export async function resolveChannelByHandle(handle) {
-  const data = await ytFetch('search', {
-    part: 'snippet',
-    q: handle,
-    type: 'channel',
-    maxResults: 1,
-  });
-  // search costs 100 quota units
-  trackQuota(99); // already tracked 1 in ytFetch
-  if (data.items?.length > 0) {
-    return data.items[0].snippet.channelId;
+  const clean = handle.replace(/^@/, '').trim();
+  if (!clean) return null;
+
+  // 1. YouTube API forHandle (costs only 1 quota unit instead of 100)
+  try {
+    const data = await ytFetch('channels', {
+      part: 'id,snippet',
+      forHandle: `@${clean}`,
+    });
+    if (data?.items?.length > 0) {
+      return data.items[0].id;
+    }
+  } catch (err) {
+    logger.warn(`forHandle YouTube API failed for @${clean}: ${err.message}`);
   }
+
+  // 2. HTML Scraper fallback (zero API quota used)
+  try {
+    const url = `https://www.youtube.com/@${clean}`;
+    const res = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept-Language': 'en-US,en;q=0.9',
+      },
+    });
+    if (res.ok) {
+      const html = await res.text();
+      const m1 = html.match(/itemprop="identifier"\s+content="(UC[\w-]{22})"/i) ||
+                 html.match(/content="(UC[\w-]{22})"\s+itemprop="identifier"/i);
+      if (m1) return m1[1];
+
+      const m2 = html.match(/"channelId":"(UC[\w-]{22})"/i) ||
+                 html.match(/"externalId":"(UC[\w-]{22})"/i);
+      if (m2) return m2[1];
+
+      const m3 = html.match(/href="https:\/\/www\.youtube\.com\/channel\/(UC[\w-]{22})"/i);
+      if (m3) return m3[1];
+    }
+  } catch (err) {
+    logger.warn(`HTML scraper fallback failed for @${clean}: ${err.message}`);
+  }
+
+  // 3. Search endpoint fallback (costs 100 quota units)
+  try {
+    const data = await ytFetch('search', {
+      part: 'snippet',
+      q: clean,
+      type: 'channel',
+      maxResults: 1,
+    });
+    trackQuota(99);
+    if (data?.items?.length > 0) {
+      return data.items[0].snippet.channelId;
+    }
+  } catch (err) {
+    logger.warn(`Search fallback failed for @${clean}: ${err.message}`);
+  }
+
   return null;
 }
 
