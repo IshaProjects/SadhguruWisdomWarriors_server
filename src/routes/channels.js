@@ -39,7 +39,6 @@ router.post('/sync-all', authorize('admin', 'manager'), syncAllChannels);
 router.post('/pull-all-videos', authorize('admin', 'manager'), pullAllChannelsVideosHandler);
 router.post('/classify-all', authorize('admin', 'manager'), classifyAllChannelsVideos);
 
-router.get('/find-first-missing-sheet', authorize('admin', 'manager'), findFirstMissingSheetChannelHandler);
 router.post('/add-first-missing-sheet', authorize('admin', 'manager'), addFirstMissingSheetChannelHandler);
 router.post('/sync-google-sheet', authorize('admin', 'manager'), syncGoogleSheetChannelsHandler);
 
