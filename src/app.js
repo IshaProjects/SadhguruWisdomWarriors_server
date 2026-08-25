@@ -1,4 +1,3 @@
-// DigitalOcean deployment trigger - fixed lockfile and build script
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -61,9 +60,20 @@ app.use('/api/categories', categoryRoutes);
 app.use('/api/video-queue', videoQueueRoutes);
 app.use('/api/micro-units', microUnitRoutes);
 
-// Health check endpoints for DigitalOcean & Cloud platforms
-app.get(['/', '/health', '/api/health'], (req, res) => {
-  res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
+import { findFirstMissingGoogleSheetChannel } from './services/googleSheetSync.js';
+
+// Health check
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+app.get('/api/sheet-pilot-find', async (req, res, next) => {
+  try {
+    const result = await findFirstMissingGoogleSheetChannel();
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
 });
 
 // Error handler
