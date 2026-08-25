@@ -6,6 +6,11 @@ import { extractChannelId, parseYoutubeStatInt } from '../utils/helpers.js';
 import { softDeleteChannels } from '../utils/softDelete.js';
 import { parse } from 'csv-parse/sync';
 import { utcStartOfDay } from '../utils/dateUtc.js';
+import {
+  findFirstMissingGoogleSheetChannel,
+  addFirstMissingGoogleSheetChannel,
+  syncAllGoogleSheetChannels,
+} from '../services/googleSheetSync.js';
 
 // ---------------------------------------------------------------------------
 // Helpers — shape Prisma rows to the legacy (Mongoose) API contract so the
@@ -904,6 +909,33 @@ export async function classifyAllChannelsVideos(req, res, next) {
     if (err.message?.includes('GEMINI_API_KEY') || err.message?.includes('GOOGLE_CLOUD_PROJECT')) {
       return res.status(503).json({ message: 'AI not configured. Set GEMINI_API_KEY (from aistudio.google.com) or GOOGLE_CLOUD_PROJECT for Vertex AI.' });
     }
+    next(err);
+  }
+}
+
+export async function findFirstMissingSheetChannelHandler(req, res, next) {
+  try {
+    const result = await findFirstMissingGoogleSheetChannel();
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function addFirstMissingSheetChannelHandler(req, res, next) {
+  try {
+    const result = await addFirstMissingGoogleSheetChannel();
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function syncGoogleSheetChannelsHandler(req, res, next) {
+  try {
+    const result = await syncAllGoogleSheetChannels();
+    res.json(result);
+  } catch (err) {
     next(err);
   }
 }
