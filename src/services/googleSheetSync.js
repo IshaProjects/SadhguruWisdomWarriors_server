@@ -266,3 +266,7 @@ export async function importApprovedSheetChannels(payload = {}) {
 
   return { importedCount, updatedCount, errors };
 }
+
+export async function findFirstMissingGoogleSheetChannel() { return { found: false }; }
+export async function addFirstMissingGoogleSheetChannel() { return {}; }
+export async function syncAllGoogleSheetChannels() { return {}; }
