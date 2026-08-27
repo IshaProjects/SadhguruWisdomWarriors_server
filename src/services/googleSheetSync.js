@@ -129,12 +129,13 @@ export async function previewGoogleSheetSync() {
           const currentHandleOrUrl = ytData.snippet?.customUrl || '';
           
           if (existingInDB) {
-            // Check if handle changed
-            // Ensure we compare strings properly. Sometimes handles have @, sometimes they don't.
+            // Check if handle or name changed
             const dbHandle = (existingInDB.customUrl || '').replace(/^@/, '');
             const currHandle = currentHandleOrUrl.replace(/^@/, '');
+            const dbTitle = existingInDB.title || '';
+            const currTitle = ytData.snippet.title || '';
             
-            if (dbHandle !== currHandle && currHandle !== '') {
+            if ((dbHandle !== currHandle && currHandle !== '') || (dbTitle !== currTitle && currTitle !== '')) {
               statusState = 'HANDLE_CHANGED';
               summary.handleChangedCount++;
             } else {
@@ -147,13 +148,15 @@ export async function previewGoogleSheetSync() {
               dbId: existingInDB.id,
               tabName: tab.name,
               category: existingInDB.category,
-              name: ytData.snippet.title || existingInDB.title,
+              name: currTitle,
+              previousName: dbTitle,
               thumbnail: ytData.snippet.thumbnails?.default?.url || existingInDB.thumbnailUrl,
               rawLink,
               currentHandle: currentHandleOrUrl,
               previousHandle: existingInDB.customUrl,
               youtubeChannelId,
               statusState,
+              appStatus: existingInDB.status
             });
           } else {
             statusState = 'NEW_CHANNEL';
