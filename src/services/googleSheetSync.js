@@ -7,12 +7,12 @@ import { parse } from 'csv-parse/sync';
 const SPREADSHEET_ID = '1rF7tGOjn5gdEWnn3DEwao51wPvDIf2xLgD_WJk47xA0';
 
 const SHEET_TABS = [
-  { name: 'Grade A', category: 'Dedicated Grade A' },
-  { name: 'Grade B', category: 'Dedicated Grade B' },
-  { name: 'Grade C', category: 'Dedicated Grade C' },
-  { name: 'Grade D', category: 'Dedicated Grade D' },
-  { name: 'Grade E', category: 'Dedicated Grade E' },
-  { name: 'Inactive', category: 'Dedicated Inactive' },
+  { name: 'Grade A', category: 'Dedicated - Grade A' },
+  { name: 'Grade B', category: 'Dedicated - Grade B' },
+  { name: 'Grade C', category: 'Dedicated - Grade C' },
+  { name: 'Grade D', category: 'Dedicated - Grade D' },
+  { name: 'Grade E', category: 'Dedicated - Grade E' },
+  { name: 'Inactive', category: 'Dedicated - Inactive' },
 ];
 
 const YOUTUBE_REGEX = /(?:https?:\/\/)?(?:www\.)?youtube\.com\/(?:@[\w.\u0900-\u097F\u0600-\u06FF-]+|channel\/UC[\w-]{22}|c\/[\w.-]+|user\/[\w.-]+)/gi;
@@ -129,13 +129,12 @@ export async function previewGoogleSheetSync() {
           const currentHandleOrUrl = ytData.snippet?.customUrl || '';
           
           if (existingInDB) {
-            // Check if handle or name changed
+            // Check if handle changed
+            // Ensure we compare strings properly. Sometimes handles have @, sometimes they don't.
             const dbHandle = (existingInDB.customUrl || '').replace(/^@/, '');
             const currHandle = currentHandleOrUrl.replace(/^@/, '');
-            const dbTitle = existingInDB.title || '';
-            const currTitle = ytData.snippet.title || '';
             
-            if ((dbHandle !== currHandle && currHandle !== '') || (dbTitle !== currTitle && currTitle !== '')) {
+            if (dbHandle !== currHandle && currHandle !== '') {
               statusState = 'HANDLE_CHANGED';
               summary.handleChangedCount++;
             } else {
@@ -148,15 +147,13 @@ export async function previewGoogleSheetSync() {
               dbId: existingInDB.id,
               tabName: tab.name,
               category: existingInDB.category,
-              name: currTitle,
-              previousName: dbTitle,
+              name: ytData.snippet.title || existingInDB.title,
               thumbnail: ytData.snippet.thumbnails?.default?.url || existingInDB.thumbnailUrl,
               rawLink,
               currentHandle: currentHandleOrUrl,
               previousHandle: existingInDB.customUrl,
               youtubeChannelId,
               statusState,
-              appStatus: existingInDB.status
             });
           } else {
             statusState = 'NEW_CHANNEL';
@@ -222,7 +219,50 @@ export async function previewGoogleSheetSync() {
   };
 }
 
-export async function importApprovedSheetChannels(approvedItems = []) { return {}; }
-export async function findFirstMissingGoogleSheetChannel() { return { found: false }; }
-export async function addFirstMissingGoogleSheetChannel() { return {}; }
-export async function syncAllGoogleSheetChannels() { return {}; }
+export async function importApprovedSheetChannels(payload = {}) {
+  const { newChannels = [], updatedChannels = [] } = payload;
+  let importedCount = 0;
+  let updatedCount = 0;
+  const errors = [];
+
+  for (const ch of updatedChannels) {
+    try {
+      if (!ch.dbId) continue;
+      await prisma.channel.update({
+        where: { id: ch.dbId },
+        data: {
+          customUrl: ch.currentHandle || '',
+          title: ch.name || '',
+          thumbnailUrl: ch.thumbnail || ''
+        }
+      });
+      updatedCount++;
+    } catch (err) {
+      errors.push({ id: ch.id, message: err.message });
+    }
+  }
+
+  for (const ch of newChannels) {
+    try {
+      if (!ch.youtubeChannelId || ch.youtubeChannelId === 'UNRESOLVED') continue;
+      await prisma.channel.create({
+        data: {
+          youtubeChannelId: ch.youtubeChannelId,
+          title: ch.name || ch.youtubeChannelId,
+          customUrl: ch.currentHandle || '',
+          thumbnailUrl: ch.thumbnail || '',
+          category: ch.category || 'Uncategorized',
+          status: 'active',
+          classification: 'green'
+        }
+      });
+      importedCount++;
+    } catch (err) {
+      if (err.code !== 'P2002') {
+        errors.push({ id: ch.id, message: err.message });
+      }
+    }
+  }
+
+  return { importedCount, updatedCount, errors };
+}
