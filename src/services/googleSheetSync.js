@@ -303,28 +303,80 @@ export async function importApprovedSheetChannels(payload = {}) {
       });
       updatedCount++;
     } catch (err) {
-      errors.push({ id: ch.id, message: err.message });
+      errors.push({ id: ch.id || ch.youtubeChannelId, message: err.message });
     }
   }
 
-  for (const ch of newChannels) {
+  const validNewChannels = newChannels.filter(
+    (ch) => ch.youtubeChannelId && ch.youtubeChannelId !== 'UNRESOLVED'
+  );
+
+  for (const ch of validNewChannels) {
     try {
-      if (!ch.youtubeChannelId || ch.youtubeChannelId === 'UNRESOLVED') continue;
-      await prisma.channel.create({
+      const channelId = ch.youtubeChannelId.trim();
+
+      // Check if already in DB to avoid duplicate errors
+      const existing = await prisma.channel.findFirst({
+        where: { youtubeChannelId: channelId },
+      });
+
+      if (existing) {
+        importedCount++;
+        continue;
+      }
+
+      let ytData = null;
+      try {
+        ytData = await fetchSingleChannel(channelId);
+      } catch (e) {
+        // Non-fatal, fallback to candidate item info
+      }
+
+      const created = await prisma.channel.create({
         data: {
-          youtubeChannelId: ch.youtubeChannelId,
-          title: ch.name || ch.youtubeChannelId,
-          customUrl: ch.currentHandle || '',
-          thumbnailUrl: ch.thumbnail || '',
+          youtubeChannelId: channelId,
+          title: ytData?.snippet?.title || ch.name || channelId,
+          description: ytData?.snippet?.description || '',
+          thumbnailUrl:
+            ytData?.snippet?.thumbnails?.high?.url ||
+            ytData?.snippet?.thumbnails?.default?.url ||
+            ch.thumbnail ||
+            '',
+          bannerUrl: ytData?.brandingSettings?.image?.bannerExternalUrl || '',
+          customUrl: ytData?.snippet?.customUrl || ch.currentHandle || '',
+          country: ytData?.snippet?.country || '',
+          publishedAt: ytData?.snippet?.publishedAt ? new Date(ytData.snippet.publishedAt) : null,
+          uploadsPlaylistId: ytData?.contentDetails?.relatedPlaylists?.uploads || '',
           category: ch.category || 'Uncategorized',
           status: 'active',
-          classification: 'green'
-        }
+          currentSubscribers: parseYoutubeStatInt(ytData?.statistics?.subscriberCount),
+          currentViews: BigInt(parseYoutubeStatInt(ytData?.statistics?.viewCount)),
+          currentVideoCount: parseYoutubeStatInt(ytData?.statistics?.videoCount),
+          lastSyncedAt: new Date(),
+        },
       });
+
+      try {
+        const today = utcStartOfDay();
+        await prisma.channelSnapshot.create({
+          data: {
+            channelId: created.id,
+            date: today,
+            subscribers: created.currentSubscribers,
+            views: created.currentViews,
+            videoCount: created.currentVideoCount,
+          },
+        });
+      } catch (snapErr) {
+        // Snapshot failure is non-fatal
+      }
+
       importedCount++;
     } catch (err) {
-      if (err.code !== 'P2002') {
-        errors.push({ id: ch.id, message: err.message });
+      if (err.code === 'P2002') {
+        importedCount++;
+      } else {
+        errors.push({ id: ch.id || ch.youtubeChannelId, message: err.message });
       }
     }
   }
