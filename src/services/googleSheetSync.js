@@ -262,9 +262,21 @@ export async function previewGoogleSheetSync() {
     }
   }
 
+  // Compute exact summary counts on the deduplicated channel list
+  const finalSummary = {
+    totalSheetChannels: uniqueItems.length,
+    rawLinksCount: candidateItems.length,
+    newCount: uniqueItems.filter(i => i.statusState === 'NEW_CHANNEL').length,
+    alreadyAddedCount: uniqueItems.filter(i => i.statusState === 'ALREADY_ADDED').length,
+    handleChangedCount: uniqueItems.filter(i => i.statusState === 'HANDLE_CHANGED').length,
+    terminatedCount: uniqueItems.filter(i => i.statusState === 'CHANNEL_TERMINATED').length,
+    notFoundCount: uniqueItems.filter(i => i.statusState === 'CHANNEL_NOT_FOUND' || i.statusState === 'ERROR').length,
+    errorCount: uniqueItems.filter(i => i.statusState === 'ERROR').length,
+  };
+
   return {
     items: uniqueItems,
-    summary,
+    summary: finalSummary,
   };
 }
 
