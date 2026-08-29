@@ -52,6 +52,7 @@ export async function previewGoogleSheetSync() {
     alreadyAddedCount: 0,
     handleChangedCount: 0,
     notFoundCount: 0,
+    terminatedCount: 0,
     errorCount: 0,
   };
 
@@ -191,15 +192,43 @@ export async function previewGoogleSheetSync() {
             });
           }
         } else {
-          candidateItems.push({
-            id: `notfound-${Math.random()}`,
-            tabName: tab.name,
-            category: tab.category,
-            name: nameInSheet,
-            rawLink,
-            youtubeChannelId: 'UNRESOLVED',
-            statusState,
-          });
+          // Check if this channel was previously in our database
+          let previouslyInDB = null;
+          if (extracted) {
+            if (typeof extracted === 'string') {
+              previouslyInDB = dbMapById.get(extracted.trim());
+            } else if (extracted.handle) {
+              const cleanHandle = extracted.handle.replace(/^@/, '').trim().toLowerCase();
+              previouslyInDB = dbMapByHandle.get(cleanHandle);
+            }
+          }
+
+          if (previouslyInDB) {
+            statusState = 'CHANNEL_TERMINATED';
+            summary.terminatedCount = (summary.terminatedCount || 0) + 1;
+            candidateItems.push({
+              id: previouslyInDB.youtubeChannelId || `terminated-${Math.random()}`,
+              dbId: previouslyInDB.id,
+              tabName: tab.name,
+              category: previouslyInDB.category,
+              name: previouslyInDB.title || nameInSheet,
+              rawLink,
+              currentHandle: previouslyInDB.customUrl || (extracted?.handle ? `@${extracted.handle}` : ''),
+              youtubeChannelId: previouslyInDB.youtubeChannelId || 'UNRESOLVED',
+              statusState,
+            });
+          } else {
+            statusState = 'CHANNEL_NOT_FOUND';
+            candidateItems.push({
+              id: `notfound-${Math.random()}`,
+              tabName: tab.name,
+              category: tab.category,
+              name: nameInSheet,
+              rawLink,
+              youtubeChannelId: 'UNRESOLVED',
+              statusState,
+            });
+          }
         }
       } catch (err) {
         statusState = 'ERROR';

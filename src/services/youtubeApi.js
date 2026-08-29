@@ -113,6 +113,14 @@ export async function resolveChannelByHandle(handle) {
     });
     if (res.ok) {
       const html = await res.text();
+      if (
+        html.includes('This account has been terminated') ||
+        html.includes("This page isn't available") ||
+        html.includes('channel does not exist')
+      ) {
+        return null;
+      }
+
       const m1 = html.match(/itemprop="identifier"\s+content="(UC[\w-]{22})"/i) ||
                  html.match(/content="(UC[\w-]{22})"\s+itemprop="identifier"/i);
       if (m1) return m1[1];
@@ -126,22 +134,6 @@ export async function resolveChannelByHandle(handle) {
     }
   } catch (err) {
     logger.warn(`HTML scraper fallback failed for @${clean}: ${err.message}`);
-  }
-
-  // 3. Search endpoint fallback (costs 100 quota units)
-  try {
-    const data = await ytFetch('search', {
-      part: 'snippet',
-      q: clean,
-      type: 'channel',
-      maxResults: 1,
-    });
-    trackQuota(99);
-    if (data?.items?.length > 0) {
-      return data.items[0].snippet.channelId;
-    }
-  } catch (err) {
-    logger.warn(`Search fallback failed for @${clean}: ${err.message}`);
   }
 
   return null;
