@@ -285,6 +285,7 @@ export async function importApprovedSheetChannels(payload = {}) {
   let importedCount = 0;
   let updatedCount = 0;
   const errors = [];
+  const today = utcStartOfDay();
 
   for (const ch of updatedChannels) {
     try {
@@ -303,80 +304,74 @@ export async function importApprovedSheetChannels(payload = {}) {
       });
       updatedCount++;
     } catch (err) {
-      errors.push({ id: ch.id || ch.youtubeChannelId, message: err.message });
+      errors.push({ id: ch.id, message: err.message });
     }
   }
 
-  const validNewChannels = newChannels.filter(
-    (ch) => ch.youtubeChannelId && ch.youtubeChannelId !== 'UNRESOLVED'
-  );
-
-  for (const ch of validNewChannels) {
+  for (const ch of newChannels) {
     try {
-      const channelId = ch.youtubeChannelId.trim();
+      if (!ch.youtubeChannelId || ch.youtubeChannelId === 'UNRESOLVED') continue;
+      const channelIdClean = ch.youtubeChannelId.trim();
+      const channelCategory = ch.category || 'Uncategorized';
 
-      // Check if already in DB to avoid duplicate errors
-      const existing = await prisma.channel.findFirst({
-        where: { youtubeChannelId: channelId },
-      });
-
-      if (existing) {
-        importedCount++;
-        continue;
-      }
-
-      let ytData = null;
+      // Ensure category exists in Category table
       try {
-        ytData = await fetchSingleChannel(channelId);
-      } catch (e) {
-        // Non-fatal, fallback to candidate item info
+        await prisma.category.upsert({
+          where: { name: channelCategory },
+          update: {},
+          create: { name: channelCategory },
+        });
+      } catch {
+        // ignore if concurrent
       }
 
       const created = await prisma.channel.create({
         data: {
-          youtubeChannelId: channelId,
-          title: ytData?.snippet?.title || ch.name || channelId,
-          description: ytData?.snippet?.description || '',
-          thumbnailUrl:
-            ytData?.snippet?.thumbnails?.high?.url ||
-            ytData?.snippet?.thumbnails?.default?.url ||
-            ch.thumbnail ||
-            '',
-          bannerUrl: ytData?.brandingSettings?.image?.bannerExternalUrl || '',
-          customUrl: ytData?.snippet?.customUrl || ch.currentHandle || '',
-          country: ytData?.snippet?.country || '',
-          publishedAt: ytData?.snippet?.publishedAt ? new Date(ytData.snippet.publishedAt) : null,
-          uploadsPlaylistId: ytData?.contentDetails?.relatedPlaylists?.uploads || '',
-          category: ch.category || 'Uncategorized',
+          youtubeChannelId: channelIdClean,
+          title: ch.name || channelIdClean,
+          customUrl: ch.currentHandle || '',
+          thumbnailUrl: ch.thumbnail || '',
+          category: channelCategory,
           status: 'active',
-          currentSubscribers: parseYoutubeStatInt(ytData?.statistics?.subscriberCount),
-          currentViews: BigInt(parseYoutubeStatInt(ytData?.statistics?.viewCount)),
-          currentVideoCount: parseYoutubeStatInt(ytData?.statistics?.videoCount),
           lastSyncedAt: new Date(),
-        },
+        }
       });
 
+      // Create initial snapshot for today
       try {
-        const today = utcStartOfDay();
         await prisma.channelSnapshot.create({
           data: {
             channelId: created.id,
             date: today,
-            subscribers: created.currentSubscribers,
-            views: created.currentViews,
-            videoCount: created.currentVideoCount,
+            subscribers: 0,
+            views: 0n,
+            videoCount: 0,
           },
         });
-      } catch (snapErr) {
-        // Snapshot failure is non-fatal
+      } catch {
+        // snapshot may already exist
       }
 
       importedCount++;
     } catch (err) {
       if (err.code === 'P2002') {
-        importedCount++;
+        // If channel already exists in DB, update category and handle
+        try {
+          await prisma.channel.update({
+            where: { youtubeChannelId: ch.youtubeChannelId.trim() },
+            data: {
+              category: ch.category || undefined,
+              customUrl: ch.currentHandle || undefined,
+              title: ch.name || undefined,
+              thumbnailUrl: ch.thumbnail || undefined,
+            },
+          });
+          importedCount++;
+        } catch (updateErr) {
+          errors.push({ id: ch.id, message: updateErr.message });
+        }
       } else {
-        errors.push({ id: ch.id || ch.youtubeChannelId, message: err.message });
+        errors.push({ id: ch.id, message: err.message });
       }
     }
   }

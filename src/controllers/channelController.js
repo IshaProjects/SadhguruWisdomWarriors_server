@@ -6,6 +6,7 @@ import { extractChannelId, parseYoutubeStatInt } from '../utils/helpers.js';
 import { softDeleteChannels } from '../utils/softDelete.js';
 import { parse } from 'csv-parse/sync';
 import { utcStartOfDay } from '../utils/dateUtc.js';
+import { isDedicatedChannel } from '../utils/channelGroup.js';
 import {
   findFirstMissingGoogleSheetChannel,
   addFirstMissingGoogleSheetChannel,
@@ -191,7 +192,7 @@ export async function listChannels(req, res, next) {
     const unclassifiedSet = new Set(unclassifiedRows.map((r) => String(r.channelId)));
     const channelsWithFlag = channels.map((ch) => ({
       ...serializeChannel(ch),
-      classificationDone: !unclassifiedSet.has(String(ch.id)),
+      classificationDone: isDedicatedChannel(ch) || !unclassifiedSet.has(String(ch.id)),
     }));
 
     res.json({
