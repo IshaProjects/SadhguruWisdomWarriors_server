@@ -30,10 +30,18 @@ export async function previewGoogleSheetSync() {
     },
   });
 
-  const dbMap = new Map();
+  const dbMapById = new Map();
+  const dbMapByHandle = new Map();
+
   for (const c of allDbChannels) {
     if (c.youtubeChannelId) {
-      dbMap.set(c.youtubeChannelId, c);
+      dbMapById.set(c.youtubeChannelId.trim(), c);
+    }
+    if (c.customUrl) {
+      const cleanHandle = c.customUrl.replace(/^@/, '').trim().toLowerCase();
+      if (cleanHandle) {
+        dbMapByHandle.set(cleanHandle, c);
+      }
     }
   }
 
@@ -109,12 +117,12 @@ export async function previewGoogleSheetSync() {
           summary.notFoundCount++;
         } else {
           if (typeof extracted === 'string') {
-            youtubeChannelId = extracted;
+            youtubeChannelId = extracted.trim();
             ytData = await fetchSingleChannel(youtubeChannelId);
           } else if (extracted.handle) {
             ytData = await fetchChannelByHandle(extracted.handle);
             if (ytData) {
-              youtubeChannelId = ytData.snippet?.channelId || ytData.id;
+              youtubeChannelId = (ytData.snippet?.channelId || ytData.id || '').trim();
             }
           }
 
@@ -125,16 +133,27 @@ export async function previewGoogleSheetSync() {
         }
 
         if (youtubeChannelId && ytData) {
-          const existingInDB = dbMap.get(youtubeChannelId);
           const currentHandleOrUrl = ytData.snippet?.customUrl || '';
-          
+          const cleanLiveHandle = currentHandleOrUrl.replace(/^@/, '').trim().toLowerCase();
+
+          // Primary lookup by Channel ID
+          let existingInDB = dbMapById.get(youtubeChannelId);
+
+          // Fallback lookup: try matching by handle if available
+          if (!existingInDB && cleanLiveHandle) {
+            existingInDB = dbMapByHandle.get(cleanLiveHandle);
+          }
+
           if (existingInDB) {
-            // Check if handle changed
-            // Ensure we compare strings properly. Sometimes handles have @, sometimes they don't.
-            const dbHandle = (existingInDB.customUrl || '').replace(/^@/, '');
-            const currHandle = currentHandleOrUrl.replace(/^@/, '');
-            
-            if (dbHandle !== currHandle && currHandle !== '') {
+            // Check if handle or title changed
+            const dbHandle = (existingInDB.customUrl || '').replace(/^@/, '').trim().toLowerCase();
+            const dbTitle = (existingInDB.title || '').trim();
+            const currTitle = (ytData.snippet?.title || '').trim();
+
+            const handleChanged = Boolean(cleanLiveHandle && dbHandle && dbHandle !== cleanLiveHandle);
+            const titleChanged = Boolean(currTitle && dbTitle && dbTitle.toLowerCase() !== currTitle.toLowerCase());
+
+            if (handleChanged || titleChanged) {
               statusState = 'HANDLE_CHANGED';
               summary.handleChangedCount++;
             } else {
@@ -152,6 +171,7 @@ export async function previewGoogleSheetSync() {
               rawLink,
               currentHandle: currentHandleOrUrl,
               previousHandle: existingInDB.customUrl,
+              previousTitle: existingInDB.title,
               youtubeChannelId,
               statusState,
             });
@@ -228,13 +248,17 @@ export async function importApprovedSheetChannels(payload = {}) {
   for (const ch of updatedChannels) {
     try {
       if (!ch.dbId) continue;
+      const updateData = {
+        customUrl: ch.currentHandle || '',
+        title: ch.name || '',
+        thumbnailUrl: ch.thumbnail || ''
+      };
+      if (ch.youtubeChannelId && ch.youtubeChannelId !== 'UNRESOLVED') {
+        updateData.youtubeChannelId = ch.youtubeChannelId.trim();
+      }
       await prisma.channel.update({
         where: { id: ch.dbId },
-        data: {
-          customUrl: ch.currentHandle || '',
-          title: ch.name || '',
-          thumbnailUrl: ch.thumbnail || ''
-        }
+        data: updateData
       });
       updatedCount++;
     } catch (err) {
