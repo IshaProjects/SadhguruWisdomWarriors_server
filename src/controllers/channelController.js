@@ -143,12 +143,12 @@ export async function listChannels(req, res, next) {
       ];
     }
 
-    if (group === 'dedicated') {
+    if (category) {
+      where.category = category;
+    } else if (group === 'dedicated') {
       where.category = { startsWith: 'Dedicated', mode: 'insensitive' };
     } else if (group === 'ihi') {
       where.category = { contains: 'IHI', mode: 'insensitive' };
-    } else if (category) {
-      where.category = category;
     }
 
     if (status) {
