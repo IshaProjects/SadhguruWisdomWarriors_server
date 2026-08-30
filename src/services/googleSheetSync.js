@@ -4,20 +4,41 @@ import { extractChannelId, parseYoutubeStatInt } from '../utils/helpers.js';
 import { utcStartOfDay } from '../utils/dateUtc.js';
 import { parse } from 'csv-parse/sync';
 
-const SPREADSHEET_ID = '1rF7tGOjn5gdEWnn3DEwao51wPvDIf2xLgD_WJk47xA0';
-
-const SHEET_TABS = [
-  { name: 'Grade A', category: 'Dedicated - Grade A' },
-  { name: 'Grade B', category: 'Dedicated - Grade B' },
-  { name: 'Grade C', category: 'Dedicated - Grade C' },
-  { name: 'Grade D', category: 'Dedicated - Grade D' },
-  { name: 'Grade E', category: 'Dedicated - Grade E' },
-  { name: 'Inactive', category: 'Dedicated - Inactive' },
-];
+const SPREADSHEETS = {
+  dedicated: {
+    id: '1rF7tGOjn5gdEWnn3DEwao51wPvDIf2xLgD_WJk47xA0',
+    title: 'Dedicated Master Database',
+    tabs: [
+      { name: 'Grade A', category: 'Dedicated - Grade A' },
+      { name: 'Grade B', category: 'Dedicated - Grade B' },
+      { name: 'Grade C', category: 'Dedicated - Grade C' },
+      { name: 'Grade D', category: 'Dedicated - Grade D' },
+      { name: 'Grade E', category: 'Dedicated - Grade E' },
+      { name: 'Inactive', category: 'Dedicated - Inactive' },
+    ],
+  },
+  ihi: {
+    id: '1J027IUUkk6wWvbactK6qgRwYUWoEafIxIScQwiDq1BU',
+    title: 'IHI Master Database',
+    tabs: [
+      { name: 'Grade A', category: 'IHI - Grade A' },
+      { name: 'Grade B', category: 'IHI - Grade B' },
+      { name: 'Grade C', category: 'IHI - Grade C' },
+      { name: 'Grade D', category: 'IHI - Grade D' },
+      { name: 'Grade E', category: 'IHI - Grade E' },
+      { name: 'Inactive', category: 'IHI - Inactive' },
+    ],
+  },
+};
 
 const YOUTUBE_REGEX = /(?:https?:\/\/)?(?:www\.)?youtube\.com\/(?:@[\w.\u0900-\u097F\u0600-\u06FF-]+|channel\/UC[\w-]{22}|c\/[\w.-]+|user\/[\w.-]+)/gi;
 
-export async function previewGoogleSheetSync() {
+export async function previewGoogleSheetSync(options = {}) {
+  const sheetType = (options.sheetType || 'dedicated').toLowerCase();
+  const config = SPREADSHEETS[sheetType] || SPREADSHEETS.dedicated;
+  const SPREADSHEET_ID = config.id;
+  const SHEET_TABS = config.tabs;
+
   const allDbChannels = await prisma.channel.findMany({
     select: {
       id: true,

@@ -945,7 +945,8 @@ export async function syncGoogleSheetChannelsHandler(req, res, next) {
 
 export async function previewGoogleSheetSyncHandler(req, res, next) {
   try {
-    const result = await previewGoogleSheetSync();
+    const { sheetType = 'dedicated' } = req.query;
+    const result = await previewGoogleSheetSync({ sheetType });
     res.json(result);
   } catch (err) {
     next(err);
