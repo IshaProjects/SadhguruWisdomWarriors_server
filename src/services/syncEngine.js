@@ -112,16 +112,27 @@ export async function syncChannelStats(channelIds = null, type = 'manual') {
         const views       = parseYoutubeStatInt(stats.viewCount);
         const videoCount  = parseYoutubeStatInt(stats.videoCount);
 
+        let notes = channel.notes || '';
+        const oldTitle = (channel.title || '').trim();
+        const newTitle = (snippet.title || '').trim();
+
+        if (oldTitle && newTitle && oldTitle.toLowerCase() !== newTitle.toLowerCase()) {
+          if (!notes.includes(oldTitle)) {
+            notes = notes ? `${notes} | Formerly: ${oldTitle}` : `Formerly: ${oldTitle}`;
+          }
+        }
+
         const data = {
-          title:        snippet.title,
-          description:  snippet.description,
-          thumbnailUrl: pickThumbnail(snippet.thumbnails),
-          bannerUrl:    branding?.image?.bannerExternalUrl || '',
-          customUrl:    snippet.customUrl || '',
-          country:      snippet.country   || '',
-          publishedAt:  snippet.publishedAt ? new Date(snippet.publishedAt) : null,
+          title:        snippet.title || channel.title,
+          description:  snippet.description || channel.description,
+          thumbnailUrl: pickThumbnail(snippet.thumbnails) || channel.thumbnailUrl,
+          bannerUrl:    branding?.image?.bannerExternalUrl || channel.bannerUrl || '',
+          customUrl:    snippet.customUrl || channel.customUrl || '',
+          country:      snippet.country   || channel.country || '',
+          notes,
+          publishedAt:  snippet.publishedAt ? new Date(snippet.publishedAt) : (channel.publishedAt || null),
           uploadsPlaylistId:
-            ytChannel.contentDetails?.relatedPlaylists?.uploads || '',
+            ytChannel.contentDetails?.relatedPlaylists?.uploads || channel.uploadsPlaylistId || '',
           currentSubscribers: subscribers,
           currentViews:       BigInt(views),
           currentVideoCount:  videoCount,

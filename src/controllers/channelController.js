@@ -136,11 +136,24 @@ export async function listChannels(req, res, next) {
     const where = { deletedAt: null };
 
     if (search) {
-      where.OR = [
-        { title: { contains: search, mode: 'insensitive' } },
-        { youtubeChannelId: { contains: search, mode: 'insensitive' } },
-        { customUrl: { contains: search, mode: 'insensitive' } },
+      const clean = search.trim();
+      const extracted = extractChannelId(clean);
+      const orClauses = [
+        { title: { contains: clean, mode: 'insensitive' } },
+        { customUrl: { contains: clean, mode: 'insensitive' } },
+        { youtubeChannelId: { contains: clean, mode: 'insensitive' } },
+        { notes: { contains: clean, mode: 'insensitive' } },
       ];
+
+      if (typeof extracted === 'string' && extracted.startsWith('UC')) {
+        orClauses.push({ youtubeChannelId: { contains: extracted, mode: 'insensitive' } });
+      } else if (extracted?.handle) {
+        const cleanH = extracted.handle.replace(/^@/, '');
+        orClauses.push({ customUrl: { contains: cleanH, mode: 'insensitive' } });
+        orClauses.push({ customUrl: { contains: `@${cleanH}`, mode: 'insensitive' } });
+      }
+
+      where.OR = orClauses;
     }
 
     if (category) {
@@ -244,16 +257,49 @@ export async function addChannel(req, res, next) {
       channelId = resolved;
     }
 
-    const existing = await prisma.channel.findFirst({ where: { youtubeChannelId: channelId } });
-    if (existing) {
-      return res
-        .status(409)
-        .json({ message: 'Channel already tracked', channel: serializeChannel(existing) });
-    }
-
     const ytData = await fetchSingleChannel(channelId);
     if (!ytData) {
       return res.status(404).json({ message: 'Channel not found on YouTube' });
+    }
+
+    const existing = await prisma.channel.findFirst({ where: { youtubeChannelId: channelId } });
+    if (existing) {
+      const liveTitle = (ytData.snippet.title || '').trim();
+      const liveHandle = ytData.snippet.customUrl || '';
+      const liveThumbnail = ytData.snippet.thumbnails?.high?.url || ytData.snippet.thumbnails?.default?.url || existing.thumbnailUrl;
+      
+      let updatedNotes = existing.notes || '';
+      const oldTitle = (existing.title || '').trim();
+
+      if (oldTitle && liveTitle && oldTitle.toLowerCase() !== liveTitle.toLowerCase()) {
+        if (!updatedNotes.includes(oldTitle)) {
+          updatedNotes = updatedNotes ? `${updatedNotes} | Formerly: ${oldTitle}` : `Formerly: ${oldTitle}`;
+        }
+      }
+
+      const updated = await prisma.channel.update({
+        where: { id: existing.id },
+        data: {
+          title: liveTitle || existing.title,
+          customUrl: liveHandle || existing.customUrl,
+          thumbnailUrl: liveThumbnail,
+          notes: updatedNotes,
+          currentSubscribers: parseYoutubeStatInt(ytData.statistics?.subscriberCount),
+          currentViews: BigInt(parseYoutubeStatInt(ytData.statistics?.viewCount)),
+          currentVideoCount: parseYoutubeStatInt(ytData.statistics?.videoCount),
+          lastSyncedAt: new Date(),
+        },
+      });
+
+      const renamedMsg = oldTitle && liveTitle && oldTitle.toLowerCase() !== liveTitle.toLowerCase()
+        ? `Channel was already tracked as "${oldTitle}". Successfully updated name to "${liveTitle}".`
+        : `Channel "${liveTitle || existing.title}" is already tracked in category "${existing.category}".`;
+
+      return res.status(200).json({
+        alreadyTracked: true,
+        message: renamedMsg,
+        channel: serializeChannel(updated),
+      });
     }
 
     const channel = await prisma.channel.create({
