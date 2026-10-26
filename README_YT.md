@@ -1,10 +1,23 @@
 # 🧘 Sadhguru Wisdom Warriors — YouTube Analytics Platform
 
-Comprehensive documentation, architecture guide, deployment pipelines, access credentials, and repository links for the **Sadhguru Wisdom Warriors YouTube Tracking & Analytics Platform**.
+Comprehensive documentation, architecture guide, deployment pipelines, access credentials, and autonomous deployment protocols for the **Sadhguru Wisdom Warriors YouTube Tracking & Analytics Platform**.
 
 ---
 
-## 📌 1. Repositories & Live Deployments
+## ⚡ 1. Autonomous AI Agent Protocol (Auto-Deploy Directive)
+
+> **Official Project Directive:**  
+> The AI Assistant / Developer is **authorized to execute end-to-end changes autonomously**. Whenever new channels, features, bug fixes, or synchronization logic are requested:
+> 1. **Modify & Test:** Apply code changes and verify syntax (`node -c`) and production builds (`npm run build`) locally.
+> 2. **Auto-Commit & Push:** Automatically commit changes and push directly to GitHub (`origin/main`) without pausing for manual approval.
+> 3. **Auto-Deploy Live:** The GitHub push automatically triggers:
+>    * **Vercel** $\rightarrow$ Rebuilds and deploys the Frontend UI in ~60 seconds.
+>    * **DigitalOcean** $\rightarrow$ Rebuilds and deploys the Backend Server in ~120 seconds.
+> 4. **Database Direct Operations:** Read, query, sync, and update the **Supabase PostgreSQL** database directly using the pooler connection strings below.
+
+---
+
+## 📌 2. Repositories & Live Deployments
 
 ### Source Code Repositories
 * **Backend API Server (Node.js / Express / Prisma):**  
@@ -22,7 +35,7 @@ Comprehensive documentation, architecture guide, deployment pipelines, access cr
 
 ---
 
-## 🗄️ 2. Database Access (Supabase PostgreSQL)
+## 🗄️ 3. Database Access (Supabase PostgreSQL)
 
 The platform runs on a managed PostgreSQL cluster hosted on **Supabase** in Asia South 1 (Mumbai).
 
@@ -54,7 +67,7 @@ postgresql+asyncpg://postgres.vsxgzvduphqqcpwwrhzt:[DATABASE_PASSWORD]@aws-1-ap-
 
 ---
 
-## 📑 3. Google Sheets Integration & Category Mapping
+## 📑 4. Google Sheets Integration & Category Mapping
 
 The app continuously synchronizes channels from two live Google Sheets:
 
@@ -79,34 +92,6 @@ The app continuously synchronizes channels from two live Google Sheets:
   * `Grade D` $\rightarrow$ `IHI - Grade D`
   * `Grade E` $\rightarrow$ `IHI - Grade E`
   * `Inactive` $\rightarrow$ `IHI - Inactive`
-
----
-
-## 🤖 4. Automated AI Deployment (CI/CD Pipeline)
-
-Deployments are fully automated through GitHub integration. You never have to manually build or FTP files.
-
-```
-Developer / AI Assistant pushes code to GitHub (main branch)
-                         │
-        ┌────────────────┴────────────────┐
-        ▼                                 ▼
- Vercel (Frontend)              DigitalOcean (Backend)
- - Detects commit on `main`     - Detects commit on `main`
- - Runs `npm run build`         - Runs `npx prisma generate`
- - Live in ~60 seconds          - Runs `npm start`
-                                - Live in ~120 seconds
-```
-
-### How AI Deploys
-Whenever you request changes, the AI coding assistant:
-1. Tests the code and builds locally.
-2. Commits changes with a descriptive message.
-3. Pushes to GitHub `main` branch using your GitHub Personal Access Token:
-   ```bash
-   git push origin main
-   ```
-4. Both **Vercel** and **DigitalOcean** instantly pick up the push and deploy the new version live.
 
 ---
 
