@@ -1,23 +1,72 @@
 # 🧘 Sadhguru Wisdom Warriors — YouTube Analytics Platform
 
-Comprehensive documentation, architecture guide, deployment pipelines, access credentials, and autonomous deployment protocols for the **Sadhguru Wisdom Warriors YouTube Tracking & Analytics Platform**.
+Comprehensive documentation, architecture guide, deployment pipelines, access credentials, and operational workflow for the **Sadhguru Wisdom Warriors YouTube Tracking & Analytics Platform**.
 
 ---
 
-## ⚡ 1. Autonomous AI Agent Protocol (Auto-Deploy Directive)
+## 📖 1. Application Overview & Core Purpose
 
-> **Official Project Directive:**  
-> The AI Assistant / Developer is **authorized to execute end-to-end changes autonomously**. Whenever new channels, features, bug fixes, or synchronization logic are requested:
-> 1. **Modify & Test:** Apply code changes and verify syntax (`node -c`) and production builds (`npm run build`) locally.
-> 2. **Auto-Commit & Push:** Automatically commit changes and push directly to GitHub (`origin/main`) without pausing for manual approval.
-> 3. **Auto-Deploy Live:** The GitHub push automatically triggers:
->    * **Vercel** $\rightarrow$ Rebuilds and deploys the Frontend UI in ~60 seconds.
->    * **DigitalOcean** $\rightarrow$ Rebuilds and deploys the Backend Server in ~120 seconds.
-> 4. **Database Direct Operations:** Read, query, sync, and update the **Supabase PostgreSQL** database directly using the pooler connection strings below.
+The **Sadhguru Wisdom Warriors YouTube Analytics Platform** is a specialized, automated intelligence system built to track, measure, and analyze the collective reach of the Sadhguru Wisdom Warriors initiative across hundreds of creator channels worldwide.
+
+### What the Application Does
+1. **Automated Daily Metric Scraping & Sync:**
+   * Every day at UTC midnight, an automated sync engine executes across all tracked YouTube channels.
+   * It fetches live channel-level statistics (**subscriber count**, **total lifetime views**, **video count**).
+   * It scans and syncs **every individual video** on every channel, recording its live **view count**, **likes**, and **comments**.
+2. **Daily Snapshot History Engine:**
+   * Raw YouTube data only provides cumulative lifetime view counts. To solve this, our system records a daily snapshot (`ChannelSnapshot` and `VideoSnapshot`) for every channel and video.
+   * This enables exact **period-based performance analysis** (e.g., how many *exact views* were generated in August vs. September), tracking true momentum rather than just cumulative counters.
+3. **Channel Rebranding & Handle Preservation:**
+   * Creators frequently update their channel names and `@handles` on YouTube.
+   * The daily sync automatically detects name or handle changes from YouTube's API, updates the channel profile, and preserves previous names in notes (e.g., *"Formerly: Truth Unmasked"*), ensuring channels remain searchable by both old and new names.
 
 ---
 
-## 📌 2. Repositories & Live Deployments
+## 🏷️ 2. Channel Segmentation: Dedicated vs. IHI Channels
+
+To ensure reporting integrity, channels are separated into two distinct operational pipelines with specific classification rules:
+
+```
+                          Tracked YouTube Channels
+                                     │
+           ┌─────────────────────────┴─────────────────────────┐
+           ▼                                                   ▼
+ 🟢 Dedicated Channels                               🟡 IHI Channels (Mixed Content)
+ - Sourced from Dedicated Sheet                      - Sourced from IHI Master Database
+ - 100% Sadhguru content                              - Mixed content (Yoga, Vlogs, Lifestyle)
+ - Auto-marked with Green Checkmark (✓)              - Marked with Dash (—)
+ - 100% videos & views count directly                - Every video evaluated via Gemini AI
+                                                       • Sadhguru Video ──► Included in Reach
+                                                       • Non-Sadhguru   ──► Excluded from Reach
+```
+
+### A. Dedicated Channels (100% Sadhguru Focus)
+* **Definition:** Channels created exclusively for sharing Sadhguru’s wisdom, talks, discourses, and Isha initiatives.
+* **Classification Rule:**
+  * **100% of videos are Sadhguru content.**
+  * No per-video filtering is required.
+  * Automatically assigned the **green checkmark (`✓`)** in the `Classified` dashboard column upon sync.
+  * 100% of their views, uploads, and engagement contribute directly to the platform's campaign analytics.
+
+### B. IHI Channels (In-House Influencers / Mixed Content Creators)
+* **Definition:** Channels run by Isha Hatha Yoga (IHI) teachers, volunteers, or independent creators who post diverse content genres (Hatha Yoga, wellness, nutrition, travel, personal vlogs) alongside occasional Sadhguru content.
+* **Classification Rule:**
+  * Displays a **dash (`—`)** in the dashboard classification column.
+  * **Automated AI Content Classification:** Every fresh video ingested from an IHI channel is evaluated through intelligent keyword filters and **Google Gemini AI classification**:
+    * **`sadhguru` content:** Included in the campaign's aggregated views and reach.
+    * **`non sadhguru` content:** Excluded from the campaign analytics so that personal or non-relevant videos do not skew reporting.
+
+---
+
+## 📊 3. Analytics & Intelligence Capabilities
+
+* **Period Views Delta Calculation:** Evaluates exact opening and closing snapshot views to determine true view gains within any calendar month.
+* **New Uploads vs. Catalog Reach:** Distinguishes between views driven by fresh monthly uploads versus older evergreen videos (catalog/backlog) continuing to accumulate algorithmic views.
+* **80/20 Pareto Distribution:** Identifies the vital few channels and videos (typically ~6% of channels and ~1.2% of videos) that generate 80%+ of total platform viewership.
+
+---
+
+## 📌 4. Repositories & Live Deployments
 
 ### Source Code Repositories
 * **Backend API Server (Node.js / Express / Prisma):**  
@@ -35,7 +84,7 @@ Comprehensive documentation, architecture guide, deployment pipelines, access cr
 
 ---
 
-## 🗄️ 3. Database Access (Supabase PostgreSQL)
+## 🗄️ 5. Database Access (Supabase PostgreSQL)
 
 The platform runs on a managed PostgreSQL cluster hosted on **Supabase** in Asia South 1 (Mumbai).
 
@@ -67,13 +116,12 @@ postgresql+asyncpg://postgres.vsxgzvduphqqcpwwrhzt:[DATABASE_PASSWORD]@aws-1-ap-
 
 ---
 
-## 📑 4. Google Sheets Integration & Category Mapping
+## 📑 6. Google Sheets Integration & Category Mapping
 
 The app continuously synchronizes channels from two live Google Sheets:
 
 ### A. Dedicated Master Database
 * **Spreadsheet ID:** `1rF7tGOjn5gdEWnn3DEwao51wPvDIf2xLgD_WJk47xA0`
-* **Classification Rule:** Dedicated channels publish 100% Sadhguru content and always receive a **green checkmark (`✓`)** in the Classified column.
 * **Tabs & Category Mapping:**
   * `Grade A` $\rightarrow$ `Dedicated - Grade A`
   * `Grade B` $\rightarrow$ `Dedicated - Grade B`
@@ -84,7 +132,6 @@ The app continuously synchronizes channels from two live Google Sheets:
 
 ### B. IHI Master Database (In-House Influencer / Mixed Channels)
 * **Spreadsheet ID:** `1J027IUUkk6wWvbactK6qgRwYUWoEafIxIScQwiDq1BU`
-* **Classification Rule:** IHI channels publish mixed content and receive a **dash (`—`)** until individual videos are analyzed and classified by the Vertex AI / Gemini engine.
 * **Tabs & Category Mapping:**
   * `Grade A` $\rightarrow$ `IHI - Grade A`
   * `Grade B` $\rightarrow$ `IHI - Grade B`
@@ -95,7 +142,25 @@ The app continuously synchronizes channels from two live Google Sheets:
 
 ---
 
-## ⚙️ 5. Environment Variables Reference
+## 🤖 7. Automated AI Deployment (CI/CD Pipeline)
+
+Deployments are fully automated through GitHub integration:
+
+```
+Developer / AI Assistant pushes code to GitHub (main branch)
+                         │
+        ┌────────────────┴────────────────┐
+        ▼                                 ▼
+ Vercel (Frontend)              DigitalOcean (Backend)
+ - Detects commit on `main`     - Detects commit on `main`
+ - Runs `npm run build`         - Runs `npx prisma generate`
+ - Live in ~60 seconds          - Runs `npm start`
+                                - Live in ~120 seconds
+```
+
+---
+
+## ⚙️ 8. Environment Variables Reference
 
 ### Backend (`.env` on DigitalOcean)
 | Variable | Value / Description |
@@ -120,7 +185,7 @@ The app continuously synchronizes channels from two live Google Sheets:
 
 ---
 
-## ⏰ 6. Automated Background Cron Schedules
+## ⏰ 9. Automated Background Cron Schedules
 
 The backend runs automated background cron jobs:
 * **Channel Sync (`0 3 * * *` — 3:00 AM UTC / 8:30 AM IST Daily):**
@@ -138,14 +203,13 @@ The backend runs automated background cron jobs:
 
 ---
 
-## 💻 7. How to Run Locally (Optional / Development)
+## 💻 10. How to Run Locally (Optional / Development)
 
 If you or an engineer ever want to test changes on a local machine before pushing to production:
 
 ### Prerequisites
 * Node.js 18+ or 20+
-* Git
-* npm
+* Git & npm
 
 ### Step 1: Run the Backend
 ```bash
@@ -163,10 +227,3 @@ npm install
 npm run dev
 # Frontend runs on http://localhost:5173
 ```
-
----
-
-## 🛡️ 8. Security & Best Practices
-* **GitHub Tokens:** Always use a classic GitHub Personal Access Token with the `repo` scope to authorize pushes.
-* **Never commit real database passwords** or raw API keys in public repositories; always inject them as environment variables in DigitalOcean App Platform and Vercel.
-* **Prisma Pooler:** When connecting from serverless environments or background jobs, always connect through port `6543` to avoid exhausting database connection limits.
