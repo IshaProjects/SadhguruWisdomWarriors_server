@@ -369,12 +369,21 @@ export async function syncVideoStats(channelIds = null, type = 'manual') {
     // with NO prior snapshot always gets its first one (absent from this map).
     // The carry-forward reports treat a skipped (unchanged) day as the carried
     // value, so this is lossless.
+    //
+    // PERFORMANCE FIX: For scheduled daily syncs (channelIds === null), omit
+    // the channel_id IN (...) filter so Postgres uses the vs_vid_date_cover
+    // index-only scan directly instead of sorting 1.35M+ rows in memory.
+    const channelFilter =
+      channelIds && channelIds.length > 0
+        ? Prisma.sql`AND channel_id IN (${Prisma.join(channelIdSet)})`
+        : Prisma.empty;
+
     const priorSnaps = await prisma.$queryRaw(Prisma.sql`
       SELECT DISTINCT ON (video_id) video_id, views, likes, comments
       FROM video_snapshots
-      WHERE channel_id IN (${Prisma.join(channelIdSet)})
-        AND deleted_at IS NULL
+      WHERE deleted_at IS NULL
         AND date < ${today}
+        ${channelFilter}
       ORDER BY video_id, date DESC
     `);
     const prevByVideo = new Map(
